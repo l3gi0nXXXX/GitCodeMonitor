@@ -28,6 +28,7 @@ log.txt
 # Cache files
 .cache/
 build-script-cache/
+.gitcodemonitor/
 
 # IDE files
 .vscode/

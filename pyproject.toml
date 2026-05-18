@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitcodemonitor"
+version = "0.1.0"
+description = "Independent GitCode monitor bridge for Metis integrations."
+requires-python = ">=3.9"
+
+[project.scripts]
+gitcodemonitor-doctor = "gitcodemonitor.cli:doctor_main"
+gitcodemonitor-scan-once = "gitcodemonitor.cli:scan_once_main"
+gitcodemonitor-tests = "gitcodemonitor.cli:tests_main"
