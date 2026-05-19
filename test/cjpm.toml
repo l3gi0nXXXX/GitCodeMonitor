@@ -19,3 +19,7 @@
   cjHeapSize = { value = "64MB", splice-type = "replace" }
 
 [dependencies]
+  magic = { path = "${MAGIC_PATH}" }
+
+[target.aarch64-apple-darwin.bin-dependencies]
+  path-option = ["${MAGIC_PATH}/libs/cangjie-stdx-mac-aarch64-1.0.0.1/darwin_aarch64_llvm/dynamic/stdx"]

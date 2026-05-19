@@ -1,5 +1,7 @@
 package gitcodemonitor
 
+import std.fs.{remove, Path, exists}
+import std.time.DateTime
 import std.unittest.testmacro.*
 
 @Test
@@ -74,6 +76,48 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func realGitCodeRequestBuilderSupportsAuthModesAndRedaction(): Unit {
+        let privateClient = GitCodeApiClient(token: "private-secret")
+        let privateReq = privateClient.listReposRequest("cangjie", 2, 50)
+        @Expect(privateReq.url.contains("page=2"), true)
+        @Expect(privateReq.headers[0][0], "PRIVATE-TOKEN")
+        @Expect(privateReq.redactedLogLine().contains("private-secret"), false)
+
+        let bearerClient = GitCodeApiClient(authMode: "Authorization", token: "bearer-secret")
+        let bearerReq = bearerClient.listIssuesRequest(GitCodeRepo("cangjie", "compiler"), 1, 20)
+        @Expect(bearerReq.headers[0][0], "Authorization")
+        @Expect(bearerReq.headers[0][1], "Bearer bearer-secret")
+        @Expect(bearerReq.redactedLogLine().contains("bearer-secret"), false)
+
+        let queryClient = GitCodeApiClient(authMode: "access_token", token: "query-secret")
+        let queryReq = queryClient.listCommentsRequest(GitCodeRepo("cangjie", "compiler"), "pr", "9", 1, 20)
+        @Expect(queryReq.url.contains("access_token="), true)
+        @Expect(queryReq.redactedLogLine().contains("query-secret"), false)
+    }
+
+    @TestCase
+    public func curlHttpSenderBuildsRealHttpArgsWithoutLoggingSecrets(): Unit {
+        let req = HttpRequestSpec("POST", "https://api.telegram.org/bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef/sendMessage", headers: [("Authorization", "Bearer secret")], body: "{\"ok\":true}")
+        let sender = CurlHttpSender()
+        let args = sender.curlArgs(req)
+        @Expect(args[0], "-sS")
+        @Expect(args.contains("--data"), true)
+        let redacted = joinStrings(sender.redactedCurlArgs(req), " ")
+        @Expect(redacted.contains("Bearer secret"), false)
+        @Expect(redacted.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), false)
+    }
+
+    @TestCase
+    public func commentPostRequestAddsSelfMarkerAndJsonBody(): Unit {
+        let event = GitCodeEvent("evt", "cangjie", "compiler", "issue", "42", "alice", "", "", "x")
+        let req = GitCodeApiClient(token: "secret").postCommentRequest(event, "hello")
+        @Expect(req.method, "POST")
+        @Expect(req.url.contains("/issues/42/comments"), true)
+        @Expect(req.body.contains(SELF_MARKER), true)
+        @Expect(req.redactedLogLine().contains("secret"), false)
+    }
+
+    @TestCase
     public func acceptedEventsNotifyBothChannelsAndMcpDownDoesNotBlock(): Unit {
         let config = defaultConfig()
         let transport = FakeGitCodeTransport()
@@ -89,6 +133,44 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func stateStorePersistsSeenAuditReplyAndBackoff(): Unit {
+        let path = "/tmp/gcm-state-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.json"
+        let store = StateStore(path)
+        let state = MonitorState()
+        state.markSeen("evt")
+        state.markMcpCall("evt")
+        state.markReply("evt")
+        state.setBackoff("cangjie/compiler", 1234)
+        let audit = AuditRecord("evt", status: "drafted", reason: "dry_run")
+        audit.draft = "draft"
+        audit.writeDecision = "dry_run"
+        state.addAudit(audit)
+        @Expect(store.save(state), true)
+        let loaded = store.load()
+        @Expect(loaded.hasSeen("evt"), true)
+        @Expect(loaded.hasMcpCall("evt"), true)
+        @Expect(loaded.hasReply("evt"), true)
+        @Expect(loaded.backoffUntil("cangjie/compiler"), 1234)
+        @Expect(loaded.audit.size, 1)
+        if (exists(Path(path))) { remove(Path(path)) }
+    }
+
+    @TestCase
+    public func notifierPayloadBuildersAreDryRunByDefaultAndRedactContent(): Unit {
+        let event = GitCodeEvent("evt", "cangjie", "compiler", "issue", "1", "alice", "", "https://gitcode.com/cangjie/compiler/issues/1", "Authorization: Bearer secret")
+        let feishu = buildFeishuPayload("https://open.feishu.cn/webhook/abc", event)
+        @Expect(feishu.request.body.contains("[REDACTED]"), true)
+        let telegram = buildTelegramPayload("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef", "chat", event)
+        @Expect(telegram.request.url.contains("sendMessage"), true)
+        @Expect(telegram.request.redactedLogLine().contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), false)
+        let sender = FakeHttpSender()
+        let notifier = HttpNotifier("feishu", sender: sender)
+        let audit = notifier.notify(event)
+        @Expect(audit.status, "dry_run")
+        @Expect(sender.requests.size, 0)
+    }
+
+    @TestCase
     public func mcpSchemaCacheAndMapperUseGitCodeTools(): Unit {
         let mcp = FakeMcpClient()
         @Expect(mcp.initialize(), true)
@@ -97,6 +179,26 @@ public class GitCodeMonitorCoreTest {
         @Expect(input.toolName, "gitcode_pr_draft_reply")
         @Expect(input.repo, "cangjie/compiler")
         @Expect(containsSecret(input.body), false)
+    }
+
+    @TestCase
+    public func mcpHttpClientBuildsJsonRpcRequestsAndDegradesCleanly(): Unit {
+        let sender = FakeHttpSender()
+        let mcp = McpHttpClient("http://127.0.0.1:8787/mcp", serviceToken: "service-secret", sender: sender)
+        @Expect(mcp.initialize(), true)
+        @Expect(sender.requests[0].body.contains("\"method\":\"initialize\""), true)
+        @Expect(sender.requests[0].redactedLogLine().contains("service-secret"), false)
+        let tools = mcp.toolsList()
+        @Expect(tools.size, 5)
+        let result = mcp.call(ToolInput("gitcode_issue_draft_reply", "evt", "cangjie/compiler", "body"))
+        @Expect(result.ok, true)
+        @Expect(sender.requests[2].body.contains("\"method\":\"tools/call\""), true)
+
+        let downSender = FakeHttpSender()
+        downSender.nextResponse = HttpResponseSpec(503)
+        let down = McpHttpClient("http://127.0.0.1:8787/mcp", sender: downSender)
+        @Expect(down.initialize(), false)
+        @Expect(down.degradedReason, "server_error")
     }
 
     @TestCase
@@ -112,12 +214,44 @@ public class GitCodeMonitorCoreTest {
         @Expect(writebackGate(config, state, event, mcp).reason, "repo_not_allowlisted")
         config.repoAllowlist = ["cangjie/compiler"]
         @Expect(writebackGate(config, state, event, McpResult(true, draft: "Authorization: Bearer x")).reason, "secret_detected")
+        @Expect(writebackGate(config, state, event, McpResult(true, draft: "/Users/name/private-index")).reason, "local_path_detected")
         @Expect(writebackGate(config, state, event, mcp).allowed, true)
         let writer = FakeCommentWriter()
         let url = writer.write(event, mcp.draft, state)
         @Expect(url.contains("https://gitcode.com/cangjie/compiler/comments/"), true)
         @Expect(writebackGate(config, state, event, mcp).reason, "duplicate")
         @Expect(filterEvent(GitCodeEvent("self", "cangjie", "compiler", "issue", "1", "bot", "", "", writer.written[0])).reason, "self_marker")
+    }
+
+    @TestCase
+    public func realWritebackWriterPostsOnlyAfterGates(): Unit {
+        let config = defaultConfig()
+        config.dryRun = false
+        config.autoReply = true
+        config.repoAllowlist = ["cangjie/compiler"]
+        let event = GitCodeEvent("evt", "cangjie", "compiler", "pr", "7", "alice", "", "", "need help")
+        let sender = FakeHttpSender()
+        let writer = GitCodeCommentWriter(GitCodeApiClient(token: "secret"), sender: sender)
+        let decision = writer.writeIfAllowed(config, MonitorState(), event, McpResult(true, draft: "safe", approved: true))
+        @Expect(decision.reason, "posted")
+        @Expect(sender.requests.size, 1)
+        @Expect(sender.requests[0].url.contains("/pulls/7/comments"), true)
+        @Expect(sender.requests[0].body.contains(SELF_MARKER), true)
+    }
+
+    @TestCase
+    public func cliReportsDoNotLeakCredentials(): Unit {
+        let config = defaultConfig()
+        config.gitCodeToken = "gitcode-secret"
+        config.mcpServiceToken = "mcp-secret"
+        config.mcpEndpoint = "http://127.0.0.1:8787/mcp"
+        let summary = configSummary(config)
+        @Expect(summary.contains("gitcode-secret"), false)
+        @Expect(summary.contains("mcp-secret"), false)
+        @Expect(probeGitCode(config).contains("gitcode-secret"), false)
+        @Expect(probeMcp(config).contains("mcp-secret"), false)
+        @Expect(cliHelp().contains("probe-gitcode"), true)
+        @Expect(serveOnceBaseline(config).contains("serve baseline"), true)
     }
 
     @TestCase

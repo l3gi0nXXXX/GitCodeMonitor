@@ -1,6 +1,10 @@
 package gitcodemonitor
 
 import std.collection.*
+import std.convert.Parsable
+import std.fs.{Directory, File, Path, exists}
+import std.process.executeWithOutput
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 public let SELF_MARKER = "<!-- gitcodemonitor:auto-reply:v1 -->"
 
@@ -16,6 +20,16 @@ public class MonitorConfig {
     public var acpEndpoint: String
     public var acpServiceToken: String
     public var acpAllowedTasks: Array<String>
+    public var gitCodeBaseUrl: String
+    public var gitCodeAuthMode: String
+    public var gitCodeToken: String
+    public var mcpEndpoint: String
+    public var mcpServiceToken: String
+    public var statePath: String
+    public var notifyNetworkEnabled: Bool
+    public var feishuWebhook: String
+    public var telegramBotToken: String
+    public var telegramChatId: String
 
     public init() {
         this.orgs = ["cangjie", "cangjie-sig", "cangjie-tpc"]
@@ -29,6 +43,16 @@ public class MonitorConfig {
         this.acpEndpoint = ""
         this.acpServiceToken = ""
         this.acpAllowedTasks = []
+        this.gitCodeBaseUrl = "https://gitcode.com/api/v5"
+        this.gitCodeAuthMode = "PRIVATE-TOKEN"
+        this.gitCodeToken = ""
+        this.mcpEndpoint = ""
+        this.mcpServiceToken = ""
+        this.statePath = "data/gitcodemonitor-state.json"
+        this.notifyNetworkEnabled = false
+        this.feishuWebhook = ""
+        this.telegramBotToken = ""
+        this.telegramChatId = ""
     }
 }
 
@@ -46,7 +70,29 @@ public func validateConfig(config: MonitorConfig): String {
     if (config.acpEnabled && (config.acpEndpoint.isEmpty() || config.acpServiceToken.isEmpty() || config.acpAllowedTasks.size == 0)) {
         return "acp enabled but endpoint/token/allowedTasks missing"
     }
+    if (!config.dryRun && config.autoReply && config.repoAllowlist.size == 0) {
+        return "writeback enabled but repo allowlist missing"
+    }
+    if (!config.notifyNetworkEnabled && (!config.feishuWebhook.isEmpty() || !config.telegramBotToken.isEmpty())) {
+        return "ok"
+    }
     return "ok"
+}
+
+public func configSummary(config: MonitorConfig): String {
+    let auth = if (config.gitCodeToken.isEmpty()) { "absent" } else { "present" }
+    let mcpAuth = if (config.mcpServiceToken.isEmpty()) { "absent" } else { "present" }
+    "GitCodeMonitor config\n" +
+        "orgs=${joinStrings(config.orgs, ",")}\n" +
+        "gitCodeBaseUrl=${config.gitCodeBaseUrl}\n" +
+        "gitCodeAuth=${config.gitCodeAuthMode}:${auth}\n" +
+        "mcpEndpoint=${config.mcpEndpoint}\n" +
+        "mcpAuth=${mcpAuth}\n" +
+        "dryRun=${config.dryRun}\n" +
+        "autoReply=${config.autoReply}\n" +
+        "allowlist=${joinStrings(config.repoAllowlist, ",")}\n" +
+        "notifyNetworkEnabled=${config.notifyNetworkEnabled}\n" +
+        "statePath=${config.statePath}"
 }
 
 public class GitCodeEvent {
@@ -132,6 +178,16 @@ public func redactSecrets(text: String): String {
     text
 }
 
+public func jsonEscape(raw: String): String {
+    raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+}
+
+public func compactSummary(raw: String, limit!: Int64 = 280): String {
+    let t = raw.trimAscii().replace("\n", " ").replace("\r", " ")
+    if (t.size <= limit) { return t }
+    t[0..limit] + "..."
+}
+
 func looksLikeTelegramBotToken(text: String): Bool {
     var digits = 0
     var seenColon = false
@@ -167,6 +223,10 @@ public class AuditRecord {
     public var reason: String
     public var requestId: String
     public var replyUrl: String
+    public var draft: String
+    public var safety: String
+    public var deliveryStatus: String
+    public var writeDecision: String
 
     public init(eventId: String, status!: String = "pending", reason!: String = "") {
         this.eventId = eventId
@@ -174,6 +234,10 @@ public class AuditRecord {
         this.reason = reason
         this.requestId = "req-" + eventId
         this.replyUrl = ""
+        this.draft = ""
+        this.safety = ""
+        this.deliveryStatus = "pending"
+        this.writeDecision = ""
     }
 }
 
@@ -181,6 +245,7 @@ public class MonitorState {
     private let seenEvents = HashSet<String>()
     private let mcpCalled = HashSet<String>()
     private let replied = HashSet<String>()
+    private let backoff = HashMap<String, Int64>()
     public let audit = ArrayList<AuditRecord>()
     public var lastFullScanAtMs: Int64 = 0
     public var skippedOverlappingScans: Int64 = 0
@@ -194,6 +259,120 @@ public class MonitorState {
     public func hasReply(eventId: String): Bool { replied.contains(eventId) }
     public func markReply(eventId: String): Unit { replied.add(eventId) }
     public func addAudit(record: AuditRecord): Unit { audit.add(record) }
+    public func seenCount(): Int64 { seenEvents.size }
+    public func mcpCallCount(): Int64 { mcpCalled.size }
+    public func replyCount(): Int64 { replied.size }
+    public func setBackoff(key: String, untilMs: Int64): Unit { backoff[key] = untilMs }
+    public func backoffUntil(key: String): Int64 { backoff.get(key) ?? 0 }
+    public func seenIds(): Array<String> {
+        let out = ArrayList<String>()
+        for (id in seenEvents) { out.add(id) }
+        out.toArray()
+    }
+    public func mcpCallIds(): Array<String> {
+        let out = ArrayList<String>()
+        for (id in mcpCalled) { out.add(id) }
+        out.toArray()
+    }
+    public func replyIds(): Array<String> {
+        let out = ArrayList<String>()
+        for (id in replied) { out.add(id) }
+        out.toArray()
+    }
+    public func backoffKeys(): Array<String> {
+        let out = ArrayList<String>()
+        for ((key, _) in backoff) { out.add(key) }
+        out.toArray()
+    }
+}
+
+public class StateStore {
+    public let path: Path
+    public init(path: String) { this.path = Path(path) }
+
+    public func save(state: MonitorState): Bool {
+        try {
+            let parent = path.parent
+            if (!exists(parent)) { Directory.create(parent, recursive: true) }
+            File.writeTo(path, stateToJson(state).toJsonString().toArray())
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    public func load(): MonitorState {
+        let state = MonitorState()
+        if (!exists(path)) { return state }
+        try {
+            let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            state.lastFullScanAtMs = readJsonInt(root, "lastFullScanAtMs")
+            state.skippedOverlappingScans = readJsonInt(root, "skippedOverlappingScans")
+            for (id in readJsonStringArray(root, "seenEvents")) { state.markSeen(id) }
+            for (id in readJsonStringArray(root, "mcpCalled")) { state.markMcpCall(id) }
+            for (id in readJsonStringArray(root, "replied")) { state.markReply(id) }
+            match (root.get("backoff")) {
+                case Some(value) =>
+                    for (item in value.asArray().getItems()) {
+                        let obj = item.asObject()
+                        state.setBackoff(readJsonString(obj, "key"), readJsonInt(obj, "untilMs"))
+                    }
+                case None => ()
+            }
+            match (root.get("audit")) {
+                case Some(value) =>
+                    for (rowValue in value.asArray().getItems()) {
+                        let row = rowValue.asObject()
+                        let audit = AuditRecord(readJsonString(row, "eventId"), status: readJsonString(row, "status"), reason: readJsonString(row, "reason"))
+                        audit.requestId = readJsonString(row, "requestId")
+                        audit.replyUrl = readJsonString(row, "replyUrl")
+                        audit.draft = readJsonString(row, "draft")
+                        audit.safety = readJsonString(row, "safety")
+                        audit.deliveryStatus = readJsonString(row, "deliveryStatus")
+                        audit.writeDecision = readJsonString(row, "writeDecision")
+                        state.addAudit(audit)
+                    }
+                case None => ()
+            }
+        } catch (_: Exception) {
+            state.addAudit(AuditRecord("state-load", status: "state_error", reason: "corrupt_or_unreadable"))
+        }
+        state
+    }
+}
+
+public func stateToJson(state: MonitorState): JsonObject {
+    let root = JsonObject()
+    root.put("schemaVersion", JsonInt(1))
+    root.put("lastFullScanAtMs", JsonInt(state.lastFullScanAtMs))
+    root.put("skippedOverlappingScans", JsonInt(state.skippedOverlappingScans))
+    root.put("seenEvents", stringArrayJson(state.seenIds()))
+    root.put("mcpCalled", stringArrayJson(state.mcpCallIds()))
+    root.put("replied", stringArrayJson(state.replyIds()))
+    let backoff = JsonArray([])
+    for (key in state.backoffKeys()) {
+        let row = JsonObject()
+        row.put("key", JsonString(key))
+        row.put("untilMs", JsonInt(state.backoffUntil(key)))
+        backoff.add(row)
+    }
+    root.put("backoff", backoff)
+    let audits = JsonArray([])
+    for (record in state.audit) {
+        let row = JsonObject()
+        row.put("eventId", JsonString(record.eventId))
+        row.put("status", JsonString(record.status))
+        row.put("reason", JsonString(record.reason))
+        row.put("requestId", JsonString(record.requestId))
+        row.put("replyUrl", JsonString(record.replyUrl))
+        row.put("draft", JsonString(record.draft))
+        row.put("safety", JsonString(record.safety))
+        row.put("deliveryStatus", JsonString(record.deliveryStatus))
+        row.put("writeDecision", JsonString(record.writeDecision))
+        audits.add(row)
+    }
+    root.put("audit", audits)
+    root
 }
 
 public class FakeClock {
@@ -239,6 +418,141 @@ public class GitCodeRepo {
         this.name = name
     }
     public func fullName(): String { "${org}/${name}" }
+}
+
+public class HttpRequestSpec {
+    public let method: String
+    public let url: String
+    public let headers: Array<(String, String)>
+    public let body: String
+    public init(method: String, url: String, headers!: Array<(String, String)> = [], body!: String = "") {
+        this.method = method
+        this.url = url
+        this.headers = headers
+        this.body = body
+    }
+    public func redactedLogLine(): String {
+        let parts = ArrayList<String>()
+        for ((key, value) in headers) {
+            let lower = key.toAsciiLower()
+            let v = if (lower.contains("authorization") || lower.contains("token") || lower.contains("cookie")) { "[REDACTED]" } else { value }
+            parts.add("${key}=${v}")
+        }
+        "${method} ${redactUrl(url)} headers=${joinStrings(parts.toArray(), ";")}"
+    }
+}
+
+public class HttpResponseSpec {
+    public let statusCode: Int64
+    public let body: String
+    public init(statusCode: Int64, body!: String = "") {
+        this.statusCode = statusCode
+        this.body = body
+    }
+}
+
+public class FakeHttpSender {
+    public let requests = ArrayList<HttpRequestSpec>()
+    public var nextResponse: HttpResponseSpec = HttpResponseSpec(200, body: "{}")
+    public init() {}
+    public func send(request: HttpRequestSpec): HttpResponseSpec {
+        requests.add(request)
+        nextResponse
+    }
+}
+
+public class CurlHttpSender {
+    public init() {}
+
+    public func curlArgs(request: HttpRequestSpec): Array<String> {
+        let args = ArrayList<String>()
+        args.add("-sS")
+        args.add("-X")
+        args.add(request.method)
+        for ((key, value) in request.headers) {
+            args.add("-H")
+            args.add("${key}: ${value}")
+        }
+        if (!request.body.isEmpty()) {
+            args.add("--data")
+            args.add(request.body)
+        }
+        args.add("-w")
+        args.add("\n%{http_code}")
+        args.add(request.url)
+        args.toArray()
+    }
+
+    public func redactedCurlArgs(request: HttpRequestSpec): Array<String> {
+        let args = ArrayList<String>()
+        for (arg in curlArgs(request)) { args.add(redactSecrets(redactUrl(arg))) }
+        args.toArray()
+    }
+
+    public func send(request: HttpRequestSpec): HttpResponseSpec {
+        let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput("curl", curlArgs(request))
+        if (exitCode != 0) {
+            return HttpResponseSpec(599, body: String.fromUtf8(stderrBytes))
+        }
+        let text = String.fromUtf8(stdoutBytes)
+        let lines = text.split("\n")
+        if (lines.size == 0) { return HttpResponseSpec(599) }
+        let code = try { Int64.parse(lines[lines.size - 1].trimAscii()) } catch (_: Exception) { 599 }
+        let body = if (lines.size > 1) { joinStrings(lines[0..lines.size - 1], "\n") } else { "" }
+        HttpResponseSpec(code, body: body)
+    }
+}
+
+public class GitCodeApiClient {
+    public let baseUrl: String
+    public let authMode: String
+    private let token: String
+
+    public init(baseUrl!: String = "https://gitcode.com/api/v5", authMode!: String = "PRIVATE-TOKEN", token!: String = "") {
+        this.baseUrl = trimTrailingSlash(baseUrl)
+        this.authMode = authMode
+        this.token = token
+    }
+
+    public func authHeaders(): Array<(String, String)> {
+        if (token.isEmpty()) { return [] }
+        match (authMode) {
+            case "Authorization" | "authorization" | "bearer" | "Bearer" => [("Authorization", if (token.startsWith("Bearer ")) { token } else { "Bearer ${token}" })]
+            case "access_token" | "query" => []
+            case _ => [("PRIVATE-TOKEN", token)]
+        }
+    }
+
+    public func listReposRequest(org: String, page: Int64, pageSize: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/orgs/${urlPart(org)}/projects?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+    }
+
+    public func listIssuesRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+    }
+
+    public func listPullRequestsRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+    }
+
+    public func listCommentsRequest(repo: GitCodeRepo, itemKind: String, itemId: String, page: Int64, pageSize: Int64): HttpRequestSpec {
+        let kind = if (itemKind == "pr") { "pulls" } else { "issues" }
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/${kind}/${urlPart(itemId)}/comments?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+    }
+
+    public func postCommentRequest(event: GitCodeEvent, body: String): HttpRequestSpec {
+        let kind = if (event.itemKind == "pr") { "pulls" } else { "issues" }
+        let json = "{\"body\":\"${jsonEscape(body + "\n\n" + SELF_MARKER)}\"}"
+        HttpRequestSpec("POST", withAuthQuery("${baseUrl}/repos/${urlPart(event.org)}/${urlPart(event.repo)}/${kind}/${urlPart(event.itemId)}/comments"), headers: authHeaders().concat([("Content-Type", "application/json")]), body: json)
+    }
+
+    private func withAuthQuery(url: String): String {
+        if ((authMode == "access_token" || authMode == "query") && !token.isEmpty()) {
+            let sep = if (url.contains("?")) { "&" } else { "?" }
+            return "${url}${sep}access_token=${urlPart(token)}"
+        }
+        url
+    }
 }
 
 public func mapGitCodeError(statusCode: Int64): String {
@@ -323,6 +637,63 @@ public class DeliveryAudit {
     }
 }
 
+public class NotifierPayload {
+    public let channel: String
+    public let request: HttpRequestSpec
+    public init(channel: String, request: HttpRequestSpec) {
+        this.channel = channel
+        this.request = request
+    }
+}
+
+public func buildFeishuPayload(webhook: String, event: GitCodeEvent): NotifierPayload {
+    let body = "{" +
+        "\"msg_type\":\"text\"," +
+        "\"content\":{\"text\":\"${jsonEscape(notificationText(event))}\"}" +
+        "}"
+    NotifierPayload("feishu", HttpRequestSpec("POST", webhook, headers: [("Content-Type", "application/json")], body: body))
+}
+
+public func buildTelegramPayload(botToken: String, chatId: String, event: GitCodeEvent): NotifierPayload {
+    let body = "{" +
+        "\"chat_id\":\"${jsonEscape(chatId)}\"," +
+        "\"text\":\"${jsonEscape(notificationText(event))}\"," +
+        "\"disable_web_page_preview\":true" +
+        "}"
+    NotifierPayload("telegram", HttpRequestSpec("POST", "https://api.telegram.org/bot${botToken}/sendMessage", headers: [("Content-Type", "application/json")], body: body))
+}
+
+public class HttpNotifier {
+    public let channel: String
+    public let networkEnabled: Bool
+    public let sender: FakeHttpSender
+    private let webhookOrToken: String
+    private let chatId: String
+    public let deliveries = ArrayList<DeliveryAudit>()
+
+    public init(channel: String, networkEnabled!: Bool = false, webhookOrToken!: String = "", chatId!: String = "", sender!: FakeHttpSender = FakeHttpSender()) {
+        this.channel = channel
+        this.networkEnabled = networkEnabled
+        this.webhookOrToken = webhookOrToken
+        this.chatId = chatId
+        this.sender = sender
+    }
+
+    public func notify(event: GitCodeEvent): DeliveryAudit {
+        let payload = if (channel == "telegram") { buildTelegramPayload(webhookOrToken, chatId, event) } else { buildFeishuPayload(webhookOrToken, event) }
+        if (!networkEnabled) {
+            let audit = DeliveryAudit(event.id, channel, "dry_run")
+            deliveries.add(audit)
+            return audit
+        }
+        let res = sender.send(payload.request)
+        let status = if (res.statusCode >= 200 && res.statusCode < 300) { "sent" } else { mapGitCodeError(res.statusCode) }
+        let audit = DeliveryAudit(event.id, channel, status)
+        deliveries.add(audit)
+        audit
+    }
+}
+
 public class FakeNotifier {
     public let channel: String
     public var failNext: Bool = false
@@ -380,6 +751,92 @@ public class McpResult {
     }
 }
 
+public class McpHttpClient {
+    public let endpoint: String
+    private let serviceToken: String
+    public let sender: FakeHttpSender
+    public var requestSeq: Int64 = 0
+    public var initialized: Bool = false
+    public var degradedReason: String = ""
+    public let schemaCache = ArrayList<ToolSchema>()
+
+    public init(endpoint: String, serviceToken!: String = "", sender!: FakeHttpSender = FakeHttpSender()) {
+        this.endpoint = endpoint
+        this.serviceToken = serviceToken
+        this.sender = sender
+    }
+
+    public func nextRequestId(prefix: String): String {
+        requestSeq++
+        "${prefix}-${requestSeq}"
+    }
+
+    public func buildInitializeRequest(): HttpRequestSpec {
+        jsonRpcRequest("initialize", "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"GitCodeMonitor\",\"version\":\"0.1.0\"}}", nextRequestId("mcp-init"))
+    }
+
+    public func buildToolsListRequest(): HttpRequestSpec {
+        jsonRpcRequest("tools/list", "{}", nextRequestId("mcp-tools"))
+    }
+
+    public func buildToolsCallRequest(input: ToolInput): HttpRequestSpec {
+        let args = "{\"eventId\":\"${jsonEscape(input.eventId)}\",\"repo\":\"${jsonEscape(input.repo)}\",\"body\":\"${jsonEscape(input.body)}\"}"
+        jsonRpcRequest("tools/call", "{\"name\":\"${jsonEscape(input.toolName)}\",\"arguments\":${args}}", nextRequestId("mcp-call"))
+    }
+
+    public func initialize(): Bool {
+        let res = sender.send(buildInitializeRequest())
+        initialized = res.statusCode >= 200 && res.statusCode < 300
+        if (!initialized) { degradedReason = mapGitCodeError(res.statusCode) }
+        initialized
+    }
+
+    public func toolsList(): Array<ToolSchema> {
+        let res = sender.send(buildToolsListRequest())
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            degradedReason = mapGitCodeError(res.statusCode)
+            return schemaCache.toArray()
+        }
+        if (schemaCache.isEmpty()) {
+            schemaCache.add(ToolSchema("gitcode_issue_summary", version: "v1", schemaHash: "http-cache"))
+            schemaCache.add(ToolSchema("gitcode_issue_draft_reply", version: "v1", schemaHash: "http-cache"))
+            schemaCache.add(ToolSchema("gitcode_pr_summary", version: "v1", schemaHash: "http-cache"))
+            schemaCache.add(ToolSchema("gitcode_pr_draft_reply", version: "v1", schemaHash: "http-cache"))
+            schemaCache.add(ToolSchema("gitcode_safety_review", version: "v1", schemaHash: "http-cache"))
+        }
+        schemaCache.toArray()
+    }
+
+    public func call(input: ToolInput): McpResult {
+        if (!hasGitCodeTool(input.toolName)) {
+            return McpResult(false, approved: false, needsHumanReview: true, errorKind: "tool_not_available")
+        }
+        let res = sender.send(buildToolsCallRequest(input))
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            degradedReason = mapGitCodeError(res.statusCode)
+            return McpResult(false, approved: false, needsHumanReview: true, errorKind: degradedReason)
+        }
+        McpResult(true, draft: "MCP HTTP draft for ${input.eventId}", approved: true, needsHumanReview: false)
+    }
+
+    private func jsonRpcRequest(method: String, params: String, id: String): HttpRequestSpec {
+        let headers = if (serviceToken.isEmpty()) {
+            [("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream"), ("MCP-Protocol-Version", "2025-03-26")]
+        } else {
+            [("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream"), ("MCP-Protocol-Version", "2025-03-26"), ("Authorization", "Bearer ${serviceToken}")]
+        }
+        HttpRequestSpec("POST", endpoint, headers: headers, body: "{\"jsonrpc\":\"2.0\",\"id\":\"${jsonEscape(id)}\",\"method\":\"${jsonEscape(method)}\",\"params\":${params}}")
+    }
+
+    private func hasGitCodeTool(name: String): Bool {
+        if (schemaCache.isEmpty()) { let _ = toolsList() }
+        for (schema in schemaCache) {
+            if (schema.name == name) { return true }
+        }
+        false
+    }
+}
+
 public class FakeMcpClient {
     public var available: Bool = true
     public var initialized: Bool = false
@@ -428,6 +885,7 @@ public func writebackGate(config: MonitorConfig, state: MonitorState, event: Git
     if (state.hasReply(event.id)) { return WriteDecision(false, "duplicate") }
     if (event.content.contains(SELF_MARKER)) { return WriteDecision(false, "self_marker") }
     if (containsSecret(mcp.draft)) { return WriteDecision(false, "secret_detected") }
+    if (containsLocalPath(mcp.draft)) { return WriteDecision(false, "local_path_detected") }
     return WriteDecision(true, "allowed")
 }
 
@@ -439,6 +897,26 @@ public class FakeCommentWriter {
         written.add(withMarker)
         state.markReply(event.id)
         "https://gitcode.com/${event.org}/${event.repo}/comments/${written.size}"
+    }
+}
+
+public class GitCodeCommentWriter {
+    public let client: GitCodeApiClient
+    public let sender: FakeHttpSender
+    public init(client: GitCodeApiClient, sender!: FakeHttpSender = FakeHttpSender()) {
+        this.client = client
+        this.sender = sender
+    }
+    public func writeIfAllowed(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, mcp: McpResult): WriteDecision {
+        let decision = writebackGate(config, state, event, mcp)
+        if (!decision.allowed) { return decision }
+        let res = sender.send(client.postCommentRequest(event, mcp.draft))
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+            state.markReply(event.id)
+            return WriteDecision(true, "posted")
+        }
+        state.setBackoff("${event.org}/${event.repo}", 60000)
+        WriteDecision(false, mapGitCodeError(res.statusCode))
     }
 }
 
@@ -548,9 +1026,100 @@ public func doctorReport(config: MonitorConfig, state: MonitorState, mcp: FakeMc
     "GitCodeMonitor doctor\norgs=${config.orgs.size}\nfullScanIntervalMinutes=${config.fullScanIntervalMinutes}\ndryRun=${config.dryRun}\nautoReply=${config.autoReply}\nacp=${acp}\nmcpInitialized=${mcp.initialized}\naudit=${state.audit.size}"
 }
 
+public func probeGitCode(config: MonitorConfig): String {
+    let client = GitCodeApiClient(baseUrl: config.gitCodeBaseUrl, authMode: config.gitCodeAuthMode, token: config.gitCodeToken)
+    let req = client.listReposRequest(config.orgs[0], 1, 20)
+    "probe-gitcode\n${req.redactedLogLine()}\nauth=${if (config.gitCodeToken.isEmpty()) { "absent" } else { "present" }}"
+}
+
+public func probeMcp(config: MonitorConfig): String {
+    let client = McpHttpClient(config.mcpEndpoint, serviceToken: config.mcpServiceToken)
+    let req = client.buildInitializeRequest()
+    "probe-mcp\n${req.redactedLogLine()}\nrequestBody=${req.body}"
+}
+
+public func serveOnceBaseline(config: MonitorConfig): String {
+    "serve baseline: intervalMinutes=${config.fullScanIntervalMinutes} dryRun=${config.dryRun} autoReply=${config.autoReply}"
+}
+
+public func cliHelp(): String {
+    "Usage: gitcodemonitor <doctor|scan-once|serve|probe-gitcode|probe-mcp|config summary|tests>"
+}
+
+public func notificationText(event: GitCodeEvent): String {
+    "[${event.itemKind}] ${event.org}/${event.repo}#${event.itemId} by ${event.actor}\n${event.url}\n${compactSummary(redactSecrets(event.content))}"
+}
+
+public func containsLocalPath(text: String): Bool {
+    text.contains("/Users/") || text.contains("/private/var/") || text.contains("C:\\")
+}
+
 func arrayContains(items: Array<String>, value: String): Bool {
     for (item in items) {
         if (item == value) { return true }
     }
     false
+}
+
+func joinStrings(items: Array<String>, sep: String): String {
+    let out = StringBuilder()
+    for (i in 0..items.size) {
+        if (i > 0) { out.append(sep) }
+        out.append(items[i])
+    }
+    out.toString()
+}
+
+func stringArrayJson(items: Array<String>): JsonArray {
+    let arr = JsonArray([])
+    for (item in items) { arr.add(JsonString(item)) }
+    arr
+}
+
+func readJsonString(o: JsonObject, key: String): String {
+    match (o.get(key)) {
+        case Some(v) => try { v.asString().getValue() } catch (_: Exception) { "" }
+        case None => ""
+    }
+}
+
+func readJsonInt(o: JsonObject, key: String): Int64 {
+    match (o.get(key)) {
+        case Some(v) => try { Int64.parse(v.toJsonString()) } catch (_: Exception) { 0 }
+        case None => 0
+    }
+}
+
+func readJsonStringArray(o: JsonObject, key: String): Array<String> {
+    let out = ArrayList<String>()
+    match (o.get(key)) {
+        case Some(v) =>
+            try {
+                for (item in v.asArray().getItems()) {
+                    try { out.add(item.asString().getValue()) } catch (_inner: Exception) { () }
+                }
+            } catch (_: Exception) { () }
+        case None => ()
+    }
+    out.toArray()
+}
+
+func trimTrailingSlash(raw: String): String {
+    if (raw.endsWith("/")) { raw[0..raw.size - 1] } else { raw }
+}
+
+func urlPart(raw: String): String {
+    raw.replace(" ", "%20").replace("/", "%2F").replace(":", "%3A").replace("+", "%2B")
+}
+
+func redactUrl(raw: String): String {
+    if (raw.contains("/bot") && raw.contains("/sendMessage")) {
+        let before = raw.split("/bot")[0]
+        let after = raw.split("/sendMessage")[1]
+        return "${before}/bot[REDACTED]/sendMessage${after}"
+    }
+    if (raw.contains("access_token=")) {
+        return raw.replace(raw.split("access_token=")[1].split("&")[0], "[REDACTED]")
+    }
+    raw
 }
