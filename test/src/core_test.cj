@@ -1,6 +1,6 @@
 package gitcodemonitor
 
-import std.fs.{remove, Path, exists}
+import std.fs.{Directory, File, remove, Path, exists}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -20,6 +20,34 @@ public class GitCodeMonitorCoreTest {
         @Expect(config.autoReply, false)
         @Expect(config.acpEnabled, false)
         @Expect(validateConfig(config), "ok")
+    }
+
+    @TestCase
+    public func loadConfigUsesInjectablePathAndRedactsSecrets(): Unit {
+        let dir = Path("/tmp/gcm-config-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        Directory.create(dir, recursive: true)
+        let path = dir.join("metis.json")
+        File.writeTo(path, ("{" +
+            "\"gitcode\":{\"baseUrl\":\"https://gitcode.example/api/v5\",\"authMode\":\"Authorization\",\"token\":\"gitcode-secret\",\"cookie\":\"sid=cookie-secret\",\"username\":\"bot\",\"password\":\"password-secret\"}," +
+            "\"metis\":{\"mcpEndpoint\":\"http://127.0.0.1:8787/mcp\",\"mcpServiceToken\":\"mcp-secret\"}," +
+            "\"feishu\":{\"webhook\":\"https://open.feishu.cn/hook/feishu-secret\"}," +
+            "\"telegram\":{\"botToken\":\"123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef\",\"chatId\":\"chat\"}," +
+            "\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"autoReply\":false,\"notifyNetworkEnabled\":false,\"repoAllowlist\":[\"cangjie/compiler\"]}" +
+            "}").toArray())
+        let config = loadConfig(path: path.toString())
+        @Expect(config.gitCodeBaseUrl, "https://gitcode.example/api/v5")
+        @Expect(config.gitCodeAuthMode, "Authorization")
+        @Expect(config.mcpEndpoint, "http://127.0.0.1:8787/mcp")
+        @Expect(config.telegramChatId, "chat")
+        @Expect(config.repoAllowlist[0], "cangjie/compiler")
+        let summary = configSummary(config)
+        let doctor = doctorReport(config, MonitorState(), FakeMcpClient())
+        @Expect(summary.contains("gitcode-secret"), false)
+        @Expect(summary.contains("cookie-secret"), false)
+        @Expect(summary.contains("mcp-secret"), false)
+        @Expect(summary.contains("present"), true)
+        @Expect(doctor.contains("gitCodeAuth=present"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
     @TestCase
@@ -76,6 +104,33 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func gitCodeHttpTransportParsesReposIssuesPrsCommentsAndRateLimit(): Unit {
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"projects\":[{\"path\":\"compiler\"},{\"full_name\":\"cangjie/runtime\"}]}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"data\":[{\"number\":11,\"title\":\"bug\",\"body\":\"details\",\"user\":{\"login\":\"alice\",\"html_url\":\"https://gitcode.com/alice\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/11\"}]}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[{\"id\":99,\"body\":\"comment\",\"user\":{\"login\":\"bob\"}}]}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"items\":[{\"id\":7,\"title\":\"pr\",\"description\":\"change\",\"author\":{\"username\":\"carol\"}}]}"))
+        sender.enqueue(HttpResponseSpec(200, body: "[]"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(token: "secret"), sender: sender, pageSize: 50)
+        let repos = transport.listReposPage("cangjie", 1)
+        @Expect(repos.repos.size, 2)
+        @Expect(repos.repos[0].fullName(), "cangjie/compiler")
+        let state = MonitorState()
+        let events = collectRepoEventsHttp(GitCodeRepo("cangjie", "compiler"), transport, state)
+        @Expect(events.size, 3)
+        @Expect(events[0].id, "cangjie/compiler:issue:11")
+        @Expect(events[1].id, "cangjie/compiler:issue:11:comment:99")
+        @Expect(events[2].itemKind, "pr")
+
+        let limitedSender = FakeHttpSender()
+        limitedSender.nextResponse = HttpResponseSpec(429, headers: [("Retry-After", "2")])
+        let limited = GitCodeHttpTransport(GitCodeApiClient(), sender: limitedSender)
+        let limitedResult = limited.listReposPage("cangjie", 1)
+        @Expect(limitedResult.errorKind, "rate_limited")
+        @Expect(limitedResult.retryAfterMs, 2000)
+    }
+
+    @TestCase
     public func realGitCodeRequestBuilderSupportsAuthModesAndRedaction(): Unit {
         let privateClient = GitCodeApiClient(token: "private-secret")
         let privateReq = privateClient.listReposRequest("cangjie", 2, 50)
@@ -93,6 +148,10 @@ public class GitCodeMonitorCoreTest {
         let queryReq = queryClient.listCommentsRequest(GitCodeRepo("cangjie", "compiler"), "pr", "9", 1, 20)
         @Expect(queryReq.url.contains("access_token="), true)
         @Expect(queryReq.redactedLogLine().contains("query-secret"), false)
+
+        let cookieClient = GitCodeApiClient(token: "token-secret", cookie: "sid=cookie-secret")
+        let cookieReq = cookieClient.listReposRequest("cangjie", 1, 20)
+        @Expect(cookieReq.redactedLogLine().contains("cookie-secret"), false)
     }
 
     @TestCase
@@ -168,6 +227,14 @@ public class GitCodeMonitorCoreTest {
         let audit = notifier.notify(event)
         @Expect(audit.status, "dry_run")
         @Expect(sender.requests.size, 0)
+
+        let liveSender = FakeHttpSender()
+        liveSender.nextResponse = HttpResponseSpec(200, body: "{\"ok\":true}")
+        let live = HttpNotifier("telegram", networkEnabled: true, webhookOrToken: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef", chatId: "chat", sender: liveSender)
+        let delivery = live.notify(event)
+        @Expect(delivery.status, "sent")
+        @Expect(liveSender.requests.size, 1)
+        @Expect(liveSender.requests[0].redactedLogLine().contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), false)
     }
 
     @TestCase
@@ -221,6 +288,22 @@ public class GitCodeMonitorCoreTest {
         @Expect(url.contains("https://gitcode.com/cangjie/compiler/comments/"), true)
         @Expect(writebackGate(config, state, event, mcp).reason, "duplicate")
         @Expect(filterEvent(GitCodeEvent("self", "cangjie", "compiler", "issue", "1", "bot", "", "", writer.written[0])).reason, "self_marker")
+    }
+
+    @TestCase
+    public func serviceLifecycleStopsAfterConfiguredScansAndHonorsOverlapGuard(): Unit {
+        let config = defaultConfig()
+        let clock = FakeClock()
+        let state = MonitorState()
+        let scheduler = FullScanScheduler(config, clock)
+        let summary = runServiceTicks(config, clock, scheduler, state, ServiceControl(maxScans: 2), tickMinutes: 10)
+        @Expect(summary.scans, 2)
+        @Expect(summary.stopped, true)
+        let overlapState = MonitorState()
+        let overlapScheduler = FullScanScheduler(config, FakeClock())
+        @Expect(overlapScheduler.begin(FakeClock(), overlapState), true)
+        @Expect(overlapScheduler.begin(FakeClock(), overlapState), false)
+        @Expect(overlapState.skippedOverlappingScans, 1)
     }
 
     @TestCase

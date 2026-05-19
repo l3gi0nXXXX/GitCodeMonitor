@@ -13,9 +13,11 @@ and final GitCode writeback decisions stay inside this project. Metis does not
 receive GitCode credentials and does not write GitCode comments.
 
 The current baseline is intentionally offline-testable. It provides
-configuration, secret redaction, fake GitCode transport, scheduler, state store,
-filters, notifiers, MCP client primitives, writeback guards, and optional ACP
-client primitives without using real network calls in tests.
+configuration loading from an injectable Metis config path, secret redaction,
+fake and HTTP-backed GitCode transport surfaces, scheduler/service lifecycle,
+state store, filters, notification senders, MCP client primitives, writeback
+guards, and optional ACP client primitives without using real network calls in
+tests.
 
 ## Usage
 
@@ -30,7 +32,7 @@ Useful commands:
 cjpm build -i
 cjpm test
 (cd test && cjpm test)
-cjpm run --run-args doctor
+cjpm run --run-args --config /tmp/gcm-metis.json doctor
 cjpm run --run-args scan-once
 cjpm run --run-args tests
 ```
@@ -59,6 +61,9 @@ cjpm run --run-args scan-once
 
 Do not put real GitCode tokens, bot tokens, cookies, or passwords in test
 fixtures or logs.
+
+Runtime configuration defaults to `$HOME/.metis/metis.json`. Tests and local
+automation should pass `--config <path>` and use temporary files.
 
 ## How to Contribute
 
