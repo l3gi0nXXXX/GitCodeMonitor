@@ -1,0 +1,21 @@
+[package]
+  cjc-version = "1.0.0"
+  name = "gitcodemonitor"
+  description = "GitCodeMonitor offline unittest package."
+  version = "0.1.0"
+  target-dir = ""
+  src-dir = ""
+  output-type = "static"
+  compile-option = "-Woff unused"
+  override-compile-option = ""
+  link-option = ""
+
+[profile.test]
+  parallel = 1
+  no-progress = true
+  no-color = true
+
+[profile.test.env]
+  cjHeapSize = { value = "64MB", splice-type = "replace" }
+
+[dependencies]
