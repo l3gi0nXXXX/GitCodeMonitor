@@ -5,7 +5,11 @@ import std.convert.Parsable
 import std.env.getVariable
 import std.fs.{Directory, File, Path, exists}
 import std.process.executeWithOutput
+import std.time.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
+import stdx.encoding.url.URL
+import stdx.net.http.*
+import stdx.net.tls.*
 
 public let SELF_MARKER = "<!-- gitcodemonitor:auto-reply:v1 -->"
 
@@ -27,6 +31,7 @@ public class MonitorConfig {
     public var gitCodeCookie: String
     public var gitCodeUsername: String
     public var gitCodePassword: String
+    public var httpTransport: String
     public var mcpEndpoint: String
     public var mcpServiceToken: String
     public var statePath: String
@@ -47,12 +52,13 @@ public class MonitorConfig {
         this.acpEndpoint = ""
         this.acpServiceToken = ""
         this.acpAllowedTasks = []
-        this.gitCodeBaseUrl = "https://gitcode.com/api/v5"
+        this.gitCodeBaseUrl = "https://api.gitcode.com/api/v5"
         this.gitCodeAuthMode = "PRIVATE-TOKEN"
         this.gitCodeToken = ""
         this.gitCodeCookie = ""
         this.gitCodeUsername = ""
         this.gitCodePassword = ""
+        this.httpTransport = "native"
         this.mcpEndpoint = ""
         this.mcpServiceToken = ""
         this.statePath = "data/gitcodemonitor-state.json"
@@ -112,6 +118,7 @@ public func configSummary(config: MonitorConfig): String {
     "GitCodeMonitor config\n" +
         "orgs=${joinStrings(config.orgs, ",")}\n" +
         "gitCodeBaseUrl=${config.gitCodeBaseUrl}\n" +
+        "transport=${configuredHttpTransport(config)}\n" +
         "gitCodeAuth=${config.gitCodeAuthMode}:${auth}\n" +
         "mcpEndpoint=${config.mcpEndpoint}\n" +
         "mcpAuth=${mcpAuth}\n" +
@@ -316,6 +323,7 @@ public class MonitorState {
 
 public class StateStore {
     public let path: Path
+    public var loadDegraded: Bool = false
     public init(path: String) { this.path = Path(path) }
 
     public func save(state: MonitorState): Bool {
@@ -331,6 +339,7 @@ public class StateStore {
 
     public func load(): MonitorState {
         let state = MonitorState()
+        loadDegraded = false
         if (!exists(path)) { return state }
         try {
             let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
@@ -363,6 +372,11 @@ public class StateStore {
                 case None => ()
             }
         } catch (_: Exception) {
+            loadDegraded = true
+            try {
+                let backup = Path(path.toString() + ".corrupt")
+                if (!exists(backup)) { File.writeTo(backup, File.readFrom(path)) }
+            } catch (_inner: Exception) { () }
             state.addAudit(AuditRecord("state-load", status: "state_error", reason: "corrupt_or_unreadable"))
         }
         state
@@ -441,9 +455,21 @@ public class FullScanScheduler {
 public class GitCodeRepo {
     public let org: String
     public let name: String
-    public init(org: String, name: String) {
+    public let visibility: String
+    public let isPublic: Bool
+    public let isPrivate: Bool
+    public let isInternal: Bool
+    public let defaultBranch: String
+    public let htmlUrl: String
+    public init(org: String, name: String, visibility!: String = "", isPublic!: Bool = false, isPrivate!: Bool = false, isInternal!: Bool = false, defaultBranch!: String = "", htmlUrl!: String = "") {
         this.org = org
         this.name = name
+        this.visibility = visibility
+        this.isPublic = isPublic
+        this.isPrivate = isPrivate
+        this.isInternal = isInternal
+        this.defaultBranch = defaultBranch
+        this.htmlUrl = htmlUrl
     }
     public func fullName(): String { "${org}/${name}" }
 }
@@ -481,7 +507,15 @@ public class HttpResponseSpec {
     }
 }
 
-public class FakeHttpSender {
+public interface HttpSender {
+    func send(request: HttpRequestSpec): HttpResponseSpec
+}
+
+public interface NativeRawHttpTransport {
+    func send(request: HttpRequestSpec, timeoutSeconds: Int64): HttpResponseSpec
+}
+
+public class FakeHttpSender <: HttpSender {
     public let requests = ArrayList<HttpRequestSpec>()
     public var nextResponse: HttpResponseSpec = HttpResponseSpec(200, body: "{}")
     public let queuedResponses = ArrayList<HttpResponseSpec>()
@@ -498,7 +532,89 @@ public class FakeHttpSender {
     }
 }
 
-public class CurlHttpSender {
+public class NativeHttpSender <: HttpSender {
+    private let timeoutSeconds: Int64
+    private let rawTransport: NativeRawHttpTransport
+
+    public init(timeoutSeconds!: Int64 = 30, rawTransport!: NativeRawHttpTransport = StdxNativeRawHttpTransport()) {
+        this.timeoutSeconds = if (timeoutSeconds <= 0) { 30 } else { timeoutSeconds }
+        this.rawTransport = rawTransport
+    }
+
+    public func send(request: HttpRequestSpec): HttpResponseSpec {
+        try {
+            rawTransport.send(request, this.timeoutSeconds)
+        } catch (e: Exception) {
+            HttpResponseSpec(599, body: "transport_error: ${redactSecrets(redactUrl(e.message))}")
+        }
+    }
+}
+
+public class StdxNativeRawHttpTransport <: NativeRawHttpTransport {
+    public init() {}
+
+    public func send(request: HttpRequestSpec, timeoutSeconds: Int64): HttpResponseSpec {
+        try {
+            let client = this.buildClient(request.url, timeoutSeconds)
+            try {
+                let response = client.send(this.buildRequest(request))
+                let body = try {
+                    String.fromUtf8(this.readAllBytes(response))
+                } catch (_: Exception) {
+                    return HttpResponseSpec(598, body: "transport_error: response body is not valid UTF-8")
+                }
+                HttpResponseSpec(Int64(response.status), body: body)
+            } finally {
+                client.close()
+            }
+        } catch (e: Exception) {
+            HttpResponseSpec(599, body: "transport_error: ${redactSecrets(redactUrl(e.message))}")
+        }
+    }
+
+    private func buildClient(url: String, timeoutSeconds: Int64): Client {
+        let builder = ClientBuilder()
+        builder.readTimeout(Duration.second * timeoutSeconds)
+        if (url.trimAscii().toAsciiLower().startsWith("https")) {
+            var tlsConfig = TlsClientConfig()
+            tlsConfig.domain = URL.parse(url).hostName
+            tlsConfig.alpnProtocolsList = ["http/1.1"]
+            builder.tlsConfig(tlsConfig)
+        }
+        builder.build()
+    }
+
+    private func buildRequest(request: HttpRequestSpec): HttpRequest {
+        let builder = HttpRequestBuilder().url(request.url)
+        match (request.method.toAsciiUpper()) {
+            case "POST" => builder.post()
+            case "PATCH" => builder.method("PATCH")
+            case "DELETE" => builder.method("DELETE")
+            case "PUT" => builder.method("PUT")
+            case _ => builder.get()
+        }
+        if (!request.body.isEmpty()) {
+            builder.body(request.body)
+        }
+        for ((key, value) in request.headers) {
+            builder.header(key, value)
+        }
+        builder.build()
+    }
+
+    private func readAllBytes(response: HttpResponse): Array<Byte> {
+        let out = ArrayList<Byte>()
+        let buffer = Array<Byte>(8192, repeat: 0)
+        while (true) {
+            let n = response.body.read(buffer)
+            if (n <= 0) { break }
+            out.add(all: buffer[..n])
+        }
+        out.toArray()
+    }
+}
+
+public class CurlHttpSender <: HttpSender {
     public init() {}
 
     public func curlArgs(request: HttpRequestSpec): Array<String> {
@@ -527,17 +643,34 @@ public class CurlHttpSender {
     }
 
     public func send(request: HttpRequestSpec): HttpResponseSpec {
-        let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput("curl", curlArgs(request))
-        if (exitCode != 0) {
-            return HttpResponseSpec(599, body: String.fromUtf8(stderrBytes))
+        try {
+            let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput("curl", curlArgs(request))
+            if (exitCode != 0) {
+                return HttpResponseSpec(599, body: "transport_error: ${redactSecrets(redactUrl(String.fromUtf8(stderrBytes)))}")
+            }
+            let text = try { String.fromUtf8(stdoutBytes) } catch (_: Exception) { return HttpResponseSpec(598, body: "transport_error: response body is not valid UTF-8") }
+            let lines = text.split("\n")
+            if (lines.size == 0) { return HttpResponseSpec(599, body: "transport_error: missing curl status") }
+            let code = try { Int64.parse(lines[lines.size - 1].trimAscii()) } catch (_: Exception) { 599 }
+            let body = if (lines.size > 1) { joinStrings(lines[0..lines.size - 1], "\n") } else { "" }
+            HttpResponseSpec(code, body: body)
+        } catch (e: Exception) {
+            HttpResponseSpec(599, body: "transport_error: ${redactSecrets(redactUrl(e.message))}")
         }
-        let text = String.fromUtf8(stdoutBytes)
-        let lines = text.split("\n")
-        if (lines.size == 0) { return HttpResponseSpec(599) }
-        let code = try { Int64.parse(lines[lines.size - 1].trimAscii()) } catch (_: Exception) { 599 }
-        let body = if (lines.size > 1) { joinStrings(lines[0..lines.size - 1], "\n") } else { "" }
-        HttpResponseSpec(code, body: body)
     }
+}
+
+public func configuredHttpTransport(config: MonitorConfig): String {
+    let value = config.httpTransport.trimAscii().toAsciiLower()
+    if (value == "curl") { return "curl" }
+    "native"
+}
+
+public func buildHttpSender(config: MonitorConfig): HttpSender {
+    if (configuredHttpTransport(config) == "curl") {
+        return CurlHttpSender()
+    }
+    NativeHttpSender()
 }
 
 public class GitCodeApiClient {
@@ -546,7 +679,7 @@ public class GitCodeApiClient {
     private let token: String
     private let cookie: String
 
-    public init(baseUrl!: String = "https://gitcode.com/api/v5", authMode!: String = "PRIVATE-TOKEN", token!: String = "", cookie!: String = "") {
+    public init(baseUrl!: String = "https://api.gitcode.com/api/v5", authMode!: String = "PRIVATE-TOKEN", token!: String = "", cookie!: String = "") {
         this.baseUrl = trimTrailingSlash(baseUrl)
         this.authMode = authMode
         this.token = token
@@ -567,20 +700,34 @@ public class GitCodeApiClient {
     }
 
     public func listReposRequest(org: String, page: Int64, pageSize: Int64): HttpRequestSpec {
-        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/orgs/${urlPart(org)}/projects?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/orgs/${urlPart(org)}/repos?type=public&page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
     }
 
-    public func listIssuesRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64): HttpRequestSpec {
-        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+    public func listIssuesRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64, since!: String = ""): HttpRequestSpec {
+        var url = "${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues?state=all&sort=updated_at&direction=desc&page=${page}&per_page=${boundedPageSize(pageSize)}"
+        if (!since.isEmpty()) { url = "${url}&since=${urlPart(since)}" }
+        HttpRequestSpec("GET", withAuthQuery(url), headers: authHeaders())
     }
 
-    public func listPullRequestsRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64): HttpRequestSpec {
-        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+    public func listPullRequestsRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64, updatedAfter!: String = ""): HttpRequestSpec {
+        var url = "${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls?state=all&sort=updated&direction=desc&page=${page}&per_page=${boundedPageSize(pageSize)}"
+        if (!updatedAfter.isEmpty()) { url = "${url}&updated_after=${urlPart(updatedAfter)}" }
+        HttpRequestSpec("GET", withAuthQuery(url), headers: authHeaders())
     }
 
     public func listCommentsRequest(repo: GitCodeRepo, itemKind: String, itemId: String, page: Int64, pageSize: Int64): HttpRequestSpec {
-        let kind = if (itemKind == "pr") { "pulls" } else { "issues" }
-        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/${kind}/${urlPart(itemId)}/comments?page=${page}&per_page=${pageSize}"), headers: authHeaders())
+        if (itemKind == "pr") {
+            return listPullRequestCommentsRequest(repo, itemId, page, pageSize)
+        }
+        listIssueCommentsRequest(repo, page, pageSize)
+    }
+
+    public func listIssueCommentsRequest(repo: GitCodeRepo, page: Int64, pageSize: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues/comments?page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
+    }
+
+    public func listPullRequestCommentsRequest(repo: GitCodeRepo, itemId: String, page: Int64, pageSize: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls/${urlPart(itemId)}/comments?page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
     }
 
     public func postCommentRequest(event: GitCodeEvent, body: String): HttpRequestSpec {
@@ -613,9 +760,9 @@ public class GitCodeListResult {
 
 public class GitCodeHttpTransport {
     public let client: GitCodeApiClient
-    public let sender: FakeHttpSender
+    public let sender: HttpSender
     public let pageSize: Int64
-    public init(client: GitCodeApiClient, sender!: FakeHttpSender = FakeHttpSender(), pageSize!: Int64 = 50) {
+    public init(client: GitCodeApiClient, sender!: HttpSender = FakeHttpSender(), pageSize!: Int64 = 50) {
         this.client = client
         this.sender = sender
         this.pageSize = pageSize
@@ -652,6 +799,71 @@ public class GitCodeHttpTransport {
         }
         GitCodeListResult(events: parseCommentsResponse(res.body, repo, kind, itemId))
     }
+}
+
+public class RuntimeContainer {
+    public let config: MonitorConfig
+    public let store: StateStore
+    public let sender: HttpSender
+    public let gitCode: GitCodeHttpTransport
+    public let feishu: HttpNotifier
+    public let telegram: HttpNotifier
+    public let mcp: McpHttpClient
+    public let writer: GitCodeCommentWriter
+
+    public init(config: MonitorConfig, sender!: ?HttpSender = None<HttpSender>) {
+        this.config = config
+        this.store = StateStore(config.statePath)
+        this.sender = match (sender) {
+            case Some(s) => s
+            case None => buildHttpSender(config)
+        }
+        let client = GitCodeApiClient(baseUrl: config.gitCodeBaseUrl, authMode: config.gitCodeAuthMode, token: config.gitCodeToken, cookie: config.gitCodeCookie)
+        this.gitCode = GitCodeHttpTransport(client, sender: this.sender, pageSize: 100)
+        this.feishu = HttpNotifier("feishu", networkEnabled: config.notifyNetworkEnabled, webhookOrToken: config.feishuWebhook, sender: this.sender)
+        this.telegram = HttpNotifier("telegram", networkEnabled: config.notifyNetworkEnabled, webhookOrToken: config.telegramBotToken, chatId: config.telegramChatId, sender: this.sender)
+        this.mcp = McpHttpClient(config.mcpEndpoint, serviceToken: config.mcpServiceToken, sender: this.sender)
+        this.writer = GitCodeCommentWriter(client, sender: this.sender)
+    }
+}
+
+public func scanOnceRuntime(config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): ScanResult {
+    var accepted: Int64 = 0
+    var ignored: Int64 = 0
+    var notified: Int64 = 0
+    var mcpCalls: Int64 = 0
+    var writes: Int64 = 0
+    for (org in config.orgs) {
+        var page: Int64 = 1
+        while (true) {
+            let repoResult = runtime.gitCode.listReposPage(org, page)
+            if (repoResult.errorKind != "ok") {
+                state.setBackoff("org:${org}", repoResult.retryAfterMs)
+                state.addAudit(AuditRecord("org:${org}", status: "scan_degraded", reason: repoResult.errorKind))
+                break
+            }
+            for (repo in repoResult.repos) {
+                for (event in collectRepoEventsHttp(repo, runtime.gitCode, state)) {
+                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer)
+                    accepted += processed.accepted
+                    ignored += processed.ignored
+                    notified += processed.notified
+                    mcpCalls += processed.mcpCalls
+                    writes += processed.writes
+                }
+            }
+            if (repoResult.repos.size < runtime.gitCode.pageSize) { break }
+            page++
+        }
+    }
+    ScanResult(accepted, ignored, notified, mcpCalls, writes)
+}
+
+public func scanOnceOfflineFixture(config: MonitorConfig, state: MonitorState): ScanResult {
+    let transport = FakeGitCodeTransport()
+    transport.seedDefaultRepos()
+    transport.events.add(GitCodeEvent("evt-1", "cangjie", "compiler", "issue", "1", "alice", "https://gitcode.com/alice", "https://gitcode.com/cangjie/compiler/issues/1", "Please check this issue."))
+    scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
 }
 
 public class GitCodeCurlTransport {
@@ -799,11 +1011,17 @@ public class DeliveryAudit {
     public let channel: String
     public let status: String
     public let error: String
-    public init(eventId: String, channel: String, status: String, error!: String = "") {
+    public let httpStatus: Int64
+    public let errorKind: String
+    public let attempts: Int64
+    public init(eventId: String, channel: String, status: String, error!: String = "", httpStatus!: Int64 = 0, errorKind!: String = "", attempts!: Int64 = 1) {
         this.eventId = eventId
         this.channel = channel
         this.status = status
         this.error = error
+        this.httpStatus = httpStatus
+        this.errorKind = errorKind
+        this.attempts = attempts
     }
 }
 
@@ -836,12 +1054,13 @@ public func buildTelegramPayload(botToken: String, chatId: String, event: GitCod
 public class HttpNotifier {
     public let channel: String
     public let networkEnabled: Bool
-    public let sender: FakeHttpSender
+    public let sender: HttpSender
     private let webhookOrToken: String
     private let chatId: String
+    public var backoffUntilMs: Int64 = 0
     public let deliveries = ArrayList<DeliveryAudit>()
 
-    public init(channel: String, networkEnabled!: Bool = false, webhookOrToken!: String = "", chatId!: String = "", sender!: FakeHttpSender = FakeHttpSender()) {
+    public init(channel: String, networkEnabled!: Bool = false, webhookOrToken!: String = "", chatId!: String = "", sender!: HttpSender = FakeHttpSender()) {
         this.channel = channel
         this.networkEnabled = networkEnabled
         this.webhookOrToken = webhookOrToken
@@ -856,9 +1075,17 @@ public class HttpNotifier {
             deliveries.add(audit)
             return audit
         }
+        if (backoffUntilMs > 0) {
+            let audit = DeliveryAudit(event.id, channel, "backoff", error: "channel_backoff", errorKind: "backoff")
+            deliveries.add(audit)
+            return audit
+        }
         let res = sender.send(payload.request)
         let status = if (res.statusCode >= 200 && res.statusCode < 300) { "sent" } else { mapGitCodeError(res.statusCode) }
-        let audit = DeliveryAudit(event.id, channel, status)
+        if (res.statusCode == 429 || res.statusCode >= 500) {
+            backoffUntilMs = retryAfterMs(res)
+        }
+        let audit = DeliveryAudit(event.id, channel, status, httpStatus: res.statusCode, errorKind: if (status == "sent") { "" } else { status })
         deliveries.add(audit)
         audit
     }
@@ -929,39 +1156,57 @@ public class ToolInput {
     public let eventId: String
     public let repo: String
     public let body: String
-    public init(toolName: String, eventId: String, repo: String, body: String) {
+    public let itemKind: String
+    public let itemId: String
+    public let actor: String
+    public let actorUrl: String
+    public let url: String
+    public let rawSummary: String
+    public init(toolName: String, eventId: String, repo: String, body: String, itemKind!: String = "", itemId!: String = "", actor!: String = "", actorUrl!: String = "", url!: String = "", rawSummary!: String = "") {
         this.toolName = toolName
         this.eventId = eventId
         this.repo = repo
         this.body = body
+        this.itemKind = itemKind
+        this.itemId = itemId
+        this.actor = actor
+        this.actorUrl = actorUrl
+        this.url = url
+        this.rawSummary = rawSummary
     }
 }
 
 public class McpResult {
     public let ok: Bool
+    public let summary: String
     public let draft: String
     public let approved: Bool
     public let needsHumanReview: Bool
     public let errorKind: String
-    public init(ok: Bool, draft!: String = "", approved!: Bool = true, needsHumanReview!: Bool = false, errorKind!: String = "") {
+    public let reason: String
+    public let citations: Array<String>
+    public init(ok: Bool, summary!: String = "", draft!: String = "", approved!: Bool = true, needsHumanReview!: Bool = false, errorKind!: String = "", reason!: String = "", citations!: Array<String> = []) {
         this.ok = ok
+        this.summary = summary
         this.draft = draft
         this.approved = approved
         this.needsHumanReview = needsHumanReview
         this.errorKind = errorKind
+        this.reason = reason
+        this.citations = citations
     }
 }
 
 public class McpHttpClient {
     public let endpoint: String
     private let serviceToken: String
-    public let sender: FakeHttpSender
+    public let sender: HttpSender
     public var requestSeq: Int64 = 0
     public var initialized: Bool = false
     public var degradedReason: String = ""
     public let schemaCache = ArrayList<ToolSchema>()
 
-    public init(endpoint: String, serviceToken!: String = "", sender!: FakeHttpSender = FakeHttpSender()) {
+    public init(endpoint: String, serviceToken!: String = "", sender!: HttpSender = FakeHttpSender()) {
         this.endpoint = endpoint
         this.serviceToken = serviceToken
         this.sender = sender
@@ -981,7 +1226,16 @@ public class McpHttpClient {
     }
 
     public func buildToolsCallRequest(input: ToolInput): HttpRequestSpec {
-        let args = "{\"eventId\":\"${jsonEscape(input.eventId)}\",\"repo\":\"${jsonEscape(input.repo)}\",\"body\":\"${jsonEscape(input.body)}\"}"
+        let args = "{" +
+            "\"eventId\":\"${jsonEscape(input.eventId)}\"," +
+            "\"repo\":\"${jsonEscape(input.repo)}\"," +
+            "\"kind\":\"${jsonEscape(input.itemKind)}\"," +
+            "\"number\":\"${jsonEscape(input.itemId)}\"," +
+            "\"body\":\"${jsonEscape(input.body)}\"," +
+            "\"author\":{\"login\":\"${jsonEscape(input.actor)}\",\"url\":\"${jsonEscape(input.actorUrl)}\"}," +
+            "\"url\":\"${jsonEscape(input.url)}\"," +
+            "\"rawSummary\":\"${jsonEscape(input.rawSummary)}\"" +
+            "}"
         jsonRpcRequest("tools/call", "{\"name\":\"${jsonEscape(input.toolName)}\",\"arguments\":${args}}", nextRequestId("mcp-call"))
     }
 
@@ -998,13 +1252,14 @@ public class McpHttpClient {
             degradedReason = mapGitCodeError(res.statusCode)
             return schemaCache.toArray()
         }
-        if (schemaCache.isEmpty()) {
-            schemaCache.add(ToolSchema("gitcode_issue_summary", version: "v1", schemaHash: "http-cache"))
-            schemaCache.add(ToolSchema("gitcode_issue_draft_reply", version: "v1", schemaHash: "http-cache"))
-            schemaCache.add(ToolSchema("gitcode_pr_summary", version: "v1", schemaHash: "http-cache"))
-            schemaCache.add(ToolSchema("gitcode_pr_draft_reply", version: "v1", schemaHash: "http-cache"))
-            schemaCache.add(ToolSchema("gitcode_safety_review", version: "v1", schemaHash: "http-cache"))
+        let parsed = parseMcpToolsResponse(res.body)
+        if (parsed.size == 0) {
+            degradedReason = "mcp_tools_parse_error"
+            return schemaCache.toArray()
         }
+        while (!schemaCache.isEmpty()) { schemaCache.remove(at: 0) }
+        for (schema in parsed) { schemaCache.add(schema) }
+        if (!hasRequiredGitCodeTools()) { degradedReason = "mcp_required_tools_missing" }
         schemaCache.toArray()
     }
 
@@ -1017,7 +1272,9 @@ public class McpHttpClient {
             degradedReason = mapGitCodeError(res.statusCode)
             return McpResult(false, approved: false, needsHumanReview: true, errorKind: degradedReason)
         }
-        McpResult(true, draft: "MCP HTTP draft for ${input.eventId}", approved: true, needsHumanReview: false)
+        let parsed = parseMcpCallResponse(res.body)
+        if (!parsed.ok) { degradedReason = parsed.errorKind }
+        parsed
     }
 
     private func jsonRpcRequest(method: String, params: String, id: String): HttpRequestSpec {
@@ -1035,6 +1292,14 @@ public class McpHttpClient {
             if (schema.name == name) { return true }
         }
         false
+    }
+
+    private func hasRequiredGitCodeTools(): Bool {
+        hasGitCodeTool("gitcode_issue_summary") &&
+            hasGitCodeTool("gitcode_issue_draft_reply") &&
+            hasGitCodeTool("gitcode_pr_summary") &&
+            hasGitCodeTool("gitcode_pr_draft_reply") &&
+            hasGitCodeTool("gitcode_safety_review")
     }
 }
 
@@ -1066,7 +1331,7 @@ public class FakeMcpClient {
 
 public func eventToToolInput(event: GitCodeEvent): ToolInput {
     let tool = if (event.itemKind == "pr") { "gitcode_pr_draft_reply" } else { "gitcode_issue_draft_reply" }
-    ToolInput(tool, event.id, "${event.org}/${event.repo}", event.content)
+    ToolInput(tool, event.id, "${event.org}/${event.repo}", event.content, itemKind: event.itemKind, itemId: event.itemId, actor: event.actor, actorUrl: event.actorUrl, url: event.url, rawSummary: compactSummary(redactSecrets(event.content), limit: 500))
 }
 
 public class WriteDecision {
@@ -1081,7 +1346,8 @@ public class WriteDecision {
 public func writebackGate(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, mcp: McpResult): WriteDecision {
     if (config.dryRun) { return WriteDecision(false, "dry_run") }
     if (!config.autoReply) { return WriteDecision(false, "auto_reply_disabled") }
-    if (!arrayContains(config.repoAllowlist, "${event.org}/${event.repo}")) { return WriteDecision(false, "repo_not_allowlisted") }
+    if (!repoAllowlisted(config.repoAllowlist, "${event.org}/${event.repo}")) { return WriteDecision(false, "repo_not_allowlisted") }
+    if (filterEvent(event).ignored) { return WriteDecision(false, "filtered_event") }
     if (!mcp.ok || !mcp.approved || mcp.needsHumanReview) { return WriteDecision(false, "safety_rejected") }
     if (state.hasReply(event.id)) { return WriteDecision(false, "duplicate") }
     if (event.content.contains(SELF_MARKER)) { return WriteDecision(false, "self_marker") }
@@ -1103,8 +1369,8 @@ public class FakeCommentWriter {
 
 public class GitCodeCommentWriter {
     public let client: GitCodeApiClient
-    public let sender: FakeHttpSender
-    public init(client: GitCodeApiClient, sender!: FakeHttpSender = FakeHttpSender()) {
+    public let sender: HttpSender
+    public init(client: GitCodeApiClient, sender!: HttpSender = FakeHttpSender()) {
         this.client = client
         this.sender = sender
     }
@@ -1222,10 +1488,50 @@ public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, sta
     ScanResult(accepted, ignored, notified, mcpCalls, writes)
 }
 
+func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, feishu: HttpNotifier, telegram: HttpNotifier, mcp: McpHttpClient, writer: GitCodeCommentWriter): ScanResult {
+    let filter = filterEvent(event)
+    if (filter.ignored) {
+        state.addAudit(AuditRecord(event.id, status: "ignored", reason: filter.reason))
+        return ScanResult(0, 1, 0, 0, 0)
+    }
+    if (state.hasSeen(event.id)) {
+        state.addAudit(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
+        return ScanResult(0, 0, 0, 0, 0)
+    }
+    state.markSeen(event.id)
+    let feishuDelivery = feishu.notify(event)
+    let telegramDelivery = telegram.notify(event)
+    let audit = AuditRecord(event.id, status: "accepted")
+    audit.deliveryStatus = "${feishuDelivery.channel}:${feishuDelivery.status},${telegramDelivery.channel}:${telegramDelivery.status}"
+    state.addAudit(audit)
+
+    var mcpCalls: Int64 = 0
+    var writes: Int64 = 0
+    if (!state.hasMcpCall(event.id)) {
+        let mcpResult = mcp.call(eventToToolInput(event))
+        if (mcpResult.ok) {
+            state.markMcpCall(event.id)
+            mcpCalls = 1
+            audit.status = "drafted"
+            let decision = writer.writeIfAllowed(config, state, event, mcpResult)
+            audit.reason = decision.reason
+            audit.writeDecision = decision.reason
+            if (decision.allowed) {
+                writes = 1
+                audit.status = "replied"
+            }
+        } else {
+            audit.status = "mcp_degraded"
+            audit.reason = mcpResult.errorKind
+        }
+    }
+    ScanResult(1, 0, 2, mcpCalls, writes)
+}
+
 public func doctorReport(config: MonitorConfig, state: MonitorState, mcp: FakeMcpClient): String {
     let acp = if (config.acpEnabled) { "enabled" } else { "disabled" }
     let auth = if (gitCodeAuthPresent(config)) { "present" } else { "absent" }
-    "GitCodeMonitor doctor\norgs=${config.orgs.size}\ngitCodeAuth=${auth}\nfullScanIntervalMinutes=${config.fullScanIntervalMinutes}\ndryRun=${config.dryRun}\nautoReply=${config.autoReply}\nacp=${acp}\nmcpInitialized=${mcp.initialized}\naudit=${state.audit.size}"
+    "GitCodeMonitor doctor\norgs=${config.orgs.size}\ngitCodeBaseUrl=${config.gitCodeBaseUrl}\ntransport=${configuredHttpTransport(config)}\nnetworkEnabled=${config.notifyNetworkEnabled}\ngitCodeAuth=${auth}\nstatePath=${config.statePath}\nfullScanIntervalMinutes=${config.fullScanIntervalMinutes}\ndryRun=${config.dryRun}\nautoReply=${config.autoReply}\nacp=${acp}\nmcpInitialized=${mcp.initialized}\naudit=${state.audit.size}"
 }
 
 public func probeGitCode(config: MonitorConfig): String {
@@ -1277,8 +1583,24 @@ public func runServiceTicks(config: MonitorConfig, clock: FakeClock, scheduler: 
     ServiceRunSummary(scans, state.skippedOverlappingScans, true)
 }
 
+public func runServiceScans(config: MonitorConfig, runtime: RuntimeContainer, clock: FakeClock, scheduler: FullScanScheduler, state: MonitorState, control: ServiceControl, tickMinutes!: Int64 = 1): ServiceRunSummary {
+    var scans: Int64 = 0
+    while (!control.shouldStop(scans)) {
+        if (scheduler.begin(clock, state)) {
+            let _ = scanOnceRuntime(config, runtime, state)
+            if (!runtime.store.save(state)) {
+                state.addAudit(AuditRecord("state-save", status: "state_error", reason: "save_failed"))
+            }
+            scans++
+            scheduler.finish()
+        }
+        clock.advanceMinutes(tickMinutes)
+    }
+    ServiceRunSummary(scans, state.skippedOverlappingScans, true)
+}
+
 public func cliHelp(): String {
-    "Usage: gitcodemonitor [--config path] <doctor|scan-once|serve|probe-gitcode|probe-mcp|config summary|tests>"
+    "Usage: gitcodemonitor [--config path] <doctor|scan-once [--offline-fixture]|serve|probe-gitcode|probe-mcp|config summary|tests>"
 }
 
 public func notificationText(event: GitCodeEvent): String {
@@ -1318,6 +1640,8 @@ func applyGitCodeSection(config: MonitorConfig, obj: JsonObject): Unit {
     if (!baseUrl.isEmpty()) { config.gitCodeBaseUrl = baseUrl }
     let authMode = firstJsonString(obj, ["authMode", "gitCodeAuthMode"])
     if (!authMode.isEmpty()) { config.gitCodeAuthMode = authMode }
+    let transport = firstJsonString(obj, ["transport", "httpTransport"])
+    if (!transport.isEmpty()) { config.httpTransport = transport }
     let token = firstJsonString(obj, ["token", "privateToken", "accessToken", "gitCodeToken"])
     if (!token.isEmpty()) { config.gitCodeToken = token }
     let cookie = firstJsonString(obj, ["cookie", "gitCodeCookie"])
@@ -1354,6 +1678,8 @@ func applyMonitorSection(config: MonitorConfig, obj: JsonObject): Unit {
     if (jitter >= 0) { config.jitterSeconds = jitter }
     let statePath = firstJsonString(obj, ["statePath"])
     if (!statePath.isEmpty()) { config.statePath = statePath }
+    let transport = firstJsonString(obj, ["transport", "httpTransport"])
+    if (!transport.isEmpty()) { config.httpTransport = transport }
     config.dryRun = firstJsonBool(obj, ["dryRun"], config.dryRun)
     config.autoReply = firstJsonBool(obj, ["autoReply"], config.autoReply)
     config.notifyNetworkEnabled = firstJsonBool(obj, ["notifyNetworkEnabled"], config.notifyNetworkEnabled)
@@ -1394,6 +1720,70 @@ func collectPagedEvents(repo: GitCodeRepo, kind: String, transport: GitCodeHttpT
     }
 }
 
+public func parseMcpToolsResponse(body: String): Array<ToolSchema> {
+    let out = ArrayList<ToolSchema>()
+    try {
+        let root = JsonValue.fromStr(body).asObject()
+        match (root.get("error")) {
+            case Some(_) => return []
+            case None => ()
+        }
+        let toolsValue = findMcpToolsValue(root)
+        for (item in toolsValue.asArray().getItems()) {
+            try {
+                let obj = item.asObject()
+                let name = firstJsonString(obj, ["name"])
+                if (!name.isEmpty()) {
+                    let version = firstJsonString(obj, ["version"])
+                    let schemaHash = stableSchemaHash(obj)
+                    out.add(ToolSchema(name, version: if (version.isEmpty()) { "v1" } else { version }, schemaHash: schemaHash))
+                }
+            } catch (_inner: Exception) { () }
+        }
+    } catch (_: Exception) { () }
+    out.toArray()
+}
+
+public func parseMcpCallResponse(body: String): McpResult {
+    if (body.trimAscii().isEmpty()) {
+        return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_empty_body")
+    }
+    try {
+        let root = JsonValue.fromStr(body).asObject()
+        match (root.get("error")) {
+            case Some(value) =>
+                let obj = try { value.asObject() } catch (_: Exception) { JsonObject() }
+                let message = firstJsonString(obj, ["message", "reason"])
+                return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_jsonrpc_error", reason: message)
+            case None => ()
+        }
+        let result = mcpResultObject(root)
+        match (result.get("isError")) {
+            case Some(value) =>
+                if (jsonValueToString(value).toAsciiLower() == "true") {
+                    return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_tool_error", reason: firstJsonString(result, ["reason", "message"]))
+                }
+            case None => ()
+        }
+        let structured = mcpStructuredObject(result)
+        let parsed = mcpResultFromObject(structured)
+        if (parsed.ok) { return parsed }
+        let text = firstMcpContentText(result)
+        if (!text.isEmpty()) {
+            try {
+                let textObj = JsonValue.fromStr(text).asObject()
+                let fromTextJson = mcpResultFromObject(textObj)
+                if (fromTextJson.ok) { return fromTextJson }
+            } catch (_inner: Exception) {
+                return McpResult(true, draft: text, approved: true, needsHumanReview: false)
+            }
+        }
+    } catch (_: Exception) {
+        return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_parse_error")
+    }
+    McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_result_missing")
+}
+
 public func parseReposResponse(body: String, org: String): Array<GitCodeRepo> {
     let out = ArrayList<GitCodeRepo>()
     try {
@@ -1404,10 +1794,33 @@ public func parseReposResponse(body: String, org: String): Array<GitCodeRepo> {
                 let full = firstJsonString(obj, ["full_name", "path_with_namespace", "name_with_namespace"])
                 if (full.contains("/")) { name = full.split("/")[full.split("/").size - 1].trimAscii() }
             }
-            if (!name.isEmpty()) { out.add(GitCodeRepo(org, name)) }
+            let visibility = firstJsonString(obj, ["visibility"]).toAsciiLower()
+            let isPublic = firstJsonBool(obj, ["public"], false)
+            let isPrivate = firstJsonBool(obj, ["private"], false)
+            let isInternal = firstJsonBool(obj, ["internal"], false)
+            if (!name.isEmpty() && repoVisibilityDecision(isPublic, isPrivate, isInternal, visibility) == "public") {
+                out.add(GitCodeRepo(
+                    org,
+                    name,
+                    visibility: visibility,
+                    isPublic: isPublic || visibility == "public",
+                    isPrivate: isPrivate || visibility == "private",
+                    isInternal: isInternal || visibility == "internal",
+                    defaultBranch: firstJsonString(obj, ["default_branch", "defaultBranch"]),
+                    htmlUrl: firstJsonString(obj, ["html_url", "web_url", "url"])
+                ))
+            }
         }
     } catch (_: Exception) { () }
     out.toArray()
+}
+
+public func repoVisibilityDecision(isPublic: Bool, isPrivate: Bool, isInternal: Bool, visibility: String): String {
+    let v = visibility.toAsciiLower()
+    if (isPrivate || v == "private") { return "private" }
+    if (isInternal || v == "internal") { return "internal" }
+    if (isPublic || v == "public") { return "public" }
+    "visibility_unknown"
 }
 
 public func parseItemsResponse(body: String, repo: GitCodeRepo, kind: String): Array<GitCodeEvent> {
@@ -1458,6 +1871,14 @@ func retryAfterMs(res: HttpResponseSpec): Int64 {
 func arrayContains(items: Array<String>, value: String): Bool {
     for (item in items) {
         if (item == value) { return true }
+    }
+    false
+}
+
+func repoAllowlisted(items: Array<String>, value: String): Bool {
+    let expected = value.trimAscii().toAsciiLower()
+    for (item in items) {
+        if (item.trimAscii().toAsciiLower() == expected) { return true }
     }
     false
 }
@@ -1586,6 +2007,77 @@ func jsonObjectItems(root: JsonValue): Array<JsonObject> {
     out.toArray()
 }
 
+func findMcpToolsValue(root: JsonObject): JsonValue {
+    match (root.get("tools")) {
+        case Some(v) => return v
+        case None => ()
+    }
+    match (root.get("result")) {
+        case Some(resultValue) =>
+            try {
+                let result = resultValue.asObject()
+                match (result.get("tools")) {
+                    case Some(v) => return v
+                    case None => ()
+                }
+            } catch (_: Exception) {
+                return resultValue
+            }
+        case None => ()
+    }
+    JsonArray([])
+}
+
+func mcpResultObject(root: JsonObject): JsonObject {
+    match (root.get("result")) {
+        case Some(v) => try { return v.asObject() } catch (_: Exception) { () }
+        case None => ()
+    }
+    root
+}
+
+func mcpStructuredObject(result: JsonObject): JsonObject {
+    for (key in ["structuredContent", "structured_content", "output", "data"]) {
+        match (result.get(key)) {
+            case Some(v) => try { return v.asObject() } catch (_: Exception) { () }
+            case None => ()
+        }
+    }
+    result
+}
+
+func mcpResultFromObject(obj: JsonObject): McpResult {
+    let draft = firstJsonString(obj, ["draft", "draftReply", "reply", "body", "text"])
+    let summary = firstJsonString(obj, ["summary"])
+    let reason = firstJsonString(obj, ["reason", "message"])
+    let approved = firstJsonBool(obj, ["approved", "safe"], true)
+    let needsHumanReview = firstJsonBool(obj, ["needsHumanReview", "needs_human_review", "humanReviewRequired"], false)
+    if (draft.isEmpty() && summary.isEmpty()) {
+        return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_result_missing")
+    }
+    McpResult(true, summary: summary, draft: draft, approved: approved, needsHumanReview: needsHumanReview, reason: reason, citations: firstJsonStringArray(obj, ["citations", "sources"]))
+}
+
+func firstMcpContentText(result: JsonObject): String {
+    match (result.get("content")) {
+        case Some(v) =>
+            try {
+                for (item in v.asArray().getItems()) {
+                    let obj = item.asObject()
+                    let text = firstJsonString(obj, ["text", "body"])
+                    if (!text.isEmpty()) { return text }
+                }
+            } catch (_: Exception) { () }
+        case None => ()
+    }
+    ""
+}
+
+func stableSchemaHash(obj: JsonObject): String {
+    let raw = obj.toJsonString()
+    "len-${raw.size}"
+}
+
 func actorName(obj: JsonObject): String {
     let direct = firstJsonString(obj, ["author", "user", "login", "username", "name"])
     if (!direct.startsWith("{")) { return direct }
@@ -1627,6 +2119,12 @@ func jsonValueToString(v: JsonValue): String {
 
 func trimTrailingSlash(raw: String): String {
     if (raw.endsWith("/")) { raw[0..raw.size - 1] } else { raw }
+}
+
+func boundedPageSize(pageSize: Int64): Int64 {
+    if (pageSize > 100) { return 100 }
+    if (pageSize < 1) { return 1 }
+    pageSize
 }
 
 func urlPart(raw: String): String {

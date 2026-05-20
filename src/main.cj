@@ -8,20 +8,25 @@ main(args: Array<String>): Int64 {
         commandArgs = args[2..]
     }
     let config = loadConfig(path: configPath)
-    let state = MonitorState()
-    let mcp = FakeMcpClient()
     if (commandArgs.size > 0 && commandArgs[0] == "scan-once") {
-        let transport = FakeGitCodeTransport()
-        transport.seedDefaultRepos()
-        transport.events.add(GitCodeEvent("evt-1", "cangjie", "compiler", "issue", "1", "alice", "https://gitcode.com/alice", "https://gitcode.com/cangjie/compiler/issues/1", "Please check this issue."))
-        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), mcp, FakeCommentWriter())
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
+        let result = if (commandArgs.size > 1 && commandArgs[1] == "--offline-fixture") {
+            scanOnceOfflineFixture(config, state)
+        } else {
+            scanOnceRuntime(config, runtime, state)
+        }
+        let saved = runtime.store.save(state)
         println("scan-once accepted=${result.accepted} ignored=${result.ignored} notified=${result.notified} mcpCalls=${result.mcpCalls} writes=${result.writes}")
+        if (!saved) { println("state=save_failed") }
         return 0
     }
     if (commandArgs.size > 0 && commandArgs[0] == "serve") {
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
         let scheduler = FullScanScheduler(config, FakeClock())
-        let summary = runServiceTicks(config, FakeClock(), scheduler, state, ServiceControl(maxScans: 1))
-        println("${serveOnceBaseline(config)} scans=${summary.scans} stopped=${summary.stopped}")
+        let summary = runServiceScans(config, runtime, FakeClock(), scheduler, state, ServiceControl(maxScans: 1), tickMinutes: config.fullScanIntervalMinutes)
+        println("serve scans=${summary.scans} skipped=${summary.skipped} stopped=${summary.stopped} audit=${state.audit.size}")
         return 0
     }
     if (commandArgs.size > 0 && commandArgs[0] == "probe-gitcode") {
@@ -41,6 +46,9 @@ main(args: Array<String>): Int64 {
         return 0
     }
     if (commandArgs.size > 0 && commandArgs[0] == "doctor") {
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
+        let mcp = FakeMcpClient()
         mcp.initialize()
         println(doctorReport(config, state, mcp))
         return 0

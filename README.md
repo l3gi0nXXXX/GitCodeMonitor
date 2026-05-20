@@ -50,7 +50,7 @@ Default behavior:
 ## Quick Start
 
 ```bash
-cd /Users/l3gi0n/work/worktrees/gcm-cangjie-rewrite
+cd <GitCodeMonitor repo>
 cjpm clean
 cjpm build -i
 cjpm test

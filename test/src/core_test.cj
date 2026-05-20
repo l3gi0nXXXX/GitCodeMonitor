@@ -1,8 +1,25 @@
 package gitcodemonitor
 
+import std.collection.ArrayList
 import std.fs.{Directory, File, remove, Path, exists}
 import std.time.DateTime
 import std.unittest.testmacro.*
+
+private class FakeNativeRawTransport <: NativeRawHttpTransport {
+    public let requests = ArrayList<HttpRequestSpec>()
+    public var nextResponse: HttpResponseSpec = HttpResponseSpec(200, body: "{\"ok\":true}")
+    public var throwNext: Bool = false
+
+    public init() {}
+
+    public func send(request: HttpRequestSpec, timeoutSeconds: Int64): HttpResponseSpec {
+        if (throwNext) {
+            throw Exception("Authorization: Bearer secret")
+        }
+        requests.add(request)
+        nextResponse
+    }
+}
 
 @Test
 public class GitCodeMonitorCoreTest {
@@ -19,6 +36,8 @@ public class GitCodeMonitorCoreTest {
         @Expect(config.dryRun, true)
         @Expect(config.autoReply, false)
         @Expect(config.acpEnabled, false)
+        @Expect(config.gitCodeBaseUrl, "https://api.gitcode.com/api/v5")
+        @Expect(configuredHttpTransport(config), "native")
         @Expect(validateConfig(config), "ok")
     }
 
@@ -45,6 +64,7 @@ public class GitCodeMonitorCoreTest {
         @Expect(summary.contains("gitcode-secret"), false)
         @Expect(summary.contains("cookie-secret"), false)
         @Expect(summary.contains("mcp-secret"), false)
+        @Expect(summary.contains("transport=native"), true)
         @Expect(summary.contains("present"), true)
         @Expect(doctor.contains("gitCodeAuth=present"), true)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
@@ -106,7 +126,7 @@ public class GitCodeMonitorCoreTest {
     @TestCase
     public func gitCodeHttpTransportParsesReposIssuesPrsCommentsAndRateLimit(): Unit {
         let sender = FakeHttpSender()
-        sender.enqueue(HttpResponseSpec(200, body: "{\"projects\":[{\"path\":\"compiler\"},{\"full_name\":\"cangjie/runtime\"}]}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"repos\":[{\"path\":\"compiler\",\"public\":true,\"private\":false,\"internal\":false,\"default_branch\":\"main\"},{\"full_name\":\"cangjie/runtime\",\"visibility\":\"public\"}]}"))
         sender.enqueue(HttpResponseSpec(200, body: "{\"data\":[{\"number\":11,\"title\":\"bug\",\"body\":\"details\",\"user\":{\"login\":\"alice\",\"html_url\":\"https://gitcode.com/alice\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/11\"}]}"))
         sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[{\"id\":99,\"body\":\"comment\",\"user\":{\"login\":\"bob\"}}]}"))
         sender.enqueue(HttpResponseSpec(200, body: "{\"items\":[{\"id\":7,\"title\":\"pr\",\"description\":\"change\",\"author\":{\"username\":\"carol\"}}]}"))
@@ -115,6 +135,7 @@ public class GitCodeMonitorCoreTest {
         let repos = transport.listReposPage("cangjie", 1)
         @Expect(repos.repos.size, 2)
         @Expect(repos.repos[0].fullName(), "cangjie/compiler")
+        @Expect(repos.repos[0].defaultBranch, "main")
         let state = MonitorState()
         let events = collectRepoEventsHttp(GitCodeRepo("cangjie", "compiler"), transport, state)
         @Expect(events.size, 3)
@@ -133,25 +154,82 @@ public class GitCodeMonitorCoreTest {
     @TestCase
     public func realGitCodeRequestBuilderSupportsAuthModesAndRedaction(): Unit {
         let privateClient = GitCodeApiClient(token: "private-secret")
-        let privateReq = privateClient.listReposRequest("cangjie", 2, 50)
+        let privateReq = privateClient.listReposRequest("cang jie", 2, 150)
+        @Expect(privateClient.baseUrl, "https://api.gitcode.com/api/v5")
+        @Expect(privateReq.url.contains("/orgs/cang%20jie/repos?type=public"), true)
         @Expect(privateReq.url.contains("page=2"), true)
+        @Expect(privateReq.url.contains("per_page=100"), true)
         @Expect(privateReq.headers[0][0], "PRIVATE-TOKEN")
         @Expect(privateReq.redactedLogLine().contains("private-secret"), false)
 
         let bearerClient = GitCodeApiClient(authMode: "Authorization", token: "bearer-secret")
-        let bearerReq = bearerClient.listIssuesRequest(GitCodeRepo("cangjie", "compiler"), 1, 20)
+        let bearerReq = bearerClient.listIssuesRequest(GitCodeRepo("cangjie", "compiler"), 1, 20, since: "2026-05-21T10:20:30+08:00")
         @Expect(bearerReq.headers[0][0], "Authorization")
         @Expect(bearerReq.headers[0][1], "Bearer bearer-secret")
+        @Expect(bearerReq.url.contains("/repos/cangjie/compiler/issues?state=all"), true)
+        @Expect(bearerReq.url.contains("sort=updated_at"), true)
+        @Expect(bearerReq.url.contains("direction=desc"), true)
+        @Expect(bearerReq.url.contains("since=2026-05-21T10%3A20%3A30%2B08%3A00"), true)
         @Expect(bearerReq.redactedLogLine().contains("bearer-secret"), false)
 
         let queryClient = GitCodeApiClient(authMode: "access_token", token: "query-secret")
         let queryReq = queryClient.listCommentsRequest(GitCodeRepo("cangjie", "compiler"), "pr", "9", 1, 20)
+        @Expect(queryReq.url.contains("/pulls/9/comments?page=1&per_page=20"), true)
         @Expect(queryReq.url.contains("access_token="), true)
         @Expect(queryReq.redactedLogLine().contains("query-secret"), false)
 
         let cookieClient = GitCodeApiClient(token: "token-secret", cookie: "sid=cookie-secret")
         let cookieReq = cookieClient.listReposRequest("cangjie", 1, 20)
         @Expect(cookieReq.redactedLogLine().contains("cookie-secret"), false)
+    }
+
+    @TestCase
+    public func gitCodeRepoDiscoveryKeepsOnlyPublicRepos(): Unit {
+        let body = "{\"data\":[" +
+            "{\"path\":\"public-flag\",\"public\":true,\"private\":false,\"internal\":false,\"default_branch\":\"main\",\"html_url\":\"https://gitcode.com/cangjie/public-flag\"}," +
+            "{\"path\":\"public-visibility\",\"visibility\":\"public\"}," +
+            "{\"path\":\"private-flag\",\"public\":false,\"private\":true,\"internal\":false}," +
+            "{\"path\":\"private-visibility\",\"visibility\":\"private\"}," +
+            "{\"path\":\"internal-flag\",\"public\":false,\"private\":false,\"internal\":true}," +
+            "{\"path\":\"internal-visibility\",\"visibility\":\"internal\"}," +
+            "{\"path\":\"unknown\"}" +
+            "]}"
+        let repos = parseReposResponse(body, "cangjie")
+        @Expect(repos.size, 2)
+        @Expect(repos[0].name, "public-flag")
+        @Expect(repos[0].isPublic, true)
+        @Expect(repos[0].isPrivate, false)
+        @Expect(repos[0].isInternal, false)
+        @Expect(repos[0].defaultBranch, "main")
+        @Expect(repos[0].htmlUrl, "https://gitcode.com/cangjie/public-flag")
+        @Expect(repos[1].name, "public-visibility")
+        @Expect(repoVisibilityDecision(false, false, false, ""), "visibility_unknown")
+        @Expect(repoVisibilityDecision(false, true, false, "public"), "private")
+        @Expect(repoVisibilityDecision(false, false, true, "public"), "internal")
+    }
+
+    @TestCase
+    public func gitCodeIssuePrAndCommentRequestsUseOfficialParameters(): Unit {
+        let client = GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5/")
+        let repo = GitCodeRepo("cangjie", "compiler")
+        let issues = client.listIssuesRequest(repo, 3, 101)
+        @Expect(issues.url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/issues?state=all&sort=updated_at&direction=desc&page=3&per_page=100")
+        let prs = client.listPullRequestsRequest(repo, 4, 25, updatedAfter: "2026-05-21T12:00:00+08:00")
+        @Expect(prs.url.contains("/repos/cangjie/compiler/pulls?state=all"), true)
+        @Expect(prs.url.contains("sort=updated"), true)
+        @Expect(prs.url.contains("updated_after=2026-05-21T12%3A00%3A00%2B08%3A00"), true)
+        let issueComments = client.listCommentsRequest(repo, "issue", "42", 1, 20)
+        @Expect(issueComments.url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/issues/comments?page=1&per_page=20")
+        let prComments = client.listCommentsRequest(repo, "pr", "7", 2, 20)
+        @Expect(prComments.url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/pulls/7/comments?page=2&per_page=20")
+        let issueEvent = GitCodeEvent("evt", "cangjie", "compiler", "issue", "42", "alice", "", "", "x")
+        let issuePost = client.postCommentRequest(issueEvent, "hello")
+        @Expect(issuePost.url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/issues/42/comments")
+        @Expect(issuePost.body.contains("\"body\""), true)
+        @Expect(issuePost.body.contains(SELF_MARKER), true)
+        let prEvent = GitCodeEvent("evt", "cangjie", "compiler", "pr", "7", "alice", "", "", "x")
+        let prPost = client.postCommentRequest(prEvent, "hello")
+        @Expect(prPost.url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/pulls/7/comments")
     }
 
     @TestCase
@@ -164,6 +242,44 @@ public class GitCodeMonitorCoreTest {
         let redacted = joinStrings(sender.redactedCurlArgs(req), " ")
         @Expect(redacted.contains("Bearer secret"), false)
         @Expect(redacted.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), false)
+    }
+
+    @TestCase
+    public func nativeHttpSenderUsesInjectableRawTransportAndKeepsFailuresContained(): Unit {
+        let raw = FakeNativeRawTransport()
+        let sender = NativeHttpSender(rawTransport: raw)
+        let methods = ["GET", "POST", "PATCH", "DELETE", "PUT"]
+        for (method in methods) {
+            let res = sender.send(HttpRequestSpec(method, "https://api.gitcode.com/api/v5/test", headers: [("X-Test", "yes")], body: "{\"body\":true}"))
+            @Expect(res.statusCode, 200)
+        }
+        @Expect(raw.requests.size, 5)
+        @Expect(raw.requests[1].method, "POST")
+        @Expect(raw.requests[1].headers[0][0], "X-Test")
+        @Expect(raw.requests[1].body.contains("body"), true)
+
+        raw.throwNext = true
+        let failed = sender.send(HttpRequestSpec("GET", "https://api.gitcode.com/api/v5/test", headers: [("Authorization", "Bearer secret")]))
+        @Expect(failed.statusCode, 599)
+        @Expect(failed.body.contains("Bearer secret"), false)
+        @Expect(failed.body.contains("transport_error"), true)
+    }
+
+    @TestCase
+    public func configuredTransportDefaultsNativeAndAllowsExplicitCurlOnly(): Unit {
+        let config = defaultConfig()
+        @Expect(configuredHttpTransport(config), "native")
+        @Expect(configSummary(config).contains("transport=native"), true)
+        @Expect(doctorReport(config, MonitorState(), FakeMcpClient()).contains("transport=native"), true)
+        config.httpTransport = "curl"
+        @Expect(configuredHttpTransport(config), "curl")
+        @Expect(configSummary(config).contains("transport=curl"), true)
+        config.gitCodeToken = "gitcode-secret"
+        config.gitCodeCookie = "sid=cookie-secret"
+        let doctor = doctorReport(config, MonitorState(), FakeMcpClient())
+        @Expect(doctor.contains("transport=curl"), true)
+        @Expect(doctor.contains("gitcode-secret"), false)
+        @Expect(doctor.contains("cookie-secret"), false)
     }
 
     @TestCase
@@ -192,6 +308,20 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func duplicateEventsDoNotRepeatNotifyMcpOrWriteback(): Unit {
+        let config = defaultConfig()
+        let state = MonitorState()
+        let first = scanOnceOfflineFixture(config, state)
+        let second = scanOnceOfflineFixture(config, state)
+        @Expect(first.accepted, 1)
+        @Expect(first.notified, 2)
+        @Expect(first.mcpCalls, 1)
+        @Expect(second.accepted, 0)
+        @Expect(second.notified, 0)
+        @Expect(second.mcpCalls, 0)
+    }
+
+    @TestCase
     public func stateStorePersistsSeenAuditReplyAndBackoff(): Unit {
         let path = "/tmp/gcm-state-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.json"
         let store = StateStore(path)
@@ -215,6 +345,20 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func stateStoreCorruptionDoesNotCrashAndKeepsBackup(): Unit {
+        let path = "/tmp/gcm-corrupt-state-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.json"
+        File.writeTo(Path(path), "{not-json".toArray())
+        let store = StateStore(path)
+        let state = store.load()
+        @Expect(store.loadDegraded, true)
+        @Expect(state.audit.size, 1)
+        @Expect(state.audit[0].status, "state_error")
+        @Expect(exists(Path(path + ".corrupt")), true)
+        if (exists(Path(path))) { remove(Path(path)) }
+        if (exists(Path(path + ".corrupt"))) { remove(Path(path + ".corrupt")) }
+    }
+
+    @TestCase
     public func notifierPayloadBuildersAreDryRunByDefaultAndRedactContent(): Unit {
         let event = GitCodeEvent("evt", "cangjie", "compiler", "issue", "1", "alice", "", "https://gitcode.com/cangjie/compiler/issues/1", "Authorization: Bearer secret")
         let feishu = buildFeishuPayload("https://open.feishu.cn/webhook/abc", event)
@@ -233,8 +377,18 @@ public class GitCodeMonitorCoreTest {
         let live = HttpNotifier("telegram", networkEnabled: true, webhookOrToken: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef", chatId: "chat", sender: liveSender)
         let delivery = live.notify(event)
         @Expect(delivery.status, "sent")
+        @Expect(delivery.httpStatus, 200)
         @Expect(liveSender.requests.size, 1)
         @Expect(liveSender.requests[0].redactedLogLine().contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), false)
+
+        let limitedSender = FakeHttpSender()
+        limitedSender.nextResponse = HttpResponseSpec(429, headers: [("Retry-After", "3")])
+        let limited = HttpNotifier("feishu", networkEnabled: true, webhookOrToken: "https://open.feishu.cn/webhook/abc", sender: limitedSender)
+        let limitedAudit = limited.notify(event)
+        @Expect(limitedAudit.status, "rate_limited")
+        @Expect(limitedAudit.httpStatus, 429)
+        @Expect(limitedAudit.errorKind, "rate_limited")
+        @Expect(limited.backoffUntilMs, 3000)
     }
 
     @TestCase
@@ -251,6 +405,9 @@ public class GitCodeMonitorCoreTest {
     @TestCase
     public func mcpHttpClientBuildsJsonRpcRequestsAndDegradesCleanly(): Unit {
         let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{}}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[{\"name\":\"gitcode_issue_summary\"},{\"name\":\"gitcode_issue_draft_reply\"},{\"name\":\"gitcode_pr_summary\"},{\"name\":\"gitcode_pr_draft_reply\"},{\"name\":\"gitcode_safety_review\"}]}}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"call\",\"result\":{\"structuredContent\":{\"summary\":\"short\",\"draft\":\"real draft\",\"approved\":true,\"needsHumanReview\":false,\"citations\":[\"https://gitcode.com/cangjie/compiler/issues/1\"]}}}"))
         let mcp = McpHttpClient("http://127.0.0.1:8787/mcp", serviceToken: "service-secret", sender: sender)
         @Expect(mcp.initialize(), true)
         @Expect(sender.requests[0].body.contains("\"method\":\"initialize\""), true)
@@ -259,13 +416,39 @@ public class GitCodeMonitorCoreTest {
         @Expect(tools.size, 5)
         let result = mcp.call(ToolInput("gitcode_issue_draft_reply", "evt", "cangjie/compiler", "body"))
         @Expect(result.ok, true)
+        @Expect(result.draft, "real draft")
+        @Expect(result.summary, "short")
+        @Expect(result.citations.size, 1)
         @Expect(sender.requests[2].body.contains("\"method\":\"tools/call\""), true)
+        @Expect(sender.requests[2].body.contains("\"repo\":\"cangjie/compiler\""), true)
 
         let downSender = FakeHttpSender()
         downSender.nextResponse = HttpResponseSpec(503)
         let down = McpHttpClient("http://127.0.0.1:8787/mcp", sender: downSender)
         @Expect(down.initialize(), false)
         @Expect(down.degradedReason, "server_error")
+    }
+
+    @TestCase
+    public func mcpParsesRealToolListsCallsAndMalformedBodiesWithoutSyntheticSuccess(): Unit {
+        let tools = parseMcpToolsResponse("{\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[{\"name\":\"gitcode_issue_summary\"},{\"name\":\"gitcode_issue_draft_reply\"}]}}")
+        @Expect(tools.size, 2)
+        @Expect(tools[0].name, "gitcode_issue_summary")
+        @Expect(parseMcpToolsResponse("").size, 0)
+        @Expect(parseMcpToolsResponse("<html>bad gateway</html>").size, 0)
+
+        let textJson = parseMcpCallResponse("{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"draft\\\":\\\"from text\\\",\\\"approved\\\":true,\\\"needsHumanReview\\\":false}\"}]}}")
+        @Expect(textJson.ok, true)
+        @Expect(textJson.draft, "from text")
+        let rejected = parseMcpCallResponse("{\"jsonrpc\":\"2.0\",\"result\":{\"structuredContent\":{\"draft\":\"unsafe\",\"approved\":false,\"needsHumanReview\":true,\"reason\":\"secret risk\"}}}")
+        @Expect(rejected.ok, true)
+        @Expect(rejected.approved, false)
+        @Expect(rejected.needsHumanReview, true)
+        @Expect(writebackGate(defaultConfig(), MonitorState(), GitCodeEvent("evt", "cangjie", "compiler", "issue", "1", "alice", "", "", "x"), rejected).reason, "dry_run")
+        @Expect(parseMcpCallResponse("").errorKind, "mcp_empty_body")
+        @Expect(parseMcpCallResponse("<html>bad gateway</html>").errorKind, "mcp_parse_error")
+        @Expect(parseMcpCallResponse("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"boom\"}}").errorKind, "mcp_jsonrpc_error")
+        @Expect(parseMcpCallResponse("{\"jsonrpc\":\"2.0\",\"result\":{\"unexpected\":true}}").ok, false)
     }
 
     @TestCase
@@ -279,9 +462,10 @@ public class GitCodeMonitorCoreTest {
         @Expect(writebackGate(config, state, event, mcp).reason, "auto_reply_disabled")
         config.autoReply = true
         @Expect(writebackGate(config, state, event, mcp).reason, "repo_not_allowlisted")
-        config.repoAllowlist = ["cangjie/compiler"]
+        config.repoAllowlist = ["Cangjie/Compiler"]
         @Expect(writebackGate(config, state, event, McpResult(true, draft: "Authorization: Bearer x")).reason, "secret_detected")
         @Expect(writebackGate(config, state, event, McpResult(true, draft: "/Users/name/private-index")).reason, "local_path_detected")
+        @Expect(writebackGate(config, state, GitCodeEvent("filtered", "cangjie", "compiler", "issue", "1", "CangjiePL", "", "", "x"), mcp).reason, "filtered_event")
         @Expect(writebackGate(config, state, event, mcp).allowed, true)
         let writer = FakeCommentWriter()
         let url = writer.write(event, mcp.draft, state)
