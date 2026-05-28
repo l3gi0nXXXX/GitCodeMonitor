@@ -2,6 +2,10 @@
 
 GitCodeMonitor owns GitCode API access, scan state, notification audit, MCP client calls, and GitCode comment writeback. Metis is only called through MCP and never receives GitCode credentials.
 
+For field-by-field configuration guidance, especially `feishu.webhook`,
+`telegram.botToken`, `telegram.chatId`, `gitcode.token`, and staged dry-run to
+writeback rollout, see [configuration.zh.md](configuration.zh.md).
+
 ## Safety Defaults
 
 - `dryRun` defaults to `true`.
@@ -17,7 +21,8 @@ Use `cjpm run --name gitcodemonitor --run-args <command>`.
 Commands:
 
 - `doctor`: prints runtime switch and audit summary without credentials.
-- `scan-once`: runs the offline fake scan baseline.
+- `scan-once`: runs one scan using the configured runtime surfaces.
+- `scan-once --offline-fixture`: runs the offline fake scan baseline.
 - `serve`: starts the monitor lifecycle path with the configured full-scan cadence and overlap guard.
 - `probe-gitcode`: prints the redacted GitCode request that would be used for repo probing.
 - `probe-mcp`: prints a redacted MCP initialize request.
@@ -32,10 +37,11 @@ Pass `--config <path>` before the command to load an injected config path for te
 ```json
 {
   "gitcode": {
-    "baseUrl": "https://gitcode.com/api/v5",
+    "baseUrl": "https://api.gitcode.com/api/v5",
     "authMode": "PRIVATE-TOKEN",
     "token": "redacted",
-    "cookie": "redacted"
+    "cookie": "redacted",
+    "transport": "native"
   },
   "metis": {
     "mcpEndpoint": "http://127.0.0.1:8787/mcp",
@@ -54,7 +60,9 @@ Pass `--config <path>` before the command to load an injected config path for te
     "dryRun": true,
     "autoReply": false,
     "notifyNetworkEnabled": false,
-    "repoAllowlist": ["cangjie/compiler"]
+    "repoAllowlist": ["cangjie/compiler"],
+    "statePath": ".gitcodemonitor/state.json",
+    "transport": "native"
   }
 }
 ```
@@ -63,10 +71,16 @@ Doctor, probe, summary, and request log helpers report credential presence only 
 
 ## Real HTTP Surfaces
 
-GitCode API requests are built by `GitCodeApiClient` and executed through injectable senders. Unit tests use `FakeHttpSender`; production surfaces can use `CurlHttpSender` through `GitCodeCurlTransport`, `CurlNotifier`, and `GitCodeCommentWriter`.
+GitCode API requests are built by `GitCodeApiClient` and executed through
+injectable senders. Unit tests use `FakeHttpSender`; production defaults to the
+native Cangjie HTTP sender. `curl` remains available only as an explicit
+diagnostic fallback via `transport=curl`.
 
 The GitCode response parser accepts common array and envelope shapes for organization repositories, issues, pull requests, and comments. HTTP status codes map to monitor error kinds such as `unauthorized`, `forbidden`, `not_found`, `rate_limited`, and `server_error`; `Retry-After` drives backoff where available.
 
 ## State
 
-State is written to the configured data path, defaulting to `data/gitcodemonitor-state.json`. Tests use `/tmp` paths and never write real user home files.
+State is written to the configured data path, defaulting to
+`data/gitcodemonitor-state.json`. Local live runs should use an ignored path such
+as `.gitcodemonitor/state.json`. Tests use temporary paths and never write real
+user home files.

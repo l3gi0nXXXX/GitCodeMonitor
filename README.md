@@ -32,9 +32,9 @@ Useful commands:
 cjpm build -i
 cjpm test
 (cd test && cjpm test)
-cjpm run --run-args --config /tmp/gcm-metis.json doctor
-cjpm run --run-args scan-once
-cjpm run --run-args tests
+cjpm run --name gitcodemonitor --run-args doctor
+cjpm run --name gitcodemonitor --run-args "scan-once --offline-fixture"
+cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.json doctor"
 ```
 
 Default behavior:
@@ -55,8 +55,8 @@ cjpm clean
 cjpm build -i
 cjpm test
 (cd test && cjpm clean && cjpm test)
-cjpm run --run-args doctor
-cjpm run --run-args scan-once
+cjpm run --name gitcodemonitor --run-args doctor
+cjpm run --name gitcodemonitor --run-args "scan-once --offline-fixture"
 ```
 
 Do not put real GitCode tokens, bot tokens, cookies, or passwords in test
@@ -64,6 +64,11 @@ fixtures or logs.
 
 Runtime configuration defaults to `$HOME/.metis/metis.json`. Tests and local
 automation should pass `--config <path>` and use temporary files.
+
+For a Chinese field-by-field configuration guide, including what to put in
+`gitcode.token`, `feishu.webhook`, `telegram.botToken`, `telegram.chatId`, and
+`metis.mcpEndpoint`, see
+[docs/configuration.zh.md](docs/configuration.zh.md).
 
 ## How to Contribute
 
