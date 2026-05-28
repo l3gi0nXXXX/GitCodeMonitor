@@ -7,6 +7,9 @@ main(args: Array<String>): Int64 {
         configPath = args[1]
         commandArgs = args[2..]
     }
+    if (commandArgs.size > 0 && commandArgs[0] == "plugin-stdio") {
+        return gcmPluginMain(["--config", configPath])
+    }
     let config = loadConfig(path: configPath)
     if (commandArgs.size > 0 && commandArgs[0] == "scan-once") {
         let runtime = RuntimeContainer(config)
