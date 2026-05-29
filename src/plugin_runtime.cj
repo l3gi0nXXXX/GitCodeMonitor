@@ -1,6 +1,7 @@
 package gitcodemonitor
 
 import std.collection.ArrayList
+import std.env.{getStdIn, getStdOut}
 import std.fs.{Path, exists}
 
 public class ServiceInitializeRequest {
@@ -123,6 +124,17 @@ public class GcmScanOnceResult {
         this.accepted = accepted
         this.ignored = ignored
         this.emitted = emitted
+    }
+}
+
+public class GcmPluginFrameHandleResult {
+    public let ok: Bool
+    public let frame: ServiceFrame
+    public let shouldStop: Bool
+    public init(ok: Bool, frame!: ServiceFrame = ServiceFrame("", "", ""), shouldStop!: Bool = false) {
+        this.ok = ok
+        this.frame = frame
+        this.shouldStop = shouldStop
     }
 }
 
@@ -316,7 +328,39 @@ public func gcmPluginMain(args: Array<String>): Int64 {
         println(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${initResult.status}\"}")).trimAscii())
         return 2
     }
-    println(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"${initResult.status}\",\"capabilities\":${initResult.capabilities.size}}")).trimAscii())
+    let loaded = loadGcmRuntimeConfig(configRef)
+    if (!loaded.ok) {
+        println(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${loaded.status}\"}")).trimAscii())
+        return 2
+    }
+    let runtime = RuntimeContainer(loaded.config)
+    let state = runtime.store.load()
+    let stdout = getStdOut()
+    stdout.writeln(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"${initResult.status}\",\"capabilities\":${initResult.capabilities.size}}")).trimAscii())
+    stdout.flush()
+    let stdin = getStdIn()
+    while (true) {
+        let line = try {
+            stdin.readln()
+        } catch (_: Exception) {
+            None<String>
+        }
+        match (line) {
+            case Some(raw) =>
+                let handled = handleGcmPluginInputLine(raw, loaded.config, runtime, state)
+                if (!handled.frame.frameType.isEmpty()) {
+                    stdout.writeln(encodeServiceFrame(handled.frame).trimAscii())
+                    stdout.flush()
+                }
+                if (handled.shouldStop) {
+                    let _ = runtime.store.save(state)
+                    return 0
+                }
+            case None =>
+                let _ = runtime.store.save(state)
+                return 0
+        }
+    }
     0
 }
 
@@ -384,8 +428,77 @@ public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): G
         runtime.state.skippedOverlappingScans++
         return GcmScanOnceResult(true, "skipped_overlap")
     }
+    if (!pluginPayloadBool(payload, "offlineFixture")) {
+        return GcmScanOnceResult(false, "runtime_required")
+    }
     let result = scanOnceOfflineFixture(runtime.config, runtime.state)
     GcmScanOnceResult(true, "ok", accepted: result.accepted, ignored: result.ignored, emitted: result.accepted + result.ignored)
+}
+
+public func handleGcmScanOnceCapabilityRuntime(payload: String, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): GcmScanOnceResult {
+    if (payload.contains("\"overlap\":true")) {
+        state.skippedOverlappingScans++
+        return GcmScanOnceResult(true, "skipped_overlap")
+    }
+    let result = if (pluginPayloadBool(payload, "offlineFixture")) {
+        scanOnceOfflineFixture(config, state)
+    } else {
+        scanOnceRuntime(config, runtime, state)
+    }
+    GcmScanOnceResult(true, "ok", accepted: result.accepted, ignored: result.ignored, emitted: result.accepted + result.ignored)
+}
+
+public func handleGcmPluginInputLine(line: String, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): GcmPluginFrameHandleResult {
+    let decoded = decodeServiceFrame(line)
+    if (!decoded.ok) {
+        return GcmPluginFrameHandleResult(false, frame: gcmPluginErrorFrame("decode-error", "", decoded.errorKind, decoded.diagnostic))
+    }
+    let frame = decoded.frame
+    if (frame.serviceId != GCM_SERVICE_PLUGIN_ID) {
+        return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "service_mismatch", "{\"ok\":false,\"status\":\"service_mismatch\"}"))
+    }
+    if (frame.method == "heartbeat") {
+        return GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", "{\"ok\":true,\"status\":\"ok\"}"))
+    }
+    if (frame.method == "status") {
+        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state))
+        return GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
+    }
+    if (frame.method == "stop") {
+        return GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "stopped", "{\"ok\":true,\"status\":\"stopped\"}"), shouldStop: true)
+    }
+    if (frame.method != "invokeCapability") {
+        return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "unknown_method", "{\"ok\":false,\"status\":\"unknown_method\"}"))
+    }
+    match (frame.capabilityId) {
+        case "gitcode.monitor.status" =>
+            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state))
+            GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
+        case "gitcode.monitor.scan_once" =>
+            let scan = handleGcmScanOnceCapabilityRuntime(frame.payload, config, runtime, state)
+            let saved = runtime.store.save(state)
+            let status = if (scan.ok && saved) { scan.status } else { if (!saved) { "state_save_failed" } else { scan.status } }
+            GcmPluginFrameHandleResult(scan.ok && saved, frame: gcmPluginResponseFrame(frame, scan.ok && saved, status, gcmScanOncePayload(scan, saved: saved)))
+        case "gitcode.writeback.apply_result" =>
+            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state))
+            GcmPluginFrameHandleResult(applied.ok, frame: gcmPluginResponseFrame(frame, applied.ok, applied.decision.reason, "{\"ok\":${applied.ok},\"status\":\"${applied.decision.reason}\",\"writerCalled\":${applied.writerCalled},\"replyUrl\":\"${jsonEscape(applied.replyUrl)}\"}"))
+        case _ =>
+            GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "capability_unsupported", "{\"ok\":false,\"status\":\"capability_unsupported\",\"capabilityId\":\"${jsonEscape(frame.capabilityId)}\"}"))
+    }
+}
+
+public func handleGcmPluginInputLinesForTest(lines: Array<String>, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): Array<String> {
+    let out = ArrayList<String>()
+    for (line in lines) {
+        let handled = handleGcmPluginInputLine(line, config, runtime, state)
+        if (!handled.frame.frameType.isEmpty()) {
+            out.add(encodeServiceFrame(handled.frame).trimAscii())
+        }
+        if (handled.shouldStop) {
+            break
+        }
+    }
+    out.toArray()
 }
 
 public func emitGcmAcceptedEvent(event: GitCodeEvent, host: MetisHostClient): HostEmitResult {
@@ -543,6 +656,44 @@ private func pluginFieldValue(raw: String, key: String): String {
     let needle = "\"${key}\":\""
     if (!raw.contains(needle)) { return "" }
     raw.split(needle, 2)[1].split("\"", 2)[0]
+}
+
+private func gcmPluginResponseFrame(request: ServiceFrame, ok: Bool, status: String, payload: String): ServiceFrame {
+    let normalizedPayload = if (payload.trimAscii().isEmpty()) {
+        "{\"ok\":${ok},\"status\":\"${jsonEscape(status)}\"}"
+    } else {
+        payload
+    }
+    ServiceFrame(
+        "response",
+        "response-${request.frameId}",
+        GCM_SERVICE_PLUGIN_ID,
+        method: request.method,
+        capabilityId: request.capabilityId,
+        correlationId: request.correlationId,
+        payload: normalizedPayload
+    )
+}
+
+private func gcmPluginErrorFrame(frameId: String, correlationId: String, status: String, diagnostic: String): ServiceFrame {
+    ServiceFrame(
+        "response",
+        frameId,
+        GCM_SERVICE_PLUGIN_ID,
+        method: "invokeCapability",
+        correlationId: correlationId,
+        payload: "{\"ok\":false,\"status\":\"${jsonEscape(status)}\",\"diagnostic\":\"${jsonEscape(diagnostic)}\"}"
+    )
+}
+
+private func gcmScanOncePayload(result: GcmScanOnceResult, saved!: Bool = true): String {
+    let status = if (saved) { result.status } else { "state_save_failed" }
+    "{\"ok\":${result.ok && saved},\"status\":\"${status}\",\"accepted\":${result.accepted},\"ignored\":${result.ignored},\"emitted\":${result.emitted},\"stateSaved\":${saved}}"
+}
+
+private func pluginPayloadBool(payload: String, key: String): Bool {
+    let normalized = payload.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    normalized.contains("\"${key}\":true")
 }
 
 private func pluginRepoAllowlisted(allowlist: Array<String>, repo: String): Bool {

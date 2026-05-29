@@ -64,13 +64,80 @@ public class GitCodeMonitorPluginRuntimeTest {
         let status = handleGcmStatusCapability("{}", runtime)
         @Expect(status.ok, true)
         @Expect(status.summary.contains("dryRun=true"), true)
-        let scan = handleGcmScanOnceCapability("{}", runtime)
+        let scan = handleGcmScanOnceCapability("{\"offlineFixture\":true}", runtime)
         @Expect(scan.ok, true)
         @Expect(scan.status, "ok")
         @Expect(scan.accepted >= 0, true)
+        let runtimeRequired = handleGcmScanOnceCapability("{}", runtime)
+        @Expect(runtimeRequired.ok, false)
+        @Expect(runtimeRequired.status, "runtime_required")
         let overlap = handleGcmScanOnceCapability("{\"overlap\":true}", runtime)
         @Expect(overlap.status, "skipped_overlap")
         @Expect(runtime.state.skippedOverlappingScans, 1)
+    }
+
+    @TestCase
+    public func pluginStdioFramesHandleStatusScanMalformedAndStopWithTempState(): Unit {
+        let configPath = tempConfigPath("gcm-plugin-stdio-loop")
+        let statePath = tempConfigPath("gcm-plugin-stdio-state")
+        writeConfig(
+            configPath,
+            text: "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"${statePath}\",\"orgs\":[\"cangjie\"]},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\"}}"
+        )
+        let loaded = loadGcmRuntimeConfig(configPath)
+        @Expect(loaded.ok, true)
+        let runtime = RuntimeContainer(loaded.config)
+        let state = runtime.store.load()
+        let statusFrame = ServiceFrame(
+            "request",
+            "status-1",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.monitor.status",
+            correlationId: "corr-status",
+            payload: "{}"
+        )
+        let scanFrame = ServiceFrame(
+            "request",
+            "scan-1",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.monitor.scan_once",
+            correlationId: "corr-scan",
+            payload: "{\"offlineFixture\":true}"
+        )
+        let stopFrame = ServiceFrame(
+            "request",
+            "stop-1",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "stop",
+            correlationId: "corr-stop",
+            payload: "{}"
+        )
+        let out = handleGcmPluginInputLinesForTest(
+            ["{not-json", encodeServiceFrame(statusFrame).trimAscii(), encodeServiceFrame(scanFrame).trimAscii(), encodeServiceFrame(stopFrame).trimAscii()],
+            loaded.config,
+            runtime,
+            state
+        )
+        @Expect(out.size, 4)
+        @Expect(out[0].contains("invalid_json"), true)
+        let statusResponse = decodeServiceFrame(out[1])
+        @Expect(statusResponse.ok, true)
+        @Expect(statusResponse.frame.correlationId, "corr-status")
+        @Expect(statusResponse.frame.payload.contains("dryRun=true"), true)
+        let scanResponse = decodeServiceFrame(out[2])
+        @Expect(scanResponse.ok, true)
+        @Expect(scanResponse.frame.correlationId, "corr-scan")
+        @Expect(scanResponse.frame.payload.contains("\"accepted\":"), true)
+        @Expect(scanResponse.frame.payload.contains("\"ignored\":"), true)
+        @Expect(scanResponse.frame.payload.contains("\"emitted\":"), true)
+        @Expect(exists(Path(statePath)), true)
+        let stopResponse = decodeServiceFrame(out[3])
+        @Expect(stopResponse.ok, true)
+        @Expect(stopResponse.frame.correlationId, "corr-stop")
+        if (exists(Path(configPath))) { remove(Path(configPath)) }
+        if (exists(Path(statePath))) { remove(Path(statePath)) }
     }
 
     @TestCase
