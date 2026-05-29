@@ -445,6 +445,7 @@ func isKnownServiceFrameMethod(method: String): Bool {
         method == "emitCapabilityEvent" ||
         method == "requestHostApi" ||
         method == "status" ||
+        method == "stop" ||
         method == "heartbeat" ||
         method == "audit"
 }
