@@ -272,6 +272,7 @@ public class GcmScanJobStore {
                 case Some(job) =>
                     job.status = GCM_SCAN_STATUS_CANCELLED
                     job.stage = stage
+                    job.report.stopReason = "cancelled"
                     job.summary = "GitCode scan cancelled"
                     job.updatedAtMs = gcmNowMillis()
                     return GcmScanJobMutationResult(true, job.status, job: job)
@@ -474,37 +475,31 @@ func scanOnceRuntimeBoundedForJob(
     job: GcmScanJob,
     eventWriter!: Option<GcmPluginStdioWriter> = None<GcmPluginStdioWriter>
 ): ScanResult {
-    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && job.limits.maxDurationMillis <= 0 && eventWriter.isNone()) {
+    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && eventWriter.isNone()) {
         return scanOnceRuntime(config, runtime, state)
     }
     let result = emptyScanResult(config)
-    let started = gcmNowMillis()
     for (org in config.orgs) {
         var page: Int64 = 1
         while (true) {
-            if (gcmJobDurationExceeded(started, job.limits.maxDurationMillis)) {
-                state.addAudit(AuditRecord(job.jobId, status: "scan_degraded", reason: "job_timeout"))
-                return finalizeScanResult(state, job.jobId, result)
-            }
             let repoResult = runtime.gitCode.listReposPage(org, page)
             if (repoResult.errorKind != "ok") {
                 state.setBackoff("org:${org}", repoResult.retryAfterMs)
                 state.addAudit(AuditRecord("org:${org}", status: "scan_degraded", reason: repoResult.errorKind))
                 result.failedEvents++
+                result.stopReason = "degraded"
                 result.addFailedSample("org:${org}", repoResult.errorKind)
                 break
             }
             for (repo in repoResult.repos) {
                 if (job.limits.maxRepos > 0 && result.scannedRepos >= job.limits.maxRepos) {
+                    result.stopReason = "max_repos_reached"
                     return finalizeScanResult(state, job.jobId, result)
                 }
                 result.scannedRepos++
                 for (event in collectRepoEventsHttp(repo, runtime.gitCode, state)) {
-                    if (gcmJobDurationExceeded(started, job.limits.maxDurationMillis)) {
-                        state.addAudit(AuditRecord(job.jobId, status: "scan_degraded", reason: "job_timeout"))
-                        return finalizeScanResult(state, job.jobId, result)
-                    }
                     if (job.limits.maxItems > 0 && result.checkedItems >= job.limits.maxItems) {
+                        result.stopReason = "max_items_reached"
                         return finalizeScanResult(state, job.jobId, result)
                     }
                     result.checkedItems++
@@ -523,10 +518,6 @@ func scanOnceRuntimeBoundedForJob(
         }
     }
     finalizeScanResult(state, job.jobId, result)
-}
-
-func gcmJobDurationExceeded(started: Int64, maxDurationMillis: Int64): Bool {
-    maxDurationMillis > 0 && gcmNowMillis() - started >= maxDurationMillis
 }
 
 func emitGcmScanJobEvent(job: GcmScanJob, writer: GcmPluginStdioWriter): Unit {
@@ -589,6 +580,7 @@ func gcmScanReportPayload(job: GcmScanJob): String {
     "{" +
         "\"orgs\":${stringArrayJson(report.orgs).toJsonString()}," +
         "\"limits\":{\"maxRepos\":${job.limits.maxRepos},\"maxItems\":${job.limits.maxItems},\"timeoutMillis\":${job.limits.maxDurationMillis}}," +
+        "\"stopReason\":\"${jsonEscape(report.stopReason)}\"," +
         "\"scannedRepos\":${report.scannedRepos}," +
         "\"checkedItems\":${report.checkedItems}," +
         "\"newEvents\":${report.newEvents}," +
@@ -736,7 +728,7 @@ func parseGcmScanJobLimits(root: JsonObject): GcmLimitsResult {
     if (maxRepos.value < 0 || maxItems.value < 0 || maxDuration.value < 0 || perRequest.value < 0 || progress.value < 0) {
         return GcmLimitsResult(false, diagnostic: "limits must be non-negative")
     }
-    GcmLimitsResult(true, value: GcmScanJobLimits(maxRepos: maxRepos.value, maxItems: maxItems.value, maxDurationMillis: maxDuration.value, perRequestTimeoutMillis: perRequest.value, progressIntervalMillis: progress.value))
+    GcmLimitsResult(true, value: GcmScanJobLimits(maxRepos: maxRepos.value, maxItems: maxItems.value, maxDurationMillis: 0, perRequestTimeoutMillis: perRequest.value, progressIntervalMillis: progress.value))
 }
 
 func parseGcmAsyncScanOptions(root: JsonObject): GcmOptionsResult {

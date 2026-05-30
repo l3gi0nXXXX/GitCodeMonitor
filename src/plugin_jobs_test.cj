@@ -43,6 +43,39 @@ public class GitCodeMonitorPluginJobsTest {
         )
     }
 
+    private func asyncScanFrameWithLimits(jobId: String, limitsJson: String, offlineFixture!: Bool = false): ServiceFrame {
+        ServiceFrame(
+            "request",
+            "scan-${jobId}",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.monitor.scan_once",
+            correlationId: "corr-${jobId}",
+            payload: "{" +
+                "\"mode\":\"async\"," +
+                "\"jobId\":\"${jobId}\"," +
+                "\"idempotencyKey\":\"idem-${jobId}\"," +
+                "\"deliveryTarget\":{\"channel\":\"telegram\",\"accountId\":\"tg\",\"peerId\":\"peer-123\",\"threadId\":\"\",\"replyToMessageId\":\"24\",\"replyInThread\":false}," +
+                "\"limits\":${limitsJson}," +
+                "\"options\":{\"offlineFixture\":${offlineFixture},\"dryRun\":true}" +
+            "}"
+        )
+    }
+
+    private func enqueueRepoWithIssueBatch(fakeSender: FakeHttpSender, repoName: String, issueCount: Int64): Unit {
+        var body = "{\"data\":["
+        for (i in 0..issueCount) {
+            if (i > 0) { body += "," }
+            body += "{\"number\":${i + 1},\"title\":\"issue-${repoName}-${i}\",\"body\":\"details\",\"user\":{\"login\":\"alice\"},\"html_url\":\"https://gitcode.com/cangjie/${repoName}/issues/${i + 1}\"}"
+        }
+        body += "]}"
+        fakeSender.enqueue(HttpResponseSpec(200, body: body))
+        for (_ in 0..issueCount) {
+            fakeSender.enqueue(HttpResponseSpec(200, body: "[]"))
+        }
+        fakeSender.enqueue(HttpResponseSpec(200, body: "[]"))
+    }
+
     @TestCase
     public func jobProtocolFixturesDecodeAndValidatePayloads(): Unit {
         let start = decodeServiceFrame(readFixture("scan_start_async_request.jsonl"))
@@ -52,7 +85,9 @@ public class GitCodeMonitorPluginJobsTest {
         @Expect(parsedStart.ok, true)
         @Expect(parsedStart.payload.mode, "async")
         @Expect(parsedStart.payload.jobId, "gcm-scan-20260530-095017-0001")
-        @Expect(parsedStart.payload.limits.maxRepos, 1)
+        @Expect(parsedStart.payload.limits.maxRepos, 0)
+        @Expect(parsedStart.payload.limits.maxItems, 0)
+        @Expect(parsedStart.payload.limits.maxDurationMillis, 0)
 
         let accepted = decodeServiceFrame(readFixture("scan_accepted_response.jsonl"))
         @Expect(accepted.ok, true)
@@ -83,6 +118,46 @@ public class GitCodeMonitorPluginJobsTest {
         var longJobId = ""
         for (_ in 0..129) { longJobId += "x" }
         @Expect(parseGcmAsyncScanPayload("{\"mode\":\"async\",\"jobId\":\"${longJobId}\",\"deliveryTarget\":{\"peerId\":\"peer\"}}").status, "job_payload_invalid")
+    }
+
+    @TestCase
+    public func asyncScanPayloadLimitsDefaultAndLegacyDurationCompatibility(): Unit {
+        let missingLimits = parseGcmAsyncScanPayload("{" +
+            "\"mode\":\"async\",\"jobId\":\"job-missing-limits\",\"deliveryTarget\":{\"peerId\":\"peer\"}" +
+        "}")
+        @Expect(missingLimits.ok, true)
+        @Expect(missingLimits.payload.limits.maxRepos, 0)
+        @Expect(missingLimits.payload.limits.maxItems, 0)
+        @Expect(missingLimits.payload.limits.maxDurationMillis, 0)
+
+        let emptyLimits = parseGcmAsyncScanPayload("{" +
+            "\"mode\":\"async\",\"jobId\":\"job-empty-limits\",\"deliveryTarget\":{\"peerId\":\"peer\"},\"limits\":{}" +
+        "}")
+        @Expect(emptyLimits.ok, true)
+        @Expect(emptyLimits.payload.limits.maxRepos, 0)
+        @Expect(emptyLimits.payload.limits.maxItems, 0)
+        @Expect(emptyLimits.payload.limits.maxDurationMillis, 0)
+
+        let legacyDuration = parseGcmAsyncScanPayload("{" +
+            "\"mode\":\"async\",\"jobId\":\"job-legacy-duration\",\"deliveryTarget\":{\"peerId\":\"peer\"}," +
+            "\"limits\":{\"maxRepos\":0,\"maxItems\":0,\"maxDurationMillis\":1}" +
+        "}")
+        @Expect(legacyDuration.ok, true)
+        @Expect(legacyDuration.payload.limits.maxDurationMillis, 0)
+
+        let badDurationType = parseGcmAsyncScanPayload("{" +
+            "\"mode\":\"async\",\"jobId\":\"job-bad-duration\",\"deliveryTarget\":{\"peerId\":\"peer\"}," +
+            "\"limits\":{\"maxDurationMillis\":\"bad\"}" +
+        "}")
+        @Expect(badDurationType.ok, false)
+        @Expect(badDurationType.diagnostic, "limits fields must be integers")
+
+        let negativeDuration = parseGcmAsyncScanPayload("{" +
+            "\"mode\":\"async\",\"jobId\":\"job-negative-duration\",\"deliveryTarget\":{\"peerId\":\"peer\"}," +
+            "\"limits\":{\"maxDurationMillis\":-1}" +
+        "}")
+        @Expect(negativeDuration.ok, false)
+        @Expect(negativeDuration.diagnostic, "limits must be non-negative")
     }
 
     @TestCase
@@ -231,6 +306,7 @@ public class GitCodeMonitorPluginJobsTest {
         let result = scanOnceRuntimeBoundedForJob(config, runtime, state, job)
 
         @Expect(result.accepted + result.ignored <= 1, true)
+        @Expect(result.stopReason, "max_repos_reached")
         var fetchedRuntimeRepo = false
         for (request in fakeSender.requests) {
             if (request.url.contains("/repos/cangjie/runtime/")) {
@@ -238,6 +314,89 @@ public class GitCodeMonitorPluginJobsTest {
             }
         }
         @Expect(fetchedRuntimeRepo, false)
+
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
+    }
+
+    @TestCase
+    public func boundedRuntimeHonorsMaxItemsAndReportsStopReason(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempStatePath("runtime-max-items")
+        config.orgs = ["cangjie"]
+        let fakeSender = FakeHttpSender()
+        fakeSender.enqueue(HttpResponseSpec(200, body: "{\"repos\":[{\"path\":\"compiler\",\"public\":true}]}"))
+        enqueueRepoWithIssueBatch(fakeSender, "compiler", 6)
+        let sender: HttpSender = fakeSender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let job = GcmScanJob(payload: parseGcmAsyncScanPayload(asyncScanFrameWithLimits("job-runtime-max-items", "{\"maxRepos\":0,\"maxItems\":3,\"maxDurationMillis\":0}").payload).payload)
+
+        let result = scanOnceRuntimeBoundedForJob(config, runtime, state, job)
+
+        @Expect(result.checkedItems, 3)
+        @Expect(result.stopReason, "max_items_reached")
+
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
+    }
+
+    @TestCase
+    public func asyncRuntimeDefaultLimitsDoNotStopAtFiveReposOrThirtyItems(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempStatePath("runtime-unbounded-default")
+        config.orgs = ["cangjie"]
+        let fakeSender = FakeHttpSender()
+        fakeSender.enqueue(HttpResponseSpec(200, body: "{\"repos\":[" +
+            "{\"path\":\"repo-0\",\"public\":true}," +
+            "{\"path\":\"repo-1\",\"public\":true}," +
+            "{\"path\":\"repo-2\",\"public\":true}," +
+            "{\"path\":\"repo-3\",\"public\":true}," +
+            "{\"path\":\"repo-4\",\"public\":true}," +
+            "{\"path\":\"repo-5\",\"public\":true}," +
+            "{\"path\":\"repo-6\",\"public\":true}," +
+            "{\"path\":\"repo-7\",\"public\":true}," +
+            "{\"path\":\"repo-8\",\"public\":true}," +
+            "{\"path\":\"repo-9\",\"public\":true}," +
+            "{\"path\":\"repo-10\",\"public\":true}," +
+            "{\"path\":\"repo-11\",\"public\":true}" +
+        "]}"))
+        for (i in 0..12) {
+            enqueueRepoWithIssueBatch(fakeSender, "repo-${i}", 7)
+        }
+        let sender: HttpSender = fakeSender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let job = GcmScanJob(payload: parseGcmAsyncScanPayload(asyncScanFrameWithLimits("job-runtime-unbounded-default", "{\"maxRepos\":0,\"maxItems\":0,\"maxDurationMillis\":0}").payload).payload)
+
+        let result = scanOnceRuntimeBoundedForJob(config, runtime, state, job)
+
+        @Expect(result.scannedRepos >= 6, true)
+        @Expect(result.checkedItems > 30, true)
+        @Expect(result.stopReason, "completed")
+
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
+    }
+
+    @TestCase
+    public func legacyDurationLimitDoesNotStopAsyncRuntime(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempStatePath("runtime-legacy-duration")
+        config.orgs = ["cangjie"]
+        let fakeSender = FakeHttpSender()
+        fakeSender.enqueue(HttpResponseSpec(200, body: "{\"repos\":[{\"path\":\"compiler\",\"public\":true}]}"))
+        enqueueRepoWithIssueBatch(fakeSender, "compiler", 6)
+        let sender: HttpSender = fakeSender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let job = GcmScanJob(payload: parseGcmAsyncScanPayload(asyncScanFrameWithLimits("job-runtime-legacy-duration", "{\"maxRepos\":0,\"maxItems\":0,\"maxDurationMillis\":1}").payload).payload)
+
+        let result = scanOnceRuntimeBoundedForJob(config, runtime, state, job)
+
+        @Expect(job.limits.maxDurationMillis, 0)
+        @Expect(result.checkedItems, 6)
+        @Expect(result.stopReason, "completed")
 
         if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
     }
@@ -299,6 +458,7 @@ public class GitCodeMonitorPluginJobsTest {
         @Expect(payloadText.contains("\"ignored\":0"), true)
         @Expect(payloadText.contains("\"writes\":0"), true)
         @Expect(payloadText.contains("\"report\""), true)
+        @Expect(payloadText.contains("\"stopReason\":\"completed\""), true)
         @Expect(payloadText.contains("\"scannedRepos\":1"), true)
         @Expect(payloadText.contains("\"checkedItems\":6"), true)
         @Expect(payloadText.contains("\"duplicateEvents\":6"), true)
