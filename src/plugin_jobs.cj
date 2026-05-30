@@ -121,6 +121,7 @@ public class GcmScanJob {
     public var cancelRequested: Bool
     public var stateSaved: Bool
     public var summary: String
+    public var report: ScanResult
 
     public init(payload!: GcmAsyncScanPayload = GcmAsyncScanPayload()) {
         this.jobId = payload.jobId
@@ -141,6 +142,7 @@ public class GcmScanJob {
         this.cancelRequested = false
         this.stateSaved = false
         this.summary = "GitCode scan job accepted"
+        this.report = ScanResult(0, 0, 0, 0, 0)
     }
 }
 
@@ -239,6 +241,7 @@ public class GcmScanJobStore {
                     job.emitted = result.accepted + result.ignored
                     job.mcpCalls = result.mcpCalls
                     job.writes = result.writes
+                    job.report = result
                     job.stateSaved = stateSaved
                     job.summary = gcmScanJobSummary(job)
                     job.updatedAtMs = gcmNowMillis()
@@ -394,7 +397,11 @@ public func gcmJobAcceptedPayload(job: GcmScanJob, alreadyRunning: Bool): String
 }
 
 public func gcmJobSnapshotPayload(job: GcmScanJob): String {
-    "{\"ok\":true,\"status\":\"${jsonEscape(job.status)}\",\"mode\":\"async\",\"jobId\":\"${jsonEscape(job.jobId)}\",\"stage\":\"${jsonEscape(job.stage)}\",\"accepted\":${job.accepted},\"ignored\":${job.ignored},\"emitted\":${job.emitted},\"mcpCalls\":${job.mcpCalls},\"writes\":${job.writes},\"stateSaved\":${job.stateSaved},\"summary\":\"${jsonEscape(job.summary)}\"}"
+    var payload = "{\"ok\":true,\"status\":\"${jsonEscape(job.status)}\",\"mode\":\"async\",\"jobId\":\"${jsonEscape(job.jobId)}\",\"stage\":\"${jsonEscape(job.stage)}\",\"accepted\":${job.accepted},\"ignored\":${job.ignored},\"emitted\":${job.emitted},\"mcpCalls\":${job.mcpCalls},\"writes\":${job.writes},\"stateSaved\":${job.stateSaved},\"summary\":\"${jsonEscape(job.summary)}\""
+    if (job.status == GCM_SCAN_STATUS_COMPLETED) {
+        payload += ",\"report\":${gcmScanReportPayload(job)}"
+    }
+    payload + "}"
 }
 
 public func gcmJobErrorPayload(status: String, jobId!: String = "", diagnostic!: String = ""): String {
@@ -441,7 +448,7 @@ func runGcmScanJobWorker(jobId: String, config: MonitorConfig, runtime: RuntimeC
         if (running.job.offlineFixture) {
             scanOnceOfflineFixture(config, state)
         } else {
-            scanOnceRuntimeBoundedForJob(config, runtime, state, running.job)
+            scanOnceRuntimeBoundedForJob(config, runtime, state, running.job, eventWriter: Some<GcmPluginStdioWriter>(writer))
         }
     } catch (e: Exception) {
         emitGcmScanJobEvent(store.markFailed(jobId, "scan_runtime", redactServicePayload(e.message).rawHash).job, writer)
@@ -460,58 +467,62 @@ func runGcmScanJobWorker(jobId: String, config: MonitorConfig, runtime: RuntimeC
     emitGcmScanJobEvent(store.markCompleted(jobId, result, saved).job, writer)
 }
 
-func scanOnceRuntimeBoundedForJob(config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState, job: GcmScanJob): ScanResult {
-    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && job.limits.maxDurationMillis <= 0) {
+func scanOnceRuntimeBoundedForJob(
+    config: MonitorConfig,
+    runtime: RuntimeContainer,
+    state: MonitorState,
+    job: GcmScanJob,
+    eventWriter!: Option<GcmPluginStdioWriter> = None<GcmPluginStdioWriter>
+): ScanResult {
+    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && job.limits.maxDurationMillis <= 0 && eventWriter.isNone()) {
         return scanOnceRuntime(config, runtime, state)
     }
-    var accepted: Int64 = 0
-    var ignored: Int64 = 0
-    var notified: Int64 = 0
-    var mcpCalls: Int64 = 0
-    var writes: Int64 = 0
-    var repoCount: Int64 = 0
-    var itemCount: Int64 = 0
+    let result = emptyScanResult(config)
     let started = gcmNowMillis()
     for (org in config.orgs) {
         var page: Int64 = 1
         while (true) {
             if (gcmJobDurationExceeded(started, job.limits.maxDurationMillis)) {
                 state.addAudit(AuditRecord(job.jobId, status: "scan_degraded", reason: "job_timeout"))
-                return ScanResult(accepted, ignored, notified, mcpCalls, writes)
+                return finalizeScanResult(state, job.jobId, result)
             }
             let repoResult = runtime.gitCode.listReposPage(org, page)
             if (repoResult.errorKind != "ok") {
                 state.setBackoff("org:${org}", repoResult.retryAfterMs)
                 state.addAudit(AuditRecord("org:${org}", status: "scan_degraded", reason: repoResult.errorKind))
+                result.failedEvents++
+                result.addFailedSample("org:${org}", repoResult.errorKind)
                 break
             }
             for (repo in repoResult.repos) {
-                if (job.limits.maxRepos > 0 && repoCount >= job.limits.maxRepos) {
-                    return ScanResult(accepted, ignored, notified, mcpCalls, writes)
+                if (job.limits.maxRepos > 0 && result.scannedRepos >= job.limits.maxRepos) {
+                    return finalizeScanResult(state, job.jobId, result)
                 }
-                repoCount++
+                result.scannedRepos++
                 for (event in collectRepoEventsHttp(repo, runtime.gitCode, state)) {
                     if (gcmJobDurationExceeded(started, job.limits.maxDurationMillis)) {
                         state.addAudit(AuditRecord(job.jobId, status: "scan_degraded", reason: "job_timeout"))
-                        return ScanResult(accepted, ignored, notified, mcpCalls, writes)
+                        return finalizeScanResult(state, job.jobId, result)
                     }
-                    if (job.limits.maxItems > 0 && itemCount >= job.limits.maxItems) {
-                        return ScanResult(accepted, ignored, notified, mcpCalls, writes)
+                    if (job.limits.maxItems > 0 && result.checkedItems >= job.limits.maxItems) {
+                        return finalizeScanResult(state, job.jobId, result)
                     }
-                    itemCount++
+                    result.checkedItems++
                     let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer)
-                    accepted += processed.accepted
-                    ignored += processed.ignored
-                    notified += processed.notified
-                    mcpCalls += processed.mcpCalls
-                    writes += processed.writes
+                    if (processed.newEvents > 0) {
+                        match (eventWriter) {
+                            case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)
+                            case None => ()
+                        }
+                    }
+                    result.absorb(processed)
                 }
             }
             if (repoResult.repos.size < runtime.gitCode.pageSize) { break }
             page++
         }
     }
-    ScanResult(accepted, ignored, notified, mcpCalls, writes)
+    finalizeScanResult(state, job.jobId, result)
 }
 
 func gcmJobDurationExceeded(started: Int64, maxDurationMillis: Int64): Bool {
@@ -520,6 +531,26 @@ func gcmJobDurationExceeded(started: Int64, maxDurationMillis: Int64): Bool {
 
 func emitGcmScanJobEvent(job: GcmScanJob, writer: GcmPluginStdioWriter): Unit {
     writer.writeFrame(gcmScanJobEventFrame(job))
+}
+
+func emitGcmAcceptedScanEvent(jobId: String, event: GitCodeEvent, writer: GcmPluginStdioWriter): Unit {
+    writer.writeFrame(gcmAcceptedScanEventFrame(jobId, event))
+}
+
+func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent): ServiceFrame {
+    ServiceFrame(
+        "event",
+        "accepted-${jobId}-${hashRawPayload(event.id)}",
+        GCM_SERVICE_PLUGIN_ID,
+        method: "emitCapabilityEvent",
+        capabilityId: "gitcode.event.accepted",
+        correlationId: "corr-${jobId}",
+        payload: gcmAcceptedScanEventPayload(jobId, event)
+    )
+}
+
+func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent): String {
+    "{\"jobId\":\"${jsonEscape(jobId.trimAscii())}\",\"eventId\":\"${jsonEscape(event.id)}\",\"repo\":\"${jsonEscape(event.org)}/${jsonEscape(event.repo)}\",\"kind\":\"${jsonEscape(event.itemKind)}\",\"number\":\"${jsonEscape(event.itemId)}\",\"author\":\"${jsonEscape(event.actor)}\",\"url\":\"${jsonEscape(event.url)}\",\"title\":\"${jsonEscape(compactSummary(redactSecrets(scanEventTitle(event)), limit: 160))}\",\"content\":\"${jsonEscape(compactSummary(redactSecrets(event.content), limit: 500))}\"}"
 }
 
 func gcmScanJobEventFrame(job: GcmScanJob): ServiceFrame {
@@ -545,12 +576,50 @@ func gcmScanJobEventPayload(job: GcmScanJob): String {
     let ok = job.status != GCM_SCAN_STATUS_FAILED
     var payload = "{\"ok\":${ok},\"status\":\"${jsonEscape(job.status)}\",\"jobId\":\"${jsonEscape(job.jobId)}\",\"stage\":\"${jsonEscape(job.stage)}\",\"accepted\":${job.accepted},\"ignored\":${job.ignored},\"emitted\":${job.emitted},\"mcpCalls\":${job.mcpCalls},\"writes\":${job.writes},\"summary\":\"${jsonEscape(job.summary)}\""
     if (job.status == GCM_SCAN_STATUS_COMPLETED) {
-        payload += ",\"durationMs\":${gcmJobDurationMs(job)},\"stateSaved\":${job.stateSaved}"
+        payload += ",\"durationMs\":${gcmJobDurationMs(job)},\"stateSaved\":${job.stateSaved},\"report\":${gcmScanReportPayload(job)}"
     }
     if (job.status == GCM_SCAN_STATUS_FAILED) {
         payload += ",\"errorKind\":\"${jsonEscape(job.errorKind)}\",\"retryable\":true,\"diagnosticHash\":\"${jsonEscape(hashRawPayload(job.errorKind))}\""
     }
     payload + "}"
+}
+
+func gcmScanReportPayload(job: GcmScanJob): String {
+    let report = job.report
+    "{" +
+        "\"orgs\":${stringArrayJson(report.orgs).toJsonString()}," +
+        "\"limits\":{\"maxRepos\":${job.limits.maxRepos},\"maxItems\":${job.limits.maxItems},\"timeoutMillis\":${job.limits.maxDurationMillis}}," +
+        "\"scannedRepos\":${report.scannedRepos}," +
+        "\"checkedItems\":${report.checkedItems}," +
+        "\"newEvents\":${report.newEvents}," +
+        "\"duplicateEvents\":${report.duplicateEvents}," +
+        "\"filteredEvents\":${report.filteredEvents}," +
+        "\"failedEvents\":${report.failedEvents}," +
+        "\"draftsGenerated\":${report.draftsGenerated}," +
+        "\"draftsFailed\":${report.draftsFailed}," +
+        "\"notificationsSent\":${report.notificationsSent}," +
+        "\"writes\":${report.writes}," +
+        "\"writeMode\":\"${jsonEscape(report.writeMode)}\"," +
+        "\"samples\":{\"new\":${gcmScanSamplesJson(report.samplesNew)},\"duplicate\":${gcmScanSamplesJson(report.samplesDuplicate)},\"filtered\":${gcmScanSamplesJson(report.samplesFiltered)},\"failed\":${gcmScanSamplesJson(report.samplesFailed)}}," +
+        "\"sampleRemaining\":{\"new\":${gcmSampleRemaining(report.newEvents, report.samplesNew.size)},\"duplicate\":${gcmSampleRemaining(report.duplicateEvents, report.samplesDuplicate.size)},\"filtered\":${gcmSampleRemaining(report.filteredEvents, report.samplesFiltered.size)},\"failed\":${gcmSampleRemaining(report.failedEvents, report.samplesFailed.size)}}" +
+    "}"
+}
+
+func gcmScanSamplesJson(samples: ArrayList<ScanEventSummary>): String {
+    let out = StringBuilder()
+    out.append("[")
+    for (i in 0..samples.size) {
+        if (i > 0) { out.append(",") }
+        let sample = samples[i]
+        out.append("{\"eventId\":\"${jsonEscape(sample.eventId)}\",\"repo\":\"${jsonEscape(sample.repo)}\",\"kind\":\"${jsonEscape(sample.kind)}\",\"number\":\"${jsonEscape(sample.number)}\",\"commentId\":\"${jsonEscape(sample.commentId)}\",\"title\":\"${jsonEscape(sample.title)}\",\"url\":\"${jsonEscape(sample.url)}\",\"status\":\"${jsonEscape(sample.status)}\",\"reason\":\"${jsonEscape(sample.reason)}\"}")
+    }
+    out.append("]")
+    out.toString()
+}
+
+func gcmSampleRemaining(total: Int64, sampleSize: Int64): Int64 {
+    let remaining = total - sampleSize
+    if (remaining < 0) { 0 } else { remaining }
 }
 
 func isGcmJobIdSafe(jobId: String): Bool {

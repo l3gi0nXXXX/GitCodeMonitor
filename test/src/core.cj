@@ -828,11 +828,7 @@ public class RuntimeContainer {
 }
 
 public func scanOnceRuntime(config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): ScanResult {
-    var accepted: Int64 = 0
-    var ignored: Int64 = 0
-    var notified: Int64 = 0
-    var mcpCalls: Int64 = 0
-    var writes: Int64 = 0
+    let result = emptyScanResult(config)
     for (org in config.orgs) {
         var page: Int64 = 1
         while (true) {
@@ -840,23 +836,23 @@ public func scanOnceRuntime(config: MonitorConfig, runtime: RuntimeContainer, st
             if (repoResult.errorKind != "ok") {
                 state.setBackoff("org:${org}", repoResult.retryAfterMs)
                 state.addAudit(AuditRecord("org:${org}", status: "scan_degraded", reason: repoResult.errorKind))
+                result.failedEvents++
+                result.addFailedSample("org:${org}", repoResult.errorKind)
                 break
             }
             for (repo in repoResult.repos) {
+                result.scannedRepos++
                 for (event in collectRepoEventsHttp(repo, runtime.gitCode, state)) {
+                    result.checkedItems++
                     let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer)
-                    accepted += processed.accepted
-                    ignored += processed.ignored
-                    notified += processed.notified
-                    mcpCalls += processed.mcpCalls
-                    writes += processed.writes
+                    result.absorb(processed)
                 }
             }
             if (repoResult.repos.size < runtime.gitCode.pageSize) { break }
             page++
         }
     }
-    ScanResult(accepted, ignored, notified, mcpCalls, writes)
+    finalizeScanResult(state, "scan_runtime", result)
 }
 
 public func scanOnceOfflineFixture(config: MonitorConfig, state: MonitorState): ScanResult {
@@ -1425,78 +1421,209 @@ public class FakeAcpClient {
     }
 }
 
+public let SCAN_REPORT_SAMPLE_LIMIT: Int64 = 5
+
+public class ScanEventSummary {
+    public let eventId: String
+    public let repo: String
+    public let kind: String
+    public let number: String
+    public let commentId: String
+    public let title: String
+    public let url: String
+    public let status: String
+    public let reason: String
+
+    public init(eventId: String, repo: String, kind: String, number: String, commentId: String, title: String, url: String, status: String, reason: String) {
+        this.eventId = sanitizeScanReportText(eventId, limit: 160)
+        this.repo = sanitizeScanReportText(repo, limit: 160)
+        this.kind = sanitizeScanReportText(kind, limit: 32)
+        this.number = sanitizeScanReportText(number, limit: 64)
+        this.commentId = sanitizeScanReportText(commentId, limit: 64)
+        this.title = sanitizeScanReportText(title, limit: 160)
+        this.url = sanitizeScanReportText(url, limit: 240)
+        this.status = sanitizeScanReportText(status, limit: 80)
+        this.reason = sanitizeScanReportText(reason, limit: 160)
+    }
+}
+
 public class ScanResult {
-    public let accepted: Int64
-    public let ignored: Int64
-    public let notified: Int64
-    public let mcpCalls: Int64
-    public let writes: Int64
-    public init(accepted: Int64, ignored: Int64, notified: Int64, mcpCalls: Int64, writes: Int64) {
+    public var accepted: Int64
+    public var ignored: Int64
+    public var notified: Int64
+    public var mcpCalls: Int64
+    public var writes: Int64
+    public var orgs: Array<String>
+    public var scannedRepos: Int64
+    public var checkedItems: Int64
+    public var newEvents: Int64
+    public var duplicateEvents: Int64
+    public var filteredEvents: Int64
+    public var failedEvents: Int64
+    public var draftsGenerated: Int64
+    public var draftsFailed: Int64
+    public var notificationsSent: Int64
+    public var writeMode: String
+    public let samplesNew: ArrayList<ScanEventSummary>
+    public let samplesDuplicate: ArrayList<ScanEventSummary>
+    public let samplesFiltered: ArrayList<ScanEventSummary>
+    public let samplesFailed: ArrayList<ScanEventSummary>
+
+    public init(
+        accepted: Int64,
+        ignored: Int64,
+        notified: Int64,
+        mcpCalls: Int64,
+        writes: Int64,
+        orgs!: Array<String> = [],
+        scannedRepos!: Int64 = 0,
+        checkedItems!: Int64 = 0,
+        newEvents!: Int64 = 0,
+        duplicateEvents!: Int64 = 0,
+        filteredEvents!: Int64 = 0,
+        failedEvents!: Int64 = 0,
+        draftsGenerated!: Int64 = 0,
+        draftsFailed!: Int64 = 0,
+        notificationsSent!: Int64 = 0,
+        writeMode!: String = "dry_run"
+    ) {
         this.accepted = accepted
         this.ignored = ignored
         this.notified = notified
         this.mcpCalls = mcpCalls
         this.writes = writes
+        this.orgs = orgs
+        this.scannedRepos = scannedRepos
+        this.checkedItems = checkedItems
+        this.newEvents = newEvents
+        this.duplicateEvents = duplicateEvents
+        this.filteredEvents = filteredEvents
+        this.failedEvents = failedEvents
+        this.draftsGenerated = draftsGenerated
+        this.draftsFailed = draftsFailed
+        this.notificationsSent = notificationsSent
+        this.writeMode = writeMode
+        this.samplesNew = ArrayList<ScanEventSummary>()
+        this.samplesDuplicate = ArrayList<ScanEventSummary>()
+        this.samplesFiltered = ArrayList<ScanEventSummary>()
+        this.samplesFailed = ArrayList<ScanEventSummary>()
+    }
+
+    public func absorb(other: ScanResult): Unit {
+        this.accepted += other.accepted
+        this.ignored += other.ignored
+        this.notified += other.notified
+        this.mcpCalls += other.mcpCalls
+        this.writes += other.writes
+        this.scannedRepos += other.scannedRepos
+        this.checkedItems += other.checkedItems
+        this.newEvents += other.newEvents
+        this.duplicateEvents += other.duplicateEvents
+        this.filteredEvents += other.filteredEvents
+        this.failedEvents += other.failedEvents
+        this.draftsGenerated += other.draftsGenerated
+        this.draftsFailed += other.draftsFailed
+        this.notificationsSent += other.notificationsSent
+        if (this.orgs.size == 0 && other.orgs.size > 0) { this.orgs = other.orgs }
+        if (this.writeMode.isEmpty() && !other.writeMode.isEmpty()) { this.writeMode = other.writeMode }
+        for (sample in other.samplesNew) { addSampleLimited(this.samplesNew, sample) }
+        for (sample in other.samplesDuplicate) { addSampleLimited(this.samplesDuplicate, sample) }
+        for (sample in other.samplesFiltered) { addSampleLimited(this.samplesFiltered, sample) }
+        for (sample in other.samplesFailed) { addSampleLimited(this.samplesFailed, sample) }
+    }
+
+    public func addNewSample(event: GitCodeEvent, status: String, reason!: String = ""): Unit {
+        addSampleLimited(this.samplesNew, scanEventSummary(event, status, reason))
+    }
+
+    public func addDuplicateSample(event: GitCodeEvent, reason: String): Unit {
+        addSampleLimited(this.samplesDuplicate, scanEventSummary(event, "seen", reason))
+    }
+
+    public func addFilteredSample(event: GitCodeEvent, reason: String): Unit {
+        addSampleLimited(this.samplesFiltered, scanEventSummary(event, "filtered", reason))
+    }
+
+    public func addFailedSample(repo: String, reason: String): Unit {
+        addSampleLimited(this.samplesFailed, ScanEventSummary("", repo, "", "", "", "", "", "failed", reason))
     }
 }
 
 public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, state: MonitorState, feishu: FakeNotifier, telegram: FakeNotifier, mcp: FakeMcpClient, writer: FakeCommentWriter): ScanResult {
-    var accepted: Int64 = 0
-    var ignored: Int64 = 0
-    var notified: Int64 = 0
-    var mcpCalls: Int64 = 0
-    var writes: Int64 = 0
+    let result = emptyScanResult(config)
     for (repo in transport.repos) {
+        result.scannedRepos++
         for (event in transport.scanRepo(repo)) {
+            result.checkedItems++
             let filter = filterEvent(event)
             if (filter.ignored) {
-                ignored++
+                result.ignored++
+                result.filteredEvents++
+                result.addFilteredSample(event, filter.reason)
                 state.addAudit(AuditRecord(event.id, status: "ignored", reason: filter.reason))
                 continue
             }
             if (state.hasSeen(event.id)) {
+                result.duplicateEvents++
+                result.addDuplicateSample(event, "seen")
                 state.addAudit(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
                 continue
             }
             state.markSeen(event.id)
-            accepted++
+            result.accepted++
+            result.newEvents++
             feishu.notify(event)
             telegram.notify(event)
-            notified += 2
+            result.notified += 2
+            result.notificationsSent += 2
             let audit = AuditRecord(event.id, status: "accepted")
             state.addAudit(audit)
+            var sampleStatus = "accepted"
+            var sampleReason = ""
             if (!state.hasMcpCall(event.id)) {
                 let input = eventToToolInput(event)
                 let mcpResult = mcp.call(input)
                 if (mcpResult.ok) {
                     state.markMcpCall(event.id)
-                    mcpCalls++
+                    result.mcpCalls++
+                    result.draftsGenerated++
                     audit.status = "drafted"
                     let decision = writebackGate(config, state, event, mcpResult)
                     audit.reason = decision.reason
+                    sampleStatus = "drafted"
+                    sampleReason = decision.reason
                     if (decision.allowed) {
                         audit.replyUrl = writer.write(event, mcpResult.draft, state)
-                        writes++
+                        result.writes++
+                        sampleStatus = "replied"
                     }
                 } else {
                     audit.status = "mcp_degraded"
                     audit.reason = mcpResult.errorKind
+                    result.draftsFailed++
+                    sampleStatus = "mcp_degraded"
+                    sampleReason = mcpResult.errorKind
                 }
             }
+            result.addNewSample(event, sampleStatus, reason: sampleReason)
         }
     }
-    ScanResult(accepted, ignored, notified, mcpCalls, writes)
+    finalizeScanResult(state, "scan_once", result)
 }
 
 func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, feishu: HttpNotifier, telegram: HttpNotifier, mcp: McpHttpClient, writer: GitCodeCommentWriter): ScanResult {
     let filter = filterEvent(event)
     if (filter.ignored) {
         state.addAudit(AuditRecord(event.id, status: "ignored", reason: filter.reason))
-        return ScanResult(0, 1, 0, 0, 0)
+        let result = ScanResult(0, 1, 0, 0, 0, filteredEvents: 1, writeMode: scanWriteMode(config))
+        result.addFilteredSample(event, filter.reason)
+        return result
     }
     if (state.hasSeen(event.id)) {
         state.addAudit(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
-        return ScanResult(0, 0, 0, 0, 0)
+        let result = ScanResult(0, 0, 0, 0, 0, duplicateEvents: 1, writeMode: scanWriteMode(config))
+        result.addDuplicateSample(event, "seen")
+        return result
     }
     state.markSeen(event.id)
     let feishuDelivery = feishu.notify(event)
@@ -1507,25 +1634,92 @@ func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitC
 
     var mcpCalls: Int64 = 0
     var writes: Int64 = 0
+    var draftsGenerated: Int64 = 0
+    var draftsFailed: Int64 = 0
+    var sampleStatus = "accepted"
+    var sampleReason = ""
     if (!state.hasMcpCall(event.id)) {
         let mcpResult = mcp.call(eventToToolInput(event))
         if (mcpResult.ok) {
             state.markMcpCall(event.id)
             mcpCalls = 1
+            draftsGenerated = 1
             audit.status = "drafted"
             let decision = writer.writeIfAllowed(config, state, event, mcpResult)
             audit.reason = decision.reason
             audit.writeDecision = decision.reason
+            sampleStatus = "drafted"
+            sampleReason = decision.reason
             if (decision.allowed) {
                 writes = 1
                 audit.status = "replied"
+                sampleStatus = "replied"
             }
         } else {
             audit.status = "mcp_degraded"
             audit.reason = mcpResult.errorKind
+            draftsFailed = 1
+            sampleStatus = "mcp_degraded"
+            sampleReason = mcpResult.errorKind
         }
     }
-    ScanResult(1, 0, 2, mcpCalls, writes)
+    let result = ScanResult(1, 0, 2, mcpCalls, writes, newEvents: 1, draftsGenerated: draftsGenerated, draftsFailed: draftsFailed, notificationsSent: 2, writeMode: scanWriteMode(config))
+    result.addNewSample(event, sampleStatus, reason: sampleReason)
+    result
+}
+
+func emptyScanResult(config: MonitorConfig): ScanResult {
+    ScanResult(0, 0, 0, 0, 0, orgs: config.orgs, writeMode: scanWriteMode(config))
+}
+
+func scanWriteMode(config: MonitorConfig): String {
+    if (config.dryRun) { "dry_run" } else { "writeback" }
+}
+
+func finalizeScanResult(state: MonitorState, scanId: String, result: ScanResult): ScanResult {
+    state.addAudit(AuditRecord(scanId, status: "scan_summary", reason: scanSummaryReason(result)))
+    result
+}
+
+func scanSummaryReason(result: ScanResult): String {
+    "scannedRepos=${result.scannedRepos} checkedItems=${result.checkedItems} newEvents=${result.newEvents} duplicateEvents=${result.duplicateEvents} filteredEvents=${result.filteredEvents} failedEvents=${result.failedEvents} draftsGenerated=${result.draftsGenerated} notificationsSent=${result.notificationsSent} writes=${result.writes}"
+}
+
+func addSampleLimited(samples: ArrayList<ScanEventSummary>, sample: ScanEventSummary): Unit {
+    if (samples.size < SCAN_REPORT_SAMPLE_LIMIT) { samples.add(sample) }
+}
+
+func scanEventSummary(event: GitCodeEvent, status: String, reason: String): ScanEventSummary {
+    ScanEventSummary(
+        event.id,
+        "${event.org}/${event.repo}",
+        event.itemKind,
+        event.itemId,
+        scanEventCommentId(event),
+        scanEventTitle(event),
+        event.url,
+        status,
+        reason
+    )
+}
+
+func scanEventTitle(event: GitCodeEvent): String {
+    let text = event.content.trimAscii()
+    if (text.isEmpty()) { return "" }
+    text.split("\n")[0].trimAscii()
+}
+
+func scanEventCommentId(event: GitCodeEvent): String {
+    if (!event.id.contains(":comment:")) { return "" }
+    let parts = event.id.split(":comment:")
+    if (parts.size < 2) { return "" }
+    parts[1]
+}
+
+func sanitizeScanReportText(raw: String, limit!: Int64 = 160): String {
+    var text = redactSecrets(redactUrl(raw)).trimAscii().replace("\n", " ").replace("\r", " ")
+    if (containsLocalPath(text)) { text = "[REDACTED_LOCAL_PATH]" }
+    compactSummary(text, limit: limit)
 }
 
 public func doctorReport(config: MonitorConfig, state: MonitorState, mcp: FakeMcpClient): String {

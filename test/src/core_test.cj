@@ -314,11 +314,94 @@ public class GitCodeMonitorCoreTest {
         let first = scanOnceOfflineFixture(config, state)
         let second = scanOnceOfflineFixture(config, state)
         @Expect(first.accepted, 1)
+        @Expect(first.scannedRepos, 3)
+        @Expect(first.checkedItems, 1)
+        @Expect(first.newEvents, 1)
+        @Expect(first.samplesNew.size, 1)
+        @Expect(first.samplesNew[0].repo, "cangjie/compiler")
+        @Expect(first.samplesNew[0].kind, "issue")
+        @Expect(first.samplesNew[0].number, "1")
+        @Expect(first.samplesNew[0].url, "https://gitcode.com/cangjie/compiler/issues/1")
         @Expect(first.notified, 2)
         @Expect(first.mcpCalls, 1)
         @Expect(second.accepted, 0)
+        @Expect(second.scannedRepos, 3)
+        @Expect(second.checkedItems, 1)
+        @Expect(second.duplicateEvents, 1)
+        @Expect(second.samplesDuplicate.size, 1)
+        @Expect(second.samplesDuplicate[0].reason, "seen")
         @Expect(second.notified, 0)
         @Expect(second.mcpCalls, 0)
+    }
+
+    @TestCase
+    public func scanReportCountsMultipleNewAndFilteredEvents(): Unit {
+        let config = defaultConfig()
+        let transport = FakeGitCodeTransport()
+        transport.repos.add(GitCodeRepo("cangjie", "compiler"))
+        transport.events.add(GitCodeEvent("evt-1", "cangjie", "compiler", "pr", "70", "alice", "", "https://gitcode.com/cangjie/compiler/pulls/70", "Fix parser\nbody"))
+        transport.events.add(GitCodeEvent("evt-2", "cangjie", "compiler", "issue", "71", "bob", "", "https://gitcode.com/cangjie/compiler/issues/71", "Discuss docs"))
+        transport.events.add(GitCodeEvent("evt-3", "cangjie", "compiler", "issue", "72", "CangjiePL", "https://gitcode.com/CangjiePL", "https://gitcode.com/cangjie/compiler/issues/72", "bot event"))
+
+        let result = scanOnce(config, transport, MonitorState(), FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+
+        @Expect(result.scannedRepos, 1)
+        @Expect(result.checkedItems, 3)
+        @Expect(result.newEvents, 2)
+        @Expect(result.filteredEvents, 1)
+        @Expect(result.draftsGenerated, 2)
+        @Expect(result.notificationsSent, 4)
+        @Expect(result.samplesNew.size, 2)
+        @Expect(result.samplesNew[0].title, "Fix parser")
+        @Expect(result.samplesFiltered.size, 1)
+        @Expect(result.samplesFiltered[0].reason, "CangjiePL")
+    }
+
+    @TestCase
+    public func scanReportSamplesAreCappedAndRedacted(): Unit {
+        let config = defaultConfig()
+        let state = MonitorState()
+        let transport = FakeGitCodeTransport()
+        transport.repos.add(GitCodeRepo("cangjie", "compiler"))
+        for (i in 0..6) {
+            let id = "dup-${i}"
+            state.markSeen(id)
+            transport.events.add(GitCodeEvent(
+                id,
+                "cangjie",
+                "compiler",
+                "issue",
+                "${i}",
+                "alice",
+                "",
+                "https://gitcode.com/cangjie/compiler/issues/${i}?access_token=secret-token",
+                "Authorization: Bearer secret-token /Users/alice/private"
+            ))
+        }
+
+        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+
+        @Expect(result.duplicateEvents, 6)
+        @Expect(result.samplesDuplicate.size, 5)
+        @Expect(result.samplesDuplicate[0].title.contains("secret-token"), false)
+        @Expect(result.samplesDuplicate[0].url.contains("secret-token"), false)
+        @Expect(result.samplesDuplicate[0].title.contains("/Users/alice"), false)
+    }
+
+    @TestCase
+    public func scanSummaryAuditContainsCountersWithoutSecrets(): Unit {
+        let config = defaultConfig()
+        let state = MonitorState()
+        let transport = FakeGitCodeTransport()
+        transport.repos.add(GitCodeRepo("cangjie", "compiler"))
+        transport.events.add(GitCodeEvent("evt-secret", "cangjie", "compiler", "issue", "1", "alice", "", "", "token=secret-value"))
+
+        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+
+        @Expect(result.checkedItems, 1)
+        @Expect(state.audit[state.audit.size - 1].status, "scan_summary")
+        @Expect(state.audit[state.audit.size - 1].reason.contains("checkedItems=1"), true)
+        @Expect(state.audit[state.audit.size - 1].reason.contains("secret-value"), false)
     }
 
     @TestCase

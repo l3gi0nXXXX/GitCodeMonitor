@@ -810,8 +810,9 @@ private func pluginArgValue(args: Array<String>, key: String): ?String {
     None<String>
 }
 
-private func eventPayload(event: GitCodeEvent): String {
-    "{\"eventId\":\"${event.id}\",\"repo\":\"${event.org}/${event.repo}\",\"kind\":\"${event.itemKind}\",\"number\":\"${event.itemId}\",\"author\":\"${event.actor}\",\"url\":\"${event.url}\",\"content\":\"${jsonEscape(compactSummary(redactSecrets(event.content), limit: 500))}\"}"
+private func eventPayload(event: GitCodeEvent, jobId!: String = ""): String {
+    let jobPart = if (jobId.trimAscii().isEmpty()) { "" } else { "\"jobId\":\"${jsonEscape(jobId.trimAscii())}\"," }
+    "{\"eventId\":\"${jsonEscape(event.id)}\",${jobPart}\"repo\":\"${jsonEscape(event.org)}/${jsonEscape(event.repo)}\",\"kind\":\"${jsonEscape(event.itemKind)}\",\"number\":\"${jsonEscape(event.itemId)}\",\"author\":\"${jsonEscape(event.actor)}\",\"url\":\"${jsonEscape(event.url)}\",\"title\":\"${jsonEscape(compactSummary(redactSecrets(scanEventTitle(event)), limit: 160))}\",\"content\":\"${jsonEscape(compactSummary(redactSecrets(event.content), limit: 500))}\"}"
 }
 
 private func parseWritebackRequest(payload: String): GcmWritebackRequest {
