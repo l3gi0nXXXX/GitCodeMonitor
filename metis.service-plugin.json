@@ -6,73 +6,22 @@
   "protocolVersion": "1.0",
   "entry": {
     "command": "cjpm",
-    "args": ["run", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
+    "args": ["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
   },
   "capabilityDeclarations": [
-    {
-      "capabilityId": "gitcode.monitor.status",
-      "kind": "controlAction",
-      "direction": "metis-to-gcm",
-      "description": "Read GitCode monitor status",
-      "outputSchema": "schemas/gitcode.monitor.status.output.json"
-    },
-    {
-      "capabilityId": "gitcode.monitor.scan_once",
-      "kind": "controlAction",
-      "direction": "metis-to-gcm",
-      "description": "Trigger one bounded GitCode scan",
-      "inputSchema": "schemas/gitcode.monitor.scan_once.input.json",
-      "outputSchema": "schemas/gitcode.monitor.scan_once.output.json"
-    },
-    {
-      "capabilityId": "gitcode.event.accepted",
-      "kind": "event",
-      "direction": "gcm-to-metis",
-      "description": "Accepted GitCode issue/PR/comment event",
-      "outputSchema": "schemas/gitcode.event.accepted.json"
-    },
-    {
-      "capabilityId": "gitcode.event.ignored",
-      "kind": "event",
-      "direction": "gcm-to-metis",
-      "description": "Ignored GitCode event audit",
-      "outputSchema": "schemas/gitcode.event.ignored.json"
-    },
-    {
-      "capabilityId": "gitcode.agent.draft_request",
-      "kind": "agentRequest",
-      "direction": "gcm-to-metis",
-      "requiredHostApis": ["host.agent.invoke"],
-      "description": "Request summary/draft/safety/citations from Metis Agent Runtime"
-    },
-    {
-      "capabilityId": "gitcode.notification.generated_reply",
-      "kind": "notificationTopic",
-      "direction": "metis-internal-delivery",
-      "requiredHostApis": ["host.notification.publish"],
-      "description": "Metis-delivered generated reply notification"
-    },
-    {
-      "capabilityId": "gitcode.writeback.apply_result",
-      "kind": "controlAction",
-      "direction": "metis-to-gcm",
-      "description": "Apply Metis draft result to GCM autoReply/writeback gate"
-    },
-    {
-      "capabilityId": "gitcode.writeback.audit",
-      "kind": "event",
-      "direction": "gcm-to-metis",
-      "description": "GitCode writeback audit event",
-      "outputSchema": "schemas/gitcode.writeback.audit.json"
-    }
+    {"capabilityId": "gitcode.monitor.status", "kind": "controlAction", "direction": "metis-to-gcm"},
+    {"capabilityId": "gitcode.monitor.scan_once", "kind": "controlAction", "direction": "metis-to-gcm"},
+    {"capabilityId": "gitcode.event.accepted", "kind": "event", "direction": "gcm-to-metis"},
+    {"capabilityId": "gitcode.event.ignored", "kind": "event", "direction": "gcm-to-metis"},
+    {"capabilityId": "gitcode.agent.draft_request", "kind": "agentRequest", "direction": "gcm-to-metis", "requiredHostApis": ["host.agent.invoke"]},
+    {"capabilityId": "gitcode.notification.generated_reply", "kind": "notificationTopic", "direction": "metis-internal-delivery", "requiredHostApis": ["host.notification.publish"]},
+    {"capabilityId": "gitcode.writeback.apply_result", "kind": "controlAction", "direction": "metis-to-gcm"},
+    {"capabilityId": "gitcode.writeback.audit", "kind": "event", "direction": "gcm-to-metis"}
   ],
   "configSchema": {
     "type": "object",
     "properties": {
-      "configPath": {
-        "type": "string",
-        "title": "GCM config path"
-      }
+      "configPath": {"type": "string", "title": "GCM config path"}
     },
     "required": ["configPath"]
   }

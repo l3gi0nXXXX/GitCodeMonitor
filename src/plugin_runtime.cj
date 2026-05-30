@@ -3,6 +3,7 @@ package gitcodemonitor
 import std.collection.ArrayList
 import std.env.{getStdIn, getStdOut}
 import std.fs.{Path, exists}
+import stdx.encoding.json.{JsonObject, JsonValue}
 
 public class ServiceInitializeRequest {
     public let protocolVersion: String
@@ -135,6 +136,92 @@ public class GcmPluginFrameHandleResult {
         this.ok = ok
         this.frame = frame
         this.shouldStop = shouldStop
+    }
+}
+
+public interface GcmPluginLineSink {
+    func writeln(line: String): Unit
+    func flush(): Unit
+}
+
+public class GcmStdoutLineSink <: GcmPluginLineSink {
+    private let stdout = getStdOut()
+
+    public init() {}
+
+    public func writeln(line: String): Unit {
+        stdout.writeln(line)
+    }
+
+    public func flush(): Unit {
+        stdout.flush()
+    }
+}
+
+public class GcmMemoryLineSink <: GcmPluginLineSink {
+    public let lines = ArrayList<String>()
+
+    public init() {}
+
+    public func writeln(line: String): Unit {
+        lines.add(line)
+    }
+
+    public func flush(): Unit {}
+}
+
+public class GcmPluginStdioWriter {
+    private let sink: GcmPluginLineSink
+
+    public init(sink: GcmPluginLineSink) {
+        this.sink = sink
+    }
+
+    public func writeFrame(frame: ServiceFrame): Unit {
+        sink.writeln(encodeServiceFrame(frame).trimAscii())
+        sink.flush()
+    }
+}
+
+public class PluginPayloadParseResult {
+    public let ok: Bool
+    public let status: String
+    public let payloadObject: JsonObject
+    public let diagnostic: String
+
+    public init(ok: Bool, status: String, payloadObject!: JsonObject = JsonObject(), diagnostic!: String = "") {
+        this.ok = ok
+        this.status = status
+        this.payloadObject = payloadObject
+        this.diagnostic = diagnostic
+    }
+}
+
+public class PluginPayloadBoolResult {
+    public let ok: Bool
+    public let status: String
+    public let value: Bool
+    public let diagnostic: String
+
+    public init(ok: Bool, status: String, value!: Bool = false, diagnostic!: String = "") {
+        this.ok = ok
+        this.status = status
+        this.value = value
+        this.diagnostic = diagnostic
+    }
+}
+
+public class PluginPayloadStringResult {
+    public let ok: Bool
+    public let status: String
+    public let value: String
+    public let diagnostic: String
+
+    public init(ok: Bool, status: String, value!: String = "", diagnostic!: String = "") {
+        this.ok = ok
+        this.status = status
+        this.value = value
+        this.diagnostic = diagnostic
     }
 }
 
@@ -322,22 +409,21 @@ public class GcmMcpClientMode {
 }
 
 public func gcmPluginMain(args: Array<String>): Int64 {
+    let writer = GcmPluginStdioWriter(GcmStdoutLineSink())
     let configRef = pluginArgValue(args, "--config") ?? pluginArgValue(args, "configRef") ?? defaultConfigPath()
     let initResult = initializeGcmPlugin(ServiceInitializeRequest(GCM_SERVICE_PROTOCOL_VERSION, configRef: configRef, hostApis: ["host.agent.invoke", "host.audit.append"]))
     if (!initResult.ok) {
-        println(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${initResult.status}\"}")).trimAscii())
+        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${initResult.status}\"}"))
         return 2
     }
     let loaded = loadGcmRuntimeConfig(configRef)
     if (!loaded.ok) {
-        println(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${loaded.status}\"}")).trimAscii())
+        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${loaded.status}\"}"))
         return 2
     }
-    let runtime = RuntimeContainer(loaded.config)
+    let runtime = RuntimeContainer(loaded.config, pluginStdioMode: true)
     let state = runtime.store.load()
-    let stdout = getStdOut()
-    stdout.writeln(encodeServiceFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"${initResult.status}\",\"capabilities\":${initResult.capabilities.size}}")).trimAscii())
-    stdout.flush()
+    writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"${initResult.status}\",\"capabilities\":${initResult.capabilities.size}}"))
     let stdin = getStdIn()
     while (true) {
         let line = try {
@@ -349,8 +435,7 @@ public func gcmPluginMain(args: Array<String>): Int64 {
             case Some(raw) =>
                 let handled = handleGcmPluginInputLine(raw, loaded.config, runtime, state)
                 if (!handled.frame.frameType.isEmpty()) {
-                    stdout.writeln(encodeServiceFrame(handled.frame).trimAscii())
-                    stdout.flush()
+                    writer.writeFrame(handled.frame)
                 }
                 if (handled.shouldStop) {
                     let _ = runtime.store.save(state)
@@ -424,11 +509,23 @@ public func handleGcmStatusCapability(payload: String, runtime: GcmRuntime): Gcm
 }
 
 public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): GcmScanOnceResult {
-    if (payload.contains("\"overlap\":true")) {
+    let parsed = parsePluginPayloadObject(payload)
+    if (!parsed.ok) {
+        return GcmScanOnceResult(false, "invalid_payload")
+    }
+    let overlap = pluginPayloadBoolField(parsed.payloadObject, "overlap", defaultValue: false)
+    if (!overlap.ok) {
+        return GcmScanOnceResult(false, "invalid_payload")
+    }
+    if (overlap.value) {
         runtime.state.skippedOverlappingScans++
         return GcmScanOnceResult(true, "skipped_overlap")
     }
-    if (!pluginPayloadBool(payload, "offlineFixture")) {
+    let offlineFixture = pluginPayloadBoolField(parsed.payloadObject, "offlineFixture", defaultValue: false)
+    if (!offlineFixture.ok) {
+        return GcmScanOnceResult(false, "invalid_payload")
+    }
+    if (!offlineFixture.value) {
         return GcmScanOnceResult(false, "runtime_required")
     }
     let result = scanOnceOfflineFixture(runtime.config, runtime.state)
@@ -436,11 +533,23 @@ public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): G
 }
 
 public func handleGcmScanOnceCapabilityRuntime(payload: String, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): GcmScanOnceResult {
-    if (payload.contains("\"overlap\":true")) {
+    let parsed = parsePluginPayloadObject(payload)
+    if (!parsed.ok) {
+        return GcmScanOnceResult(false, "invalid_payload")
+    }
+    let overlap = pluginPayloadBoolField(parsed.payloadObject, "overlap", defaultValue: false)
+    if (!overlap.ok) {
+        return GcmScanOnceResult(false, "invalid_payload")
+    }
+    if (overlap.value) {
         state.skippedOverlappingScans++
         return GcmScanOnceResult(true, "skipped_overlap")
     }
-    let result = if (pluginPayloadBool(payload, "offlineFixture")) {
+    let offlineFixture = pluginPayloadBoolField(parsed.payloadObject, "offlineFixture", defaultValue: false)
+    if (!offlineFixture.ok) {
+        return GcmScanOnceResult(false, "invalid_payload")
+    }
+    let result = if (offlineFixture.value) {
         scanOnceOfflineFixture(config, state)
     } else {
         scanOnceRuntime(config, runtime, state)
@@ -639,23 +748,80 @@ private func eventPayload(event: GitCodeEvent): String {
 }
 
 private func parseWritebackRequest(payload: String): GcmWritebackRequest {
+    let parsed = parsePluginPayloadObject(payload)
+    if (!parsed.ok) {
+        return GcmWritebackRequest("", "", "", "", "", "", safety: "invalid_payload")
+    }
+    let eventId = pluginPayloadStringField(parsed.payloadObject, "eventId")
+    let repo = pluginPayloadStringField(parsed.payloadObject, "repo")
+    let kind = pluginPayloadStringField(parsed.payloadObject, "kind")
+    let number = pluginPayloadStringField(parsed.payloadObject, "number")
+    let url = pluginPayloadStringField(parsed.payloadObject, "url")
+    let draft = pluginPayloadStringField(parsed.payloadObject, "draft", maxBytes: 32768)
+    let safety = pluginPayloadStringField(parsed.payloadObject, "safety", defaultValue: "approved")
+    let needsHumanReview = pluginPayloadBoolField(parsed.payloadObject, "needsHumanReview", defaultValue: false)
+    let duplicate = pluginPayloadBoolField(parsed.payloadObject, "duplicate", defaultValue: false)
+    if (!eventId.ok || !repo.ok || !kind.ok || !number.ok || !url.ok || !draft.ok || !safety.ok || !needsHumanReview.ok || !duplicate.ok) {
+        return GcmWritebackRequest("", "", "", "", "", "", safety: "invalid_payload")
+    }
     GcmWritebackRequest(
-        pluginFieldValue(payload, "eventId"),
-        pluginFieldValue(payload, "repo"),
-        pluginFieldValue(payload, "kind"),
-        pluginFieldValue(payload, "number"),
-        pluginFieldValue(payload, "url"),
-        pluginFieldValue(payload, "draft"),
-        safety: pluginFieldValue(payload, "safety"),
-        needsHumanReview: payload.contains("\"needsHumanReview\":true"),
-        duplicate: payload.contains("\"duplicate\":true")
+        eventId.value,
+        repo.value,
+        kind.value,
+        number.value,
+        url.value,
+        draft.value,
+        safety: safety.value,
+        needsHumanReview: needsHumanReview.value,
+        duplicate: duplicate.value
     )
 }
 
-private func pluginFieldValue(raw: String, key: String): String {
-    let needle = "\"${key}\":\""
-    if (!raw.contains(needle)) { return "" }
-    raw.split(needle, 2)[1].split("\"", 2)[0]
+public func parsePluginPayloadObject(payload: String, maxBytes!: Int64 = 16384): PluginPayloadParseResult {
+    let normalized = payload.trimAscii()
+    if (normalized.size > maxBytes) {
+        return PluginPayloadParseResult(false, "invalid_payload", diagnostic: "payload_too_large")
+    }
+    if (normalized.isEmpty()) {
+        return PluginPayloadParseResult(true, "ok", payloadObject: JsonObject())
+    }
+    let root = try {
+        JsonValue.fromStr(normalized).asObject()
+    } catch (_: Exception) {
+        return PluginPayloadParseResult(false, "invalid_payload", diagnostic: "payload must be a JSON object")
+    }
+    PluginPayloadParseResult(true, "ok", payloadObject: root)
+}
+
+public func pluginPayloadBoolField(root: JsonObject, key: String, defaultValue!: Bool = false): PluginPayloadBoolResult {
+    match (root.get(key)) {
+        case Some(value) =>
+            let raw = value.toJsonString().trimAscii()
+            if (raw == "true") {
+                return PluginPayloadBoolResult(true, "ok", value: true)
+            }
+            if (raw == "false") {
+                return PluginPayloadBoolResult(true, "ok", value: false)
+            }
+            PluginPayloadBoolResult(false, "invalid_payload", diagnostic: "field ${key} must be bool")
+        case None => PluginPayloadBoolResult(true, "ok", value: defaultValue)
+    }
+}
+
+public func pluginPayloadStringField(root: JsonObject, key: String, defaultValue!: String = "", maxBytes!: Int64 = 4096): PluginPayloadStringResult {
+    match (root.get(key)) {
+        case Some(value) =>
+            let text = try {
+                value.asString().getValue()
+            } catch (_: Exception) {
+                return PluginPayloadStringResult(false, "invalid_payload", diagnostic: "field ${key} must be string")
+            }
+            if (text.size > maxBytes) {
+                return PluginPayloadStringResult(false, "invalid_payload", diagnostic: "field ${key} exceeds ${maxBytes} bytes")
+            }
+            PluginPayloadStringResult(true, "ok", value: text)
+        case None => PluginPayloadStringResult(true, "ok", value: defaultValue)
+    }
 }
 
 private func gcmPluginResponseFrame(request: ServiceFrame, ok: Bool, status: String, payload: String): ServiceFrame {
@@ -689,11 +855,6 @@ private func gcmPluginErrorFrame(frameId: String, correlationId: String, status:
 private func gcmScanOncePayload(result: GcmScanOnceResult, saved!: Bool = true): String {
     let status = if (saved) { result.status } else { "state_save_failed" }
     "{\"ok\":${result.ok && saved},\"status\":\"${status}\",\"accepted\":${result.accepted},\"ignored\":${result.ignored},\"emitted\":${result.emitted},\"stateSaved\":${saved}}"
-}
-
-private func pluginPayloadBool(payload: String, key: String): Bool {
-    let normalized = payload.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
-    normalized.contains("\"${key}\":true")
 }
 
 private func pluginRepoAllowlisted(allowlist: Array<String>, repo: String): Bool {
