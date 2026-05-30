@@ -846,6 +846,7 @@ public func scanOnceRuntime(config: MonitorConfig, runtime: RuntimeContainer, st
                 state.setBackoff("org:${org}", repoResult.retryAfterMs)
                 state.addAudit(AuditRecord("org:${org}", status: "scan_degraded", reason: repoResult.errorKind))
                 result.failedEvents++
+                result.stopReason = "degraded"
                 result.addFailedSample("org:${org}", repoResult.errorKind)
                 break
             }
@@ -1473,6 +1474,7 @@ public class ScanResult {
     public var draftsFailed: Int64
     public var notificationsSent: Int64
     public var writeMode: String
+    public var stopReason: String
     public let samplesNew: ArrayList<ScanEventSummary>
     public let samplesDuplicate: ArrayList<ScanEventSummary>
     public let samplesFiltered: ArrayList<ScanEventSummary>
@@ -1494,7 +1496,8 @@ public class ScanResult {
         draftsGenerated!: Int64 = 0,
         draftsFailed!: Int64 = 0,
         notificationsSent!: Int64 = 0,
-        writeMode!: String = "dry_run"
+        writeMode!: String = "dry_run",
+        stopReason!: String = "completed"
     ) {
         this.accepted = accepted
         this.ignored = ignored
@@ -1512,6 +1515,7 @@ public class ScanResult {
         this.draftsFailed = draftsFailed
         this.notificationsSent = notificationsSent
         this.writeMode = writeMode
+        this.stopReason = normalizeScanStopReason(stopReason)
         this.samplesNew = ArrayList<ScanEventSummary>()
         this.samplesDuplicate = ArrayList<ScanEventSummary>()
         this.samplesFiltered = ArrayList<ScanEventSummary>()
@@ -1535,6 +1539,7 @@ public class ScanResult {
         this.notificationsSent += other.notificationsSent
         if (this.orgs.size == 0 && other.orgs.size > 0) { this.orgs = other.orgs }
         if (this.writeMode.isEmpty() && !other.writeMode.isEmpty()) { this.writeMode = other.writeMode }
+        if (this.stopReason == "completed" && other.stopReason != "completed") { this.stopReason = other.stopReason }
         for (sample in other.samplesNew) { addSampleLimited(this.samplesNew, sample) }
         for (sample in other.samplesDuplicate) { addSampleLimited(this.samplesDuplicate, sample) }
         for (sample in other.samplesFiltered) { addSampleLimited(this.samplesFiltered, sample) }
@@ -1686,12 +1691,24 @@ func scanWriteMode(config: MonitorConfig): String {
 }
 
 func finalizeScanResult(state: MonitorState, scanId: String, result: ScanResult): ScanResult {
+    result.stopReason = normalizeScanStopReason(result.stopReason)
     state.addAudit(AuditRecord(scanId, status: "scan_summary", reason: scanSummaryReason(result)))
     result
 }
 
 func scanSummaryReason(result: ScanResult): String {
-    "scannedRepos=${result.scannedRepos} checkedItems=${result.checkedItems} newEvents=${result.newEvents} duplicateEvents=${result.duplicateEvents} filteredEvents=${result.filteredEvents} failedEvents=${result.failedEvents} draftsGenerated=${result.draftsGenerated} notificationsSent=${result.notificationsSent} writes=${result.writes}"
+    "scannedRepos=${result.scannedRepos} checkedItems=${result.checkedItems} newEvents=${result.newEvents} duplicateEvents=${result.duplicateEvents} filteredEvents=${result.filteredEvents} failedEvents=${result.failedEvents} draftsGenerated=${result.draftsGenerated} notificationsSent=${result.notificationsSent} writes=${result.writes} stopReason=${result.stopReason}"
+}
+
+func normalizeScanStopReason(stopReason: String): String {
+    match (stopReason) {
+        case "completed" => "completed"
+        case "max_repos_reached" => "max_repos_reached"
+        case "max_items_reached" => "max_items_reached"
+        case "cancelled" => "cancelled"
+        case "degraded" => "degraded"
+        case _ => "completed"
+    }
 }
 
 func addSampleLimited(samples: ArrayList<ScanEventSummary>, sample: ScanEventSummary): Unit {

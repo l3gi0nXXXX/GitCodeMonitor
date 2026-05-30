@@ -405,6 +405,19 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func scanResultDefaultsStopReasonToCompletedAndAuditMentionsIt(): Unit {
+        let state = MonitorState()
+        let result = ScanResult(0, 0, 0, 0, 0)
+
+        let finalized = finalizeScanResult(state, "scan-stop-reason", result)
+
+        @Expect(finalized.stopReason, "completed")
+        @Expect(state.audit[state.audit.size - 1].reason.contains("stopReason=completed"), true)
+        @Expect(state.audit[state.audit.size - 1].reason.contains("token="), false)
+        @Expect(state.audit[state.audit.size - 1].reason.contains("/Users/"), false)
+    }
+
+    @TestCase
     public func stateStorePersistsSeenAuditReplyAndBackoff(): Unit {
         let path = "/tmp/gcm-state-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.json"
         let store = StateStore(path)
