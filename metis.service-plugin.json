@@ -11,6 +11,12 @@
   "capabilityDeclarations": [
     {"capabilityId": "gitcode.monitor.status", "kind": "controlAction", "direction": "metis-to-gcm"},
     {"capabilityId": "gitcode.monitor.scan_once", "kind": "controlAction", "direction": "metis-to-gcm"},
+    {"capabilityId": "gitcode.monitor.job_status", "kind": "controlAction", "direction": "metis-to-gcm"},
+    {"capabilityId": "gitcode.monitor.cancel_job", "kind": "controlAction", "direction": "metis-to-gcm"},
+    {"capabilityId": "gitcode.monitor.scan_progress", "kind": "event", "direction": "gcm-to-metis"},
+    {"capabilityId": "gitcode.monitor.scan_completed", "kind": "event", "direction": "gcm-to-metis"},
+    {"capabilityId": "gitcode.monitor.scan_failed", "kind": "event", "direction": "gcm-to-metis"},
+    {"capabilityId": "gitcode.monitor.scan_cancelled", "kind": "event", "direction": "gcm-to-metis"},
     {"capabilityId": "gitcode.event.accepted", "kind": "event", "direction": "gcm-to-metis"},
     {"capabilityId": "gitcode.event.ignored", "kind": "event", "direction": "gcm-to-metis"},
     {"capabilityId": "gitcode.agent.draft_request", "kind": "agentRequest", "direction": "gcm-to-metis", "requiredHostApis": ["host.agent.invoke"]},

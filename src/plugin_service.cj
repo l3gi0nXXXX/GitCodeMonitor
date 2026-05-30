@@ -53,6 +53,12 @@ public func requiredGitCodeMonitorCapabilityIds(): Array<String> {
     [
         "gitcode.monitor.status",
         "gitcode.monitor.scan_once",
+        "gitcode.monitor.job_status",
+        "gitcode.monitor.cancel_job",
+        "gitcode.monitor.scan_progress",
+        "gitcode.monitor.scan_completed",
+        "gitcode.monitor.scan_failed",
+        "gitcode.monitor.scan_cancelled",
         "gitcode.event.accepted",
         "gitcode.event.ignored",
         "gitcode.agent.draft_request",
@@ -75,9 +81,53 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         "gitcode.monitor.scan_once",
         "controlAction",
         direction: "metis-to-gcm",
-        description: "Trigger one bounded GitCode scan",
+        description: "Start one asynchronous GitCode scan job",
         inputSchema: "schemas/gitcode.monitor.scan_once.input.json",
         outputSchema: "schemas/gitcode.monitor.scan_once.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.job_status",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Read GitCode scan job status",
+        inputSchema: "schemas/gitcode.monitor.job_status.input.json",
+        outputSchema: "schemas/gitcode.monitor.job_status.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.cancel_job",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Request cancellation for a GitCode scan job",
+        inputSchema: "schemas/gitcode.monitor.cancel_job.input.json",
+        outputSchema: "schemas/gitcode.monitor.cancel_job.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.scan_progress",
+        "event",
+        direction: "gcm-to-metis",
+        description: "GitCode scan job progress event",
+        outputSchema: "schemas/gitcode.monitor.scan_progress.event.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.scan_completed",
+        "event",
+        direction: "gcm-to-metis",
+        description: "GitCode scan job completed event",
+        outputSchema: "schemas/gitcode.monitor.scan_completed.event.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.scan_failed",
+        "event",
+        direction: "gcm-to-metis",
+        description: "GitCode scan job failed event",
+        outputSchema: "schemas/gitcode.monitor.scan_failed.event.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.scan_cancelled",
+        "event",
+        direction: "gcm-to-metis",
+        description: "GitCode scan job cancelled event",
+        outputSchema: "schemas/gitcode.monitor.scan_cancelled.event.json"
     ))
     records.add(ServiceCapabilityRecord(
         "gitcode.event.accepted",

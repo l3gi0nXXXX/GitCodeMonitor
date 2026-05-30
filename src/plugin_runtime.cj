@@ -3,6 +3,7 @@ package gitcodemonitor
 import std.collection.ArrayList
 import std.env.{getStdIn, getStdOut}
 import std.fs.{Path, exists}
+import std.sync.Mutex
 import stdx.encoding.json.{JsonObject, JsonValue}
 
 public class ServiceInitializeRequest {
@@ -132,10 +133,12 @@ public class GcmPluginFrameHandleResult {
     public let ok: Bool
     public let frame: ServiceFrame
     public let shouldStop: Bool
-    public init(ok: Bool, frame!: ServiceFrame = ServiceFrame("", "", ""), shouldStop!: Bool = false) {
+    public let asyncJobId: String
+    public init(ok: Bool, frame!: ServiceFrame = ServiceFrame("", "", ""), shouldStop!: Bool = false, asyncJobId!: String = "") {
         this.ok = ok
         this.frame = frame
         this.shouldStop = shouldStop
+        this.asyncJobId = asyncJobId
     }
 }
 
@@ -172,14 +175,17 @@ public class GcmMemoryLineSink <: GcmPluginLineSink {
 
 public class GcmPluginStdioWriter {
     private let sink: GcmPluginLineSink
+    private let lock = Mutex()
 
     public init(sink: GcmPluginLineSink) {
         this.sink = sink
     }
 
     public func writeFrame(frame: ServiceFrame): Unit {
-        sink.writeln(encodeServiceFrame(frame).trimAscii())
-        sink.flush()
+        synchronized(lock) {
+            sink.writeln(encodeServiceFrame(frame).trimAscii())
+            sink.flush()
+        }
     }
 }
 
@@ -423,6 +429,7 @@ public func gcmPluginMain(args: Array<String>): Int64 {
     }
     let runtime = RuntimeContainer(loaded.config, pluginStdioMode: true)
     let state = runtime.store.load()
+    let jobs = GcmScanJobStore(maxConcurrent: 1)
     writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"${initResult.status}\",\"capabilities\":${initResult.capabilities.size}}"))
     let stdin = getStdIn()
     while (true) {
@@ -433,9 +440,12 @@ public func gcmPluginMain(args: Array<String>): Int64 {
         }
         match (line) {
             case Some(raw) =>
-                let handled = handleGcmPluginInputLine(raw, loaded.config, runtime, state)
+                let handled = handleGcmPluginInputLineWithJobs(raw, loaded.config, runtime, state, jobs)
                 if (!handled.frame.frameType.isEmpty()) {
                     writer.writeFrame(handled.frame)
+                }
+                if (!handled.asyncJobId.isEmpty()) {
+                    startGcmScanJobWorker(handled.asyncJobId, loaded.config, runtime, state, jobs, writer)
                 }
                 if (handled.shouldStop) {
                     let _ = runtime.store.save(state)
@@ -558,6 +568,10 @@ public func handleGcmScanOnceCapabilityRuntime(payload: String, config: MonitorC
 }
 
 public func handleGcmPluginInputLine(line: String, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState): GcmPluginFrameHandleResult {
+    handleGcmPluginInputLineWithJobs(line, config, runtime, state, GcmScanJobStore(maxConcurrent: 1))
+}
+
+public func handleGcmPluginInputLineWithJobs(line: String, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState, jobs: GcmScanJobStore): GcmPluginFrameHandleResult {
     let decoded = decodeServiceFrame(line)
     if (!decoded.ok) {
         return GcmPluginFrameHandleResult(false, frame: gcmPluginErrorFrame("decode-error", "", decoded.errorKind, decoded.diagnostic))
@@ -584,10 +598,47 @@ public func handleGcmPluginInputLine(line: String, config: MonitorConfig, runtim
             let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state))
             GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
         case "gitcode.monitor.scan_once" =>
+            let mode = scanPayloadMode(frame.payload)
+            if (mode == "async") {
+                let parsed = parseGcmAsyncScanPayload(frame.payload)
+                if (!parsed.ok) {
+                    return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, parsed.status, gcmJobErrorPayload(parsed.status, diagnostic: parsed.diagnostic)))
+                }
+                let created = jobs.createOrGet(parsed.payload)
+                if (!created.ok) {
+                    return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, created.status, gcmJobErrorPayload(created.status, jobId: parsed.payload.jobId)))
+                }
+                return GcmPluginFrameHandleResult(
+                    true,
+                    frame: gcmPluginResponseFrame(frame, true, "accepted", gcmJobAcceptedPayload(created.job, created.alreadyRunning)),
+                    asyncJobId: if (created.alreadyRunning) { "" } else { created.job.jobId }
+                )
+            }
             let scan = handleGcmScanOnceCapabilityRuntime(frame.payload, config, runtime, state)
             let saved = runtime.store.save(state)
             let status = if (scan.ok && saved) { scan.status } else { if (!saved) { "state_save_failed" } else { scan.status } }
             GcmPluginFrameHandleResult(scan.ok && saved, frame: gcmPluginResponseFrame(frame, scan.ok && saved, status, gcmScanOncePayload(scan, saved: saved)))
+        case "gitcode.monitor.job_status" =>
+            let jobId = parseGcmJobIdPayload(frame.payload)
+            if (jobId.isEmpty()) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "job_payload_invalid", gcmJobErrorPayload("job_payload_invalid")))
+            }
+            match (jobs.find(jobId)) {
+                case Some(job) =>
+                    GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, job.status, gcmJobSnapshotPayload(job)))
+                case None =>
+                    GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "job_not_found", gcmJobErrorPayload("job_not_found", jobId: jobId)))
+            }
+        case "gitcode.monitor.cancel_job" =>
+            let jobId = parseGcmJobIdPayload(frame.payload)
+            if (jobId.isEmpty()) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "job_payload_invalid", gcmJobErrorPayload("job_payload_invalid")))
+            }
+            let cancelled = jobs.requestCancel(jobId)
+            if (!cancelled.ok) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, cancelled.status, gcmJobErrorPayload(cancelled.status, jobId: jobId)))
+            }
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "cancel_requested", "{\"ok\":true,\"status\":\"cancel_requested\",\"jobId\":\"${jsonEscape(jobId)}\",\"summary\":\"GitCode scan cancellation requested\"}"))
         case "gitcode.writeback.apply_result" =>
             let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state))
             GcmPluginFrameHandleResult(applied.ok, frame: gcmPluginResponseFrame(frame, applied.ok, applied.decision.reason, "{\"ok\":${applied.ok},\"status\":\"${applied.decision.reason}\",\"writerCalled\":${applied.writerCalled},\"replyUrl\":\"${jsonEscape(applied.replyUrl)}\"}"))
@@ -727,6 +778,22 @@ public func renderGcmMcpLegacyNotice(mode: GcmMcpClientMode): String {
         return "MCP client disabled"
     }
     "GCM MCP client is diagnostic/legacy; main intelligent reply flow is Metis service plugin host"
+}
+
+func scanPayloadMode(payload: String): String {
+    let parsed = parsePluginPayloadObject(payload)
+    if (!parsed.ok) { return "" }
+    let mode = pluginPayloadStringField(parsed.payloadObject, "mode", defaultValue: "")
+    if (!mode.ok) { return "" }
+    mode.value
+}
+
+func parseGcmJobIdPayload(payload: String): String {
+    let parsed = parsePluginPayloadObject(payload)
+    if (!parsed.ok) { return "" }
+    let jobId = pluginPayloadStringField(parsed.payloadObject, "jobId", maxBytes: 128)
+    if (!jobId.ok || !isGcmJobIdSafe(jobId.value)) { return "" }
+    jobId.value
 }
 
 private func pluginArgValue(args: Array<String>, key: String): ?String {
