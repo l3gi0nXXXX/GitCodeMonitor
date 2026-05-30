@@ -666,8 +666,12 @@ public func configuredHttpTransport(config: MonitorConfig): String {
     "native"
 }
 
-public func buildHttpSender(config: MonitorConfig): HttpSender {
-    if (configuredHttpTransport(config) == "curl") {
+public func configuredPluginStdioHttpTransport(config: MonitorConfig): String {
+    "curl"
+}
+
+public func buildHttpSender(config: MonitorConfig, pluginStdioMode!: Bool = false): HttpSender {
+    if ((pluginStdioMode && configuredPluginStdioHttpTransport(config) == "curl") || configuredHttpTransport(config) == "curl") {
         return CurlHttpSender()
     }
     NativeHttpSender()
@@ -810,13 +814,18 @@ public class RuntimeContainer {
     public let telegram: HttpNotifier
     public let mcp: McpHttpClient
     public let writer: GitCodeCommentWriter
+    public let httpTransportKind: String
 
-    public init(config: MonitorConfig, sender!: ?HttpSender = None<HttpSender>) {
+    public init(config: MonitorConfig, sender!: ?HttpSender = None<HttpSender>, pluginStdioMode!: Bool = false) {
         this.config = config
         this.store = StateStore(config.statePath)
+        this.httpTransportKind = match (sender) {
+            case Some(_) => "injected"
+            case None => if (pluginStdioMode) { configuredPluginStdioHttpTransport(config) } else { configuredHttpTransport(config) }
+        }
         this.sender = match (sender) {
             case Some(s) => s
-            case None => buildHttpSender(config)
+            case None => buildHttpSender(config, pluginStdioMode: pluginStdioMode)
         }
         let client = GitCodeApiClient(baseUrl: config.gitCodeBaseUrl, authMode: config.gitCodeAuthMode, token: config.gitCodeToken, cookie: config.gitCodeCookie)
         this.gitCode = GitCodeHttpTransport(client, sender: this.sender, pageSize: 100)

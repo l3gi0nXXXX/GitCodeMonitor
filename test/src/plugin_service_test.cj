@@ -1,11 +1,29 @@
 package gitcodemonitor
 
 import std.collection.ArrayList
+import std.fs.{File, Path, exists}
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
 
 @Test
 public class GitCodeMonitorPluginServiceTest {
+    private func readFirstExisting(paths: Array<String>): String {
+        for (path in paths) {
+            if (exists(Path(path))) {
+                return String.fromUtf8(File.readFrom(Path(path))).trimAscii()
+            }
+        }
+        ""
+    }
+
+    private func jsonStringArray(value: JsonValue): Array<String> {
+        let out = ArrayList<String>()
+        for (item in value.asArray().getItems()) {
+            out.add(item.asString().getValue())
+        }
+        out.toArray()
+    }
+
     @TestCase
     public func buildGitCodeMonitorCapabilityDeclarationsContainsEightRecords(): Unit {
         let records = buildGitCodeMonitorCapabilityDeclarations()
@@ -59,6 +77,52 @@ public class GitCodeMonitorPluginServiceTest {
         @Expect(manifest.contains("cookie"), false)
         @Expect(manifest.contains("appSecret"), false)
         @Expect(manifest.contains("/Users/"), false)
+    }
+
+    @TestCase
+    public func generatedManifestUsesSkipBuildAndCheckedInEntryMatches(): Unit {
+        let generated = JsonValue.fromStr(buildGitCodeMonitorServicePluginManifest()).asObject()
+        let generatedEntry = generated.get("entry").getOrThrow().asObject()
+        let generatedArgs = jsonStringArray(generatedEntry.get("args").getOrThrow())
+        let expectedArgs = ["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
+        @Expect(generatedEntry.get("command").getOrThrow().asString().getValue(), "cjpm")
+        @Expect(generatedArgs.contains("--skip-build"), true)
+        @Expect(generatedArgs.size, expectedArgs.size)
+        for (i in 0..expectedArgs.size) {
+            @Expect(generatedArgs[i], expectedArgs[i])
+        }
+
+        let checkedInText = readFirstExisting(["metis.service-plugin.json", "../metis.service-plugin.json"])
+        @Expect(checkedInText.isEmpty(), false)
+        let checkedIn = JsonValue.fromStr(checkedInText).asObject()
+        let checkedInEntry = checkedIn.get("entry").getOrThrow().asObject()
+        let checkedInArgs = jsonStringArray(checkedInEntry.get("args").getOrThrow())
+        @Expect(checkedInEntry.get("command").getOrThrow().asString().getValue(), generatedEntry.get("command").getOrThrow().asString().getValue())
+        @Expect(checkedInArgs.size, generatedArgs.size)
+        for (i in 0..generatedArgs.size) {
+            @Expect(checkedInArgs[i], generatedArgs[i])
+        }
+        @Expect(checkedInText.contains("token"), false)
+        @Expect(checkedInText.contains("Authorization"), false)
+        @Expect(checkedInText.contains("/Users/"), false)
+    }
+
+    @TestCase
+    public func stdioProtocolFixturesAreGoldenAndDoNotContainSecrets(): Unit {
+        let initLine = readFirstExisting(["test/fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl", "../test/fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl", "fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl"])
+        let scanLine = readFirstExisting(["test/fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl", "../test/fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl", "fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl"])
+        let noisy = readFirstExisting(["test/fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt", "../test/fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt", "fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt"])
+        @Expect(initLine, "{\"type\":\"response\",\"frameId\":\"initialize\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ok\",\"capabilities\":8}}")
+        @Expect(scanLine, "{\"type\":\"response\",\"frameId\":\"response-scan-1\",\"serviceId\":\"gitcode-monitor\",\"method\":\"invokeCapability\",\"capabilityId\":\"gitcode.monitor.scan_once\",\"correlationId\":\"corr-scan-1\",\"payload\":{\"ok\":true,\"status\":\"ok\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"stateSaved\":true}}")
+        let noisyLines = noisy.split("\n")
+        @Expect(noisyLines.size, 3)
+        @Expect(decodeServiceFrame(noisyLines[0]).ok, true)
+        @Expect(decodeServiceFrame(noisyLines[1]).ok, false)
+        @Expect(decodeServiceFrame(noisyLines[1]).errorKind, "invalid_json")
+        @Expect(decodeServiceFrame(noisyLines[2]).ok, true)
+        @Expect(noisy.contains("Authorization"), false)
+        @Expect(noisy.contains("cookie"), false)
+        @Expect(noisy.contains("/Users/"), false)
     }
 
     @TestCase

@@ -13,6 +13,33 @@ public class GitCodeMonitorPluginRuntimeTest {
         File.writeTo(Path(path), text.toArray())
     }
 
+    private func readFixture(path: String): String {
+        String.fromUtf8(File.readFrom(Path(path))).trimAscii()
+    }
+
+    private func scanResponsePayloadFor(rawPayload: String): String {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempConfigPath("gcm-plugin-payload-state")
+        let fakeSender = FakeHttpSender()
+        fakeSender.nextResponse = HttpResponseSpec(200, body: "[]")
+        let sender: HttpSender = fakeSender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let scanFrame = ServiceFrame(
+            "request",
+            "scan-payload",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.monitor.scan_once",
+            correlationId: "corr-payload",
+            payload: rawPayload
+        )
+        let handled = handleGcmPluginInputLine(encodeServiceFrame(scanFrame).trimAscii(), config, runtime, state)
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
+        handled.frame.payload
+    }
+
     @TestCase
     public func initializeNegotiatesProtocolAndLoadsConfigWithoutLeakingSecrets(): Unit {
         let path = tempConfigPath("gcm-plugin-init")
@@ -29,12 +56,56 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
-    public func pluginMainSupportsPluginStdioEntryAndMainConfigRefShape(): Unit {
+    public func pluginMainRejectsInvalidConfigWithoutWaitingForStdin(): Unit {
         let path = tempConfigPath("gcm-plugin-main")
-        writeConfig(path)
-        @Expect(gcmPluginMain(["--config", path]), 0)
         @Expect(gcmPluginMain(["--config", "/tmp/missing-gcm-plugin-main.json"]), 2)
         if (exists(Path(path))) { remove(Path(path)) }
+    }
+
+    @TestCase
+    public func stdioProtocolFixturesDecodeValidFramesAndRejectNoiseLine(): Unit {
+        let initLine = readFixture("test/fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl")
+        let scanLine = readFixture("test/fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl")
+        let noisy = readFixture("test/fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt").split("\n")
+        let initFrame = decodeServiceFrame(initLine)
+        @Expect(initFrame.ok, true)
+        @Expect(initFrame.frame.method, "initialize")
+        @Expect(initFrame.frame.payload.contains("\"capabilities\""), true)
+        let scanFrame = decodeServiceFrame(scanLine)
+        @Expect(scanFrame.ok, true)
+        @Expect(scanFrame.frame.method, "invokeCapability")
+        @Expect(scanFrame.frame.capabilityId, "gitcode.monitor.scan_once")
+        @Expect(scanFrame.frame.correlationId, "corr-scan-1")
+        @Expect(noisy.size, 3)
+        @Expect(decodeServiceFrame(noisy[0]).ok, true)
+        @Expect(decodeServiceFrame(noisy[1]).ok, false)
+        @Expect(decodeServiceFrame(noisy[1]).errorKind, "invalid_json")
+        @Expect(decodeServiceFrame(noisy[2]).ok, true)
+        @Expect(initLine.contains("Authorization"), false)
+        @Expect(scanLine.contains("/Users/"), false)
+        @Expect(readFixture("test/fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt").contains("fake-token"), false)
+    }
+
+    @TestCase
+    public func pluginStdioWriterWritesOnlyEncodedFrames(): Unit {
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"ok\"}"))
+        writer.writeFrame(ServiceFrame("response", "stop-1", GCM_SERVICE_PLUGIN_ID, method: "stop", correlationId: "corr-stop", payload: "{\"ok\":true,\"status\":\"stopped\"}"))
+        @Expect(sink.lines.size, 2)
+        for (line in sink.lines) {
+            @Expect(line.contains("\n"), false)
+            @Expect(line.startsWith("{"), true)
+            @Expect(decodeServiceFrame(line).ok, true)
+        }
+    }
+
+    @TestCase
+    public func pluginModeRuntimeUsesCapturedHttpSenderWhenLoggerCannotBeRedirected(): Unit {
+        let config = defaultConfig()
+        @Expect(configuredHttpTransport(config), "native")
+        let runtime = RuntimeContainer(config, pluginStdioMode: true)
+        @Expect(runtime.httpTransportKind, "curl")
     }
 
     @TestCase
@@ -74,6 +145,46 @@ public class GitCodeMonitorPluginRuntimeTest {
         let overlap = handleGcmScanOnceCapability("{\"overlap\":true}", runtime)
         @Expect(overlap.status, "skipped_overlap")
         @Expect(runtime.state.skippedOverlappingScans, 1)
+    }
+
+    @TestCase
+    public func scanPayloadRejectsStringBooleanArrayAndOversizePayloads(): Unit {
+        @Expect(scanResponsePayloadFor("{\"offlineFixture\":true}").contains("\"status\":\"ok\""), true)
+        @Expect(scanResponsePayloadFor("{\"offlineFixture\":\"true\"}").contains("\"status\":\"invalid_payload\""), true)
+        @Expect(scanResponsePayloadFor("[]").contains("\"status\":\"invalid_payload\""), true)
+        @Expect(scanResponsePayloadFor("{\"overlap\":\"true\"}").contains("\"status\":\"invalid_payload\""), true)
+
+        let filler = StringBuilder()
+        for (_ in 0..16386) { filler.append("x") }
+        let oversize = "{\"offlineFixture\":true,\"pad\":\"${filler.toString()}\"}"
+        @Expect(scanResponsePayloadFor(oversize).contains("\"status\":\"invalid_payload\""), true)
+    }
+
+    @TestCase
+    public func writebackPayloadParsesEscapedStringsAndBooleansStructurally(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.repoAllowlist = ["Cangjie/community"]
+        let runtime = GcmRuntime(config)
+        let draft = "line one\nline two \"quoted\""
+        let payload = "{" +
+            "\"eventId\":\"e1\"," +
+            "\"repo\":\"Cangjie/community\"," +
+            "\"kind\":\"issue\"," +
+            "\"number\":\"1\"," +
+            "\"url\":\"https://gitcode.com/Cangjie/community/issues/1\"," +
+            "\"draft\":\"${jsonEscape(draft)}\"," +
+            "\"safety\":\"approved\"," +
+            "\"needsHumanReview\":false," +
+            "\"duplicate\":false" +
+            "}"
+        let applied = handleGcmWritebackApplyResult(payload, runtime)
+        @Expect(applied.ok, true)
+        @Expect(applied.writerCalled, true)
+        @Expect(runtime.writer.written.size, 1)
+        @Expect(runtime.writer.written[0].contains("line two \"quoted\""), true)
     }
 
     @TestCase
@@ -138,6 +249,35 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(stopResponse.frame.correlationId, "corr-stop")
         if (exists(Path(configPath))) { remove(Path(configPath)) }
         if (exists(Path(statePath))) { remove(Path(statePath)) }
+    }
+
+    @TestCase
+    public func pluginLoopKeepsFakeNetworkWarningsInsideResponseFrames(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempConfigPath("gcm-plugin-warning-state")
+        config.orgs = ["cangjie"]
+        let fakeSender = FakeHttpSender()
+        let warning = "2026-05-30T00:54:06.196142+08:00 WARN [HttpEngine1#connect] TLS handshake error, the connection is closed."
+        fakeSender.nextResponse = HttpResponseSpec(599, body: warning)
+        let sender: HttpSender = fakeSender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let scanFrame = ServiceFrame(
+            "request",
+            "scan-warning",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.monitor.scan_once",
+            correlationId: "corr-warning",
+            payload: "{}"
+        )
+        let out = handleGcmPluginInputLinesForTest([encodeServiceFrame(scanFrame).trimAscii()], config, runtime, state)
+        @Expect(out.size, 1)
+        @Expect(out[0] != warning, true)
+        @Expect(out[0].startsWith("{"), true)
+        @Expect(decodeServiceFrame(out[0]).ok, true)
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
     }
 
     @TestCase

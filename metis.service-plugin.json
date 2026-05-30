@@ -6,7 +6,7 @@
   "protocolVersion": "1.0",
   "entry": {
     "command": "cjpm",
-    "args": ["run", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
+    "args": ["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
   },
   "capabilityDeclarations": [
     {

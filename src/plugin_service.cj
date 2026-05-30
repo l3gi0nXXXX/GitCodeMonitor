@@ -170,7 +170,7 @@ public func buildGitCodeMonitorServicePluginManifest(): String {
 
     let entry = JsonObject()
     entry.put("command", JsonString("cjpm"))
-    entry.put("args", stringArrayJson(["run", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]))
+    entry.put("args", stringArrayJson(["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]))
     root.put("entry", entry)
 
     let capabilities = JsonArray([])
