@@ -448,7 +448,7 @@ func runGcmScanJobWorker(jobId: String, config: MonitorConfig, runtime: RuntimeC
         if (running.job.offlineFixture) {
             scanOnceOfflineFixture(config, state)
         } else {
-            scanOnceRuntimeBoundedForJob(config, runtime, state, running.job)
+            scanOnceRuntimeBoundedForJob(config, runtime, state, running.job, eventWriter: Some<GcmPluginStdioWriter>(writer))
         }
     } catch (e: Exception) {
         emitGcmScanJobEvent(store.markFailed(jobId, "scan_runtime", redactServicePayload(e.message).rawHash).job, writer)
@@ -467,8 +467,14 @@ func runGcmScanJobWorker(jobId: String, config: MonitorConfig, runtime: RuntimeC
     emitGcmScanJobEvent(store.markCompleted(jobId, result, saved).job, writer)
 }
 
-func scanOnceRuntimeBoundedForJob(config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState, job: GcmScanJob): ScanResult {
-    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && job.limits.maxDurationMillis <= 0) {
+func scanOnceRuntimeBoundedForJob(
+    config: MonitorConfig,
+    runtime: RuntimeContainer,
+    state: MonitorState,
+    job: GcmScanJob,
+    eventWriter!: Option<GcmPluginStdioWriter> = None<GcmPluginStdioWriter>
+): ScanResult {
+    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && job.limits.maxDurationMillis <= 0 && eventWriter.isNone()) {
         return scanOnceRuntime(config, runtime, state)
     }
     let result = emptyScanResult(config)
@@ -503,6 +509,12 @@ func scanOnceRuntimeBoundedForJob(config: MonitorConfig, runtime: RuntimeContain
                     }
                     result.checkedItems++
                     let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer)
+                    if (processed.newEvents > 0) {
+                        match (eventWriter) {
+                            case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)
+                            case None => ()
+                        }
+                    }
                     result.absorb(processed)
                 }
             }
@@ -519,6 +531,26 @@ func gcmJobDurationExceeded(started: Int64, maxDurationMillis: Int64): Bool {
 
 func emitGcmScanJobEvent(job: GcmScanJob, writer: GcmPluginStdioWriter): Unit {
     writer.writeFrame(gcmScanJobEventFrame(job))
+}
+
+func emitGcmAcceptedScanEvent(jobId: String, event: GitCodeEvent, writer: GcmPluginStdioWriter): Unit {
+    writer.writeFrame(gcmAcceptedScanEventFrame(jobId, event))
+}
+
+func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent): ServiceFrame {
+    ServiceFrame(
+        "event",
+        "accepted-${jobId}-${hashRawPayload(event.id)}",
+        GCM_SERVICE_PLUGIN_ID,
+        method: "emitCapabilityEvent",
+        capabilityId: "gitcode.event.accepted",
+        correlationId: "corr-${jobId}",
+        payload: gcmAcceptedScanEventPayload(jobId, event)
+    )
+}
+
+func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent): String {
+    "{\"jobId\":\"${jsonEscape(jobId.trimAscii())}\",\"eventId\":\"${jsonEscape(event.id)}\",\"repo\":\"${jsonEscape(event.org)}/${jsonEscape(event.repo)}\",\"kind\":\"${jsonEscape(event.itemKind)}\",\"number\":\"${jsonEscape(event.itemId)}\",\"author\":\"${jsonEscape(event.actor)}\",\"url\":\"${jsonEscape(event.url)}\",\"title\":\"${jsonEscape(compactSummary(redactSecrets(scanEventTitle(event)), limit: 160))}\",\"content\":\"${jsonEscape(compactSummary(redactSecrets(event.content), limit: 500))}\"}"
 }
 
 func gcmScanJobEventFrame(job: GcmScanJob): ServiceFrame {

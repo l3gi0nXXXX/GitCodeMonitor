@@ -140,6 +140,51 @@ public class GitCodeMonitorPluginJobsTest {
     }
 
     @TestCase
+    public func asyncRuntimeEmitsAcceptedEventForEachNewItem(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempStatePath("runtime-accepted-event")
+        config.orgs = ["cangjie"]
+        let fakeSender = FakeHttpSender()
+        fakeSender.enqueue(HttpResponseSpec(200, body: "{\"repos\":[{\"path\":\"compiler\",\"public\":true}]}"))
+        fakeSender.enqueue(HttpResponseSpec(200, body: "{\"data\":[{\"number\":11,\"title\":\"bug\",\"body\":\"details\",\"user\":{\"login\":\"alice\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/11\"}]}"))
+        fakeSender.enqueue(HttpResponseSpec(200, body: "[]"))
+        fakeSender.enqueue(HttpResponseSpec(200, body: "[]"))
+        let sender: HttpSender = fakeSender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+        let store = GcmScanJobStore(maxConcurrent: 1)
+        let frame = asyncScanFrame("job-runtime-accepted-event", offlineFixture: false)
+
+        let handled = handleGcmPluginInputLineWithJobs(encodeServiceFrame(frame).trimAscii(), config, runtime, state, store)
+        writer.writeFrame(handled.frame)
+        startGcmScanJobWorker(handled.asyncJobId, config, runtime, state, store, writer)
+        waitForGcmJobTerminal(store, "job-runtime-accepted-event", timeoutMs: 3000)
+
+        var acceptedEvents: Int64 = 0
+        var completedPayload = ""
+        for (line in sink.lines) {
+            let decoded = decodeServiceFrame(line)
+            if (decoded.ok && decoded.frame.capabilityId == "gitcode.event.accepted") {
+                acceptedEvents++
+                @Expect(decoded.frame.payload.contains("\"jobId\": \"job-runtime-accepted-event\""), true)
+                @Expect(decoded.frame.payload.contains("\"eventId\": \"cangjie/compiler:issue:11\""), true)
+                @Expect(decoded.frame.payload.contains("https://gitcode.com/cangjie/compiler/issues/11"), true)
+            }
+            if (decoded.ok && decoded.frame.capabilityId == "gitcode.monitor.scan_completed") {
+                completedPayload = decoded.frame.payload
+            }
+        }
+        @Expect(acceptedEvents, 1)
+        @Expect(completedPayload.contains("\"newEvents\": 1"), true)
+        @Expect(completedPayload.contains("\"samples\""), true)
+
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
+    }
+
+    @TestCase
     public func asyncRuntimeEmitsFailedFrameWhenFakeTransportFails(): Unit {
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
