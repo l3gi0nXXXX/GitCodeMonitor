@@ -126,6 +126,7 @@ public class GcmScanJob {
     public var stateSaved: Bool
     public var summary: String
     public var report: ScanResult
+    public var diagnostic: String
 
     public init(payload!: GcmAsyncScanPayload = GcmAsyncScanPayload()) {
         this.jobId = payload.jobId
@@ -148,6 +149,7 @@ public class GcmScanJob {
         this.stateSaved = false
         this.summary = "GitCode scan job accepted"
         this.report = ScanResult(0, 0, 0, 0, 0)
+        this.diagnostic = ""
     }
 }
 
@@ -256,13 +258,14 @@ public class GcmScanJobStore {
         }
     }
 
-    public func markFailed(jobId: String, stage: String, errorKind: String): GcmScanJobMutationResult {
+    public func markFailed(jobId: String, stage: String, errorKind: String, diagnostic!: String = ""): GcmScanJobMutationResult {
         synchronized(lock) {
             match (jobs.get(jobId)) {
                 case Some(job) =>
                     job.status = GCM_SCAN_STATUS_FAILED
                     job.stage = stage
                     job.errorKind = errorKind
+                    job.diagnostic = gcmDiagnosticForPayload(diagnostic)
                     job.summary = "GitCode scan failed at ${stage}: ${errorKind}"
                     job.updatedAtMs = gcmNowMillis()
                     return GcmScanJobMutationResult(true, job.status, job: job)
@@ -408,6 +411,9 @@ public func gcmJobSnapshotPayload(job: GcmScanJob): String {
     if (job.status == GCM_SCAN_STATUS_COMPLETED) {
         payload += ",\"report\":${gcmScanReportPayload(job)}"
     }
+    if (!job.diagnostic.isEmpty()) {
+        payload += ",\"diagnostic\":${gcmDiagnosticPayloadJson(job.diagnostic)}"
+    }
     payload + "}"
 }
 
@@ -458,7 +464,8 @@ func runGcmScanJobWorker(jobId: String, config: MonitorConfig, runtime: RuntimeC
             scanOnceRuntimeBoundedForJob(config, runtime, state, running.job, eventWriter: Some<GcmPluginStdioWriter>(writer))
         }
     } catch (e: Exception) {
-        emitGcmScanJobEvent(store.markFailed(jobId, "scan_runtime", redactServicePayload(e.message).rawHash).job, writer)
+        let diagnostic = gcmScanRuntimeDiagnostic("scan_runtime", e.message)
+        emitGcmScanJobEvent(store.markFailed(jobId, "scan_runtime", gcmClassifyScanRuntimeError(e.message), diagnostic: diagnostic).job, writer)
         return
     }
     if (store.isCancelRequested(jobId)) {
@@ -467,7 +474,7 @@ func runGcmScanJobWorker(jobId: String, config: MonitorConfig, runtime: RuntimeC
     }
     let degraded = gcmFirstScanDegradedReason(state, auditStart)
     if (!degraded.isEmpty()) {
-        emitGcmScanJobEvent(store.markFailed(jobId, "scan_runtime", degraded).job, writer)
+        emitGcmScanJobEvent(store.markFailed(jobId, "scan_runtime", degraded, diagnostic: gcmScanRuntimeDiagnostic("scan_runtime", degraded)).job, writer)
         return
     }
     let saved = runtime.store.save(state)
@@ -520,14 +527,23 @@ func scanOnceRuntimeBoundedForJob(
                     }
                     result.checkedItems++
                     let baselineMode = !job.backfill && !hadBaseline
-                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: baselineMode)
-                    if (processed.newEvents > 0) {
-                        match (eventWriter) {
-                            case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)
-                            case None => ()
+                    try {
+                        let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: baselineMode)
+                        if (processed.newEvents > 0) {
+                            match (eventWriter) {
+                                case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)
+                                case None => ()
+                            }
                         }
+                        result.absorb(processed)
+                    } catch (e: Exception) {
+                        let errorKind = gcmClassifyScanRuntimeError(e.message)
+                        let audit = AuditRecord(event.id, status: "scan_degraded", reason: errorKind)
+                        audit.deliveryStatus = gcmScanEventDeliveryStatus(repo, "event_runtime", redactServicePayload(e.message).rawHash)
+                        state.addAudit(audit)
+                        result.failedEvents++
+                        result.addEventFailedSample(event, errorKind)
                     }
-                    result.absorb(processed)
                 }
                 if (!job.backfill && !hadBaseline && collection.completed && repoCompleted) {
                     state.markBaseline(scopeKey, result.baselineSeededEvents - baselineStart)
@@ -592,8 +608,29 @@ func gcmScanJobEventPayload(job: GcmScanJob): String {
     }
     if (job.status == GCM_SCAN_STATUS_FAILED) {
         payload += ",\"errorKind\":\"${jsonEscape(job.errorKind)}\",\"retryable\":true,\"diagnosticHash\":\"${jsonEscape(hashRawPayload(job.errorKind))}\""
+        if (!job.diagnostic.isEmpty()) {
+            payload += ",\"diagnostic\":${gcmDiagnosticPayloadJson(job.diagnostic)}"
+        }
     }
     payload + "}"
+}
+
+extend ScanResult {
+    public func addEventFailedSample(event: GitCodeEvent, reason: String): Unit {
+        if (this.samplesFailed.size < SCAN_REPORT_SAMPLE_LIMIT) {
+            this.samplesFailed.add(ScanEventSummary(
+                event.id,
+                "${event.org}/${event.repo}",
+                event.itemKind,
+                event.itemId,
+                "",
+                scanEventTitle(event),
+                event.url,
+                "failed",
+                reason
+            ))
+        }
+    }
 }
 
 func gcmScanReportPayload(job: GcmScanJob): String {
@@ -683,6 +720,55 @@ func gcmJobDurationMs(job: GcmScanJob): Int64 {
 
 func gcmNowMillis(): Int64 {
     DateTime.now().toUnixTimeStamp().toMilliseconds()
+}
+
+func gcmClassifyScanRuntimeError(message: String): String {
+    let lower = message.toAsciiLower()
+    if (lower.contains("invalid utf8") || lower.contains("invalid utf-8")) { return "invalid_utf8" }
+    if (lower.contains("timeout") || lower.contains("timed out")) { return "timeout" }
+    if ((lower.contains("json") && (lower.contains("parse") || lower.contains("decode"))) || lower.contains("parse error")) { return "json_parse_error" }
+    "runtime_exception"
+}
+
+func gcmScanRuntimeDiagnostic(stage: String, message: String): String {
+    let redacted = redactServicePayload(message)
+    let errorKind = gcmClassifyScanRuntimeError(message)
+    "{\"stage\":\"${jsonEscape(stage)}\",\"errorKind\":\"${jsonEscape(errorKind)}\",\"errorHash\":\"${jsonEscape(redacted.rawHash)}\",\"message\":\"${jsonEscape(redacted.text)}\"}"
+}
+
+func gcmDiagnosticForPayload(diagnostic: String): String {
+    if (diagnostic.trimAscii().isEmpty()) { return "" }
+    try {
+        let root = JsonValue.fromStr(diagnostic).asObject()
+        let stage = firstJsonString(root, ["stage"])
+        let errorKind = firstJsonString(root, ["errorKind"])
+        let errorHash = firstJsonString(root, ["errorHash"])
+        if (!stage.isEmpty() || !errorKind.isEmpty() || !errorHash.isEmpty()) {
+            var payload = "{\"stage\":\"${jsonEscape(stage)}\",\"errorKind\":\"${jsonEscape(errorKind)}\",\"errorHash\":\"${jsonEscape(errorHash)}\""
+            let repo = firstJsonString(root, ["repo"])
+            let eventId = firstJsonString(root, ["eventId"])
+            let kind = firstJsonString(root, ["kind"])
+            let itemId = firstJsonString(root, ["itemId"])
+            if (!repo.isEmpty()) { payload += ",\"repo\":\"${jsonEscape(redactServicePayload(repo).text)}\"" }
+            if (!eventId.isEmpty()) { payload += ",\"eventId\":\"${jsonEscape(redactServicePayload(eventId).text)}\"" }
+            if (!kind.isEmpty()) { payload += ",\"kind\":\"${jsonEscape(redactServicePayload(kind).text)}\"" }
+            if (!itemId.isEmpty()) { payload += ",\"itemId\":\"${jsonEscape(redactServicePayload(itemId).text)}\"" }
+            return payload + "}"
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    redactServicePayload(diagnostic).text
+}
+
+func gcmDiagnosticPayloadJson(diagnostic: String): String {
+    let safe = gcmDiagnosticForPayload(diagnostic)
+    if (safe.trimAscii().startsWith("{")) { return safe }
+    "\"${jsonEscape(safe)}\""
+}
+
+func gcmScanEventDeliveryStatus(repo: GitCodeRepo, stage: String, errorHash: String): String {
+    redactServicePayload("repo=${repo.fullName()} stage=${stage} hash=${errorHash}").text
 }
 
 class GcmStringResult {
@@ -797,6 +883,10 @@ func gcmFirstScanDegradedReason(state: MonitorState, auditStart: Int64): String 
     while (index < state.audit.size) {
         let record = state.audit[index]
         if (record.status == "scan_degraded" || record.status == "state_error") {
+            if (record.deliveryStatus.contains("stage=event_runtime")) {
+                index++
+                continue
+            }
             if (!record.reason.isEmpty()) { return record.reason }
             return record.status
         }

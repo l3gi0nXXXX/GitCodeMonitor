@@ -93,6 +93,48 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func compactSummaryRegressionForGitCodePythonInteropPr9Comment156890959(): Unit {
+        let text = "按这里描述找不到模块都已经抛出异常了，还需要判断isAvaliable吗？下面的示例有点矛盾。得基于用户的实际场景准备示例"
+        @Expect(text.size, 161)
+        @Expect(text.toRuneArray().size, 61)
+        let summary = compactSummary(text, limit: 160)
+        @Expect(summary, text)
+        @Expect(summary.toRuneArray().size, 61)
+    }
+
+    @TestCase
+    public func compactSummaryTruncatesChineseOnRuneBoundary(): Unit {
+        let text = "你好世界"
+        @Expect(text.size > text.toRuneArray().size, true)
+        @Expect(compactSummary(text, limit: 3), "你好世...")
+    }
+
+    @TestCase
+    public func compactSummaryWithEmojiAndVariationSelectorDoesNotThrow(): Unit {
+        let text = "\u{26A0}\u{FE0F}警告"
+        @Expect(text.toRuneArray().size > 2, true)
+        @Expect(compactSummary(text, limit: 2), "\u{26A0}\u{FE0F}...")
+    }
+
+    @TestCase
+    public func compactSummaryLimitZeroHandlesEmptyAndNonEmptyText(): Unit {
+        @Expect(compactSummary("", limit: 0), "")
+        @Expect(compactSummary("abc", limit: 0), "...")
+        @Expect(compactSummary("你好", limit: 0), "...")
+    }
+
+    @TestCase
+    public func compactSummaryExactRuneLimitDoesNotAppendEllipsis(): Unit {
+        @Expect(compactSummary("abc", limit: 3), "abc")
+        @Expect(compactSummary("你好", limit: 2), "你好")
+    }
+
+    @TestCase
+    public func compactSummaryNormalizesNewlinesBeforeTruncating(): Unit {
+        @Expect(compactSummary("ab\ncd\ref", limit: 5), "ab cd...")
+    }
+
+    @TestCase
     public func schedulerUsesFakeClockCadenceAndOverlapGuard(): Unit {
         let config = defaultConfig()
         let clock = FakeClock()

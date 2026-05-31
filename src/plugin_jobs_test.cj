@@ -1,8 +1,43 @@
 package gitcodemonitor
 
+import std.collection.ArrayList
 import std.fs.{File, Path, exists, remove}
 import std.time.*
 import std.unittest.testmacro.*
+
+private class ThrowingMcpCallSender <: HttpSender {
+    public let requests = ArrayList<HttpRequestSpec>()
+    public init() {}
+
+    public func send(request: HttpRequestSpec): HttpResponseSpec {
+        requests.add(request)
+        if (request.url.contains("/orgs/cangjie/repos")) {
+            return HttpResponseSpec(200, body: "{\"repos\":[{\"path\":\"compiler\",\"public\":true}]}")
+        }
+        if (request.url.contains("/repos/cangjie/compiler/issues?")) {
+            return HttpResponseSpec(200, body: "{\"data\":[" +
+                "{\"number\":11,\"title\":\"bug-11\",\"body\":\"details 11\",\"user\":{\"login\":\"alice\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/11\"}," +
+                "{\"number\":12,\"title\":\"bug-12\",\"body\":\"details 12\",\"user\":{\"login\":\"bob\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/12\"}" +
+            "]}")
+        }
+        if (request.url.contains("/issues/comments")) {
+            return HttpResponseSpec(200, body: "[]")
+        }
+        if (request.url.contains("/pulls?")) {
+            return HttpResponseSpec(200, body: "[]")
+        }
+        if (request.body.contains("\"method\":\"tools/list\"")) {
+            return HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[{\"name\":\"gitcode_issue_summary\"},{\"name\":\"gitcode_issue_draft_reply\"},{\"name\":\"gitcode_pr_summary\"},{\"name\":\"gitcode_pr_draft_reply\"},{\"name\":\"gitcode_safety_review\"}]}}")
+        }
+        if (request.body.contains("\"method\":\"tools/call\"") && request.body.contains("gitcode:cangjie/compiler:issue:11")) {
+            throw Exception("MCP timeout Authorization: Bearer secret-token /Users/alice/.metis")
+        }
+        if (request.body.contains("\"method\":\"tools/call\"")) {
+            return HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"call\",\"result\":{\"structuredContent\":{\"draft\":\"safe draft\",\"approved\":true,\"needsHumanReview\":false}}}")
+        }
+        HttpResponseSpec(200, body: "{}")
+    }
+}
 
 @Test
 public class GitCodeMonitorPluginJobsTest {
@@ -523,6 +558,89 @@ public class GitCodeMonitorPluginJobsTest {
         @Expect(payloadText.contains("secret-token"), false)
         @Expect(payloadText.contains("/Users/alice"), false)
         @Expect(snapshotText.contains("\"report\""), true)
+    }
+
+    @TestCase
+    public func failedPayloadAndSnapshotIncludeRedactedDiagnostic(): Unit {
+        let payload = parseGcmAsyncScanPayload(asyncScanFrame("job-failed-diagnostic").payload).payload
+        let store = GcmScanJobStore(maxConcurrent: 1)
+        let created = store.createOrGet(payload)
+        let diagnostic = "{\"stage\":\"scan_runtime\",\"errorKind\":\"timeout\",\"errorHash\":\"payload-67-67\",\"message\":\"Authorization: Bearer secret-token /Users/alice/.metis\"}"
+
+        let failed = store.markFailed(created.job.jobId, "scan_runtime", "timeout", diagnostic: diagnostic)
+        let payloadText = gcmScanJobEventPayload(failed.job)
+        let snapshotText = gcmJobSnapshotPayload(failed.job)
+
+        @Expect(payloadText.contains("\"errorKind\":\"timeout\""), true)
+        @Expect(payloadText.contains("\"diagnostic\""), true)
+        @Expect(payloadText.contains("\"stage\""), true)
+        @Expect(payloadText.contains("\"errorHash\""), true)
+        @Expect(snapshotText.contains("\"diagnostic\""), true)
+        @Expect(payloadText.contains("secret-token"), false)
+        @Expect(snapshotText.contains("secret-token"), false)
+        @Expect(payloadText.contains("Authorization"), false)
+        @Expect(snapshotText.contains("/Users/alice"), false)
+    }
+
+    @TestCase
+    public func scanRuntimeErrorClassificationUsesReadableKinds(): Unit {
+        @Expect(gcmClassifyScanRuntimeError("Invalid utf8 byte sequence."), "invalid_utf8")
+        @Expect(gcmClassifyScanRuntimeError("request timeout after 1000 ms"), "timeout")
+        @Expect(gcmClassifyScanRuntimeError("JSON parse error at byte 1"), "json_parse_error")
+        @Expect(gcmClassifyScanRuntimeError("something unexpected"), "runtime_exception")
+    }
+
+    @TestCase
+    public func scanRuntimeDiagnosticRedactsSensitiveContent(): Unit {
+        let diagnostic = gcmScanRuntimeDiagnostic("scan_runtime", "Authorization: Bearer secret-token /Users/alice/.metis/state.json")
+
+        @Expect(diagnostic.contains("\"stage\""), true)
+        @Expect(diagnostic.contains("\"errorKind\""), true)
+        @Expect(diagnostic.contains("\"errorHash\""), true)
+        @Expect(diagnostic.contains("secret-token"), false)
+        @Expect(diagnostic.contains("Authorization"), false)
+        @Expect(diagnostic.contains("/Users/alice"), false)
+    }
+
+    @TestCase
+    public func boundedRuntimeIsolatesSingleEventExceptionAndContinues(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = tempStatePath("runtime-event-isolation")
+        config.orgs = ["cangjie"]
+        config.mcpEndpoint = "http://127.0.0.1:8787/mcp"
+        let sender = ThrowingMcpCallSender()
+        let httpSender: HttpSender = sender
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(httpSender))
+        let state = runtime.store.load()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
+        let job = GcmScanJob(payload: parseGcmAsyncScanPayload(asyncScanFrameWithLimits("job-runtime-event-isolation", "{\"maxRepos\":0,\"maxItems\":0,\"maxDurationMillis\":0}").payload).payload)
+
+        let result = scanOnceRuntimeBoundedForJob(config, runtime, state, job)
+
+        @Expect(result.stopReason, "completed")
+        @Expect(result.checkedItems, 2)
+        @Expect(result.failedEvents, 1)
+        @Expect(result.newEvents, 1)
+        @Expect(result.samplesFailed.size, 1)
+        @Expect(result.samplesFailed[0].eventId, "gitcode:cangjie/compiler:issue:11")
+        @Expect(result.samplesFailed[0].reason, "timeout")
+        @Expect(state.hasSeen("gitcode:cangjie/compiler:issue:12"), true)
+        var degradedAuditFound = false
+        for (record in state.audit) {
+            if (record.eventId == "gitcode:cangjie/compiler:issue:11" && record.status == "scan_degraded") {
+                degradedAuditFound = true
+                @Expect(record.reason, "timeout")
+                @Expect(record.deliveryStatus.contains("repo=cangjie/compiler"), true)
+                @Expect(record.deliveryStatus.contains("stage=event_runtime"), true)
+                @Expect(record.deliveryStatus.contains("hash=payload-"), true)
+                @Expect(record.deliveryStatus.contains("secret-token"), false)
+                @Expect(record.deliveryStatus.contains("/Users/alice"), false)
+            }
+        }
+        @Expect(degradedAuditFound, true)
+
+        if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
     }
 
     @TestCase

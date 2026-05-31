@@ -217,10 +217,20 @@ public func jsonEscape(raw: String): String {
     raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 }
 
+public func truncateRunes(text: String, maxRunes: Int64): String {
+    if (maxRunes <= 0) { return "" }
+    let runes = text.toRuneArray()
+    if (runes.size <= maxRunes) { return text }
+    String(runes[0..maxRunes])
+}
+
 public func compactSummary(raw: String, limit!: Int64 = 280): String {
     let t = raw.trimAscii().replace("\n", " ").replace("\r", " ")
-    if (t.size <= limit) { return t }
-    t[0..limit] + "..."
+    if (limit <= 0) {
+        return if (t.isEmpty()) { "" } else { "..." }
+    }
+    if (t.toRuneArray().size <= limit) { return t }
+    truncateRunes(t, limit) + "..."
 }
 
 func looksLikeTelegramBotToken(text: String): Bool {
