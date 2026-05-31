@@ -513,6 +513,8 @@ public class GitCodeMonitorPluginJobsTest {
         @Expect(payloadText.contains("\"baseline\""), true)
         @Expect(payloadText.contains("\"createdScopes\":1"), true)
         @Expect(payloadText.contains("\"seededEvents\":3"), true)
+        @Expect(payloadText.contains("\"baselineSeededEvents\":3"), true)
+        @Expect(payloadText.contains("\"status\":\"created\""), true)
         @Expect(payloadText.contains("\"writeMode\":\"dry_run\""), true)
         @Expect(payloadText.contains("\"duplicate\""), true)
         @Expect(payloadText.contains("\"sampleRemaining\""), true)

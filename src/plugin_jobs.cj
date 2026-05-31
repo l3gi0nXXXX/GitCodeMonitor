@@ -598,6 +598,7 @@ func gcmScanJobEventPayload(job: GcmScanJob): String {
 
 func gcmScanReportPayload(job: GcmScanJob): String {
     let report = job.report
+    let baselineStatus = gcmBaselineReportStatus(job, report)
     "{" +
         "\"orgs\":${stringArrayJson(report.orgs).toJsonString()}," +
         "\"limits\":{\"maxRepos\":${job.limits.maxRepos},\"maxItems\":${job.limits.maxItems},\"timeoutMillis\":${job.limits.maxDurationMillis}}," +
@@ -608,7 +609,10 @@ func gcmScanReportPayload(job: GcmScanJob): String {
         "\"duplicateEvents\":${report.duplicateEvents}," +
         "\"filteredEvents\":${report.filteredEvents}," +
         "\"failedEvents\":${report.failedEvents}," +
-        "\"baseline\":{\"createdScopes\":${report.baselineScopesCreated},\"seededEvents\":${report.baselineSeededEvents},\"backfillEvents\":${report.backfillEvents},\"enabled\":true}," +
+        "\"baselineScopesCreated\":${report.baselineScopesCreated}," +
+        "\"baselineSeededEvents\":${report.baselineSeededEvents}," +
+        "\"backfillEvents\":${report.backfillEvents}," +
+        "\"baseline\":{\"createdScopes\":${report.baselineScopesCreated},\"seededEvents\":${report.baselineSeededEvents},\"backfillEvents\":${report.backfillEvents},\"enabled\":true,\"backfill\":${job.backfill},\"status\":\"${jsonEscape(baselineStatus)}\"}," +
         "\"draftsGenerated\":${report.draftsGenerated}," +
         "\"draftsFailed\":${report.draftsFailed}," +
         "\"notificationsSent\":${report.notificationsSent}," +
@@ -617,6 +621,15 @@ func gcmScanReportPayload(job: GcmScanJob): String {
         "\"samples\":{\"new\":${gcmScanSamplesJson(report.samplesNew)},\"duplicate\":${gcmScanSamplesJson(report.samplesDuplicate)},\"filtered\":${gcmScanSamplesJson(report.samplesFiltered)},\"failed\":${gcmScanSamplesJson(report.samplesFailed)},\"baseline\":${gcmScanSamplesJson(report.samplesBaseline)}}," +
         "\"sampleRemaining\":{\"new\":${gcmSampleRemaining(report.newEvents, report.samplesNew.size)},\"duplicate\":${gcmSampleRemaining(report.duplicateEvents, report.samplesDuplicate.size)},\"filtered\":${gcmSampleRemaining(report.filteredEvents, report.samplesFiltered.size)},\"failed\":${gcmSampleRemaining(report.failedEvents, report.samplesFailed.size)},\"baseline\":${gcmSampleRemaining(report.baselineSeededEvents, report.samplesBaseline.size)}}" +
     "}"
+}
+
+func gcmBaselineReportStatus(job: GcmScanJob, report: ScanResult): String {
+    if (!job.stateSaved && report.baselineSeededEvents > 0) { return "state_save_failed" }
+    if (job.backfill || report.backfillEvents > 0) { return "backfill" }
+    if (report.baselineScopesCreated > 0 || report.baselineSeededEvents > 0) {
+        return if (report.failedEvents > 0) { "partial" } else { "created" }
+    }
+    "existing"
 }
 
 func gcmScanSamplesJson(samples: ArrayList<ScanEventSummary>): String {
