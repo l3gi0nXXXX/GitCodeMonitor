@@ -135,6 +135,7 @@ public class GitCodeMonitorPluginRuntimeTest {
         let status = handleGcmStatusCapability("{}", runtime)
         @Expect(status.ok, true)
         @Expect(status.summary.contains("dryRun=true"), true)
+        @Expect(status.summary.contains("baselineScopes=0"), true)
         let scan = handleGcmScanOnceCapability("{\"offlineFixture\":true}", runtime)
         @Expect(scan.ok, true)
         @Expect(scan.status, "ok")

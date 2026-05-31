@@ -139,8 +139,8 @@ public class GitCodeMonitorCoreTest {
         let state = MonitorState()
         let events = collectRepoEventsHttp(GitCodeRepo("cangjie", "compiler"), transport, state)
         @Expect(events.size, 3)
-        @Expect(events[0].id, "cangjie/compiler:issue:11")
-        @Expect(events[1].id, "cangjie/compiler:issue:11:comment:99")
+        @Expect(events[0].id, "gitcode:cangjie/compiler:issue:11")
+        @Expect(events[1].id, "gitcode:cangjie/compiler:issue:11:comment:99")
         @Expect(events[2].itemKind, "pr")
 
         let limitedSender = FakeHttpSender()
@@ -149,6 +149,19 @@ public class GitCodeMonitorCoreTest {
         let limitedResult = limited.listReposPage("cangjie", 1)
         @Expect(limitedResult.errorKind, "rate_limited")
         @Expect(limitedResult.retryAfterMs, 2000)
+    }
+
+    @TestCase
+    public func canonicalEventIdsSeparateIssuePrCommentAndIgnoreContent(): Unit {
+        let repo = GitCodeRepo("Cangjie", "Compiler")
+        let issue = canonicalGitCodeEventId(repo, "issue", "71")
+        let pr = canonicalGitCodeEventId(repo, "pr", "71")
+        let comment = canonicalGitCodeEventId(repo, "issue", "71", commentId: "9001")
+        @Expect(issue, "gitcode:cangjie/compiler:issue:71")
+        @Expect(pr, "gitcode:cangjie/compiler:pr:71")
+        @Expect(comment, "gitcode:cangjie/compiler:issue:71:comment:9001")
+        @Expect(issue == pr, false)
+        @Expect(comment.contains("token="), false)
     }
 
     @TestCase
@@ -300,7 +313,9 @@ public class GitCodeMonitorCoreTest {
         transport.events.add(GitCodeEvent("evt", "cangjie", "compiler", "issue", "1", "alice", "", "", "need help"))
         let mcp = FakeMcpClient()
         mcp.available = false
-        let result = scanOnce(config, transport, MonitorState(), FakeNotifier("feishu"), FakeNotifier("telegram"), mcp, FakeCommentWriter())
+        let state = MonitorState()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
+        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), mcp, FakeCommentWriter())
         @Expect(result.accepted, 1)
         @Expect(result.notified, 2)
         @Expect(result.mcpCalls, 0)
@@ -308,9 +323,52 @@ public class GitCodeMonitorCoreTest {
     }
 
     @TestCase
+    public func firstRepoScanSeedsBaselineWithoutNotifyMcpOrWriteback(): Unit {
+        let config = defaultConfig()
+        let state = MonitorState()
+        let transport = FakeGitCodeTransport()
+        transport.repos.add(GitCodeRepo("cangjie", "compiler"))
+        transport.events.add(GitCodeEvent("gitcode:cangjie/compiler:issue:1", "cangjie", "compiler", "issue", "1", "alice", "", "https://gitcode.com/cangjie/compiler/issues/1", "history"))
+
+        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+
+        @Expect(result.accepted, 0)
+        @Expect(result.newEvents, 0)
+        @Expect(result.baselineSeededEvents, 1)
+        @Expect(result.baselineScopesCreated, 1)
+        @Expect(result.notificationsSent, 0)
+        @Expect(result.mcpCalls, 0)
+        @Expect(state.hasSeen("gitcode:cangjie/compiler:issue:1"), true)
+        @Expect(state.hasBaseline("gitcode:cangjie/compiler"), true)
+        @Expect(result.samplesBaseline.size, 1)
+        @Expect(result.samplesBaseline[0].reason, "first_baseline")
+    }
+
+    @TestCase
+    public func baselineAfterFirstScanAllowsNewCommentOnHistoricalIssue(): Unit {
+        let config = defaultConfig()
+        let state = MonitorState()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
+        state.markSeen("gitcode:cangjie/compiler:issue:1")
+        let transport = FakeGitCodeTransport()
+        transport.repos.add(GitCodeRepo("cangjie", "compiler"))
+        transport.events.add(GitCodeEvent("gitcode:cangjie/compiler:issue:1:comment:99", "cangjie", "compiler", "issue", "1", "bob", "", "https://gitcode.com/cangjie/compiler/issues/1#note_99", "new comment"))
+
+        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+
+        @Expect(result.accepted, 1)
+        @Expect(result.newEvents, 1)
+        @Expect(result.baselineSeededEvents, 0)
+        @Expect(result.draftsGenerated, 1)
+        @Expect(result.notificationsSent, 2)
+        @Expect(state.hasSeen("gitcode:cangjie/compiler:issue:1:comment:99"), true)
+    }
+
+    @TestCase
     public func duplicateEventsDoNotRepeatNotifyMcpOrWriteback(): Unit {
         let config = defaultConfig()
         let state = MonitorState()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
         let first = scanOnceOfflineFixture(config, state)
         let second = scanOnceOfflineFixture(config, state)
         @Expect(first.accepted, 1)
@@ -343,7 +401,9 @@ public class GitCodeMonitorCoreTest {
         transport.events.add(GitCodeEvent("evt-2", "cangjie", "compiler", "issue", "71", "bob", "", "https://gitcode.com/cangjie/compiler/issues/71", "Discuss docs"))
         transport.events.add(GitCodeEvent("evt-3", "cangjie", "compiler", "issue", "72", "CangjiePL", "https://gitcode.com/CangjiePL", "https://gitcode.com/cangjie/compiler/issues/72", "bot event"))
 
-        let result = scanOnce(config, transport, MonitorState(), FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+        let state = MonitorState()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
+        let result = scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
 
         @Expect(result.scannedRepos, 1)
         @Expect(result.checkedItems, 3)
@@ -361,6 +421,7 @@ public class GitCodeMonitorCoreTest {
     public func scanReportSamplesAreCappedAndRedacted(): Unit {
         let config = defaultConfig()
         let state = MonitorState()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
         let transport = FakeGitCodeTransport()
         transport.repos.add(GitCodeRepo("cangjie", "compiler"))
         for (i in 0..6) {
@@ -392,6 +453,7 @@ public class GitCodeMonitorCoreTest {
     public func scanSummaryAuditContainsCountersWithoutSecrets(): Unit {
         let config = defaultConfig()
         let state = MonitorState()
+        state.markBaseline("gitcode:cangjie/compiler", 0)
         let transport = FakeGitCodeTransport()
         transport.repos.add(GitCodeRepo("cangjie", "compiler"))
         transport.events.add(GitCodeEvent("evt-secret", "cangjie", "compiler", "issue", "1", "alice", "", "", "token=secret-value"))
@@ -425,6 +487,7 @@ public class GitCodeMonitorCoreTest {
         state.markSeen("evt")
         state.markMcpCall("evt")
         state.markReply("evt")
+        state.markBaseline("gitcode:cangjie/compiler", 7)
         state.setBackoff("cangjie/compiler", 1234)
         let audit = AuditRecord("evt", status: "drafted", reason: "dry_run")
         audit.draft = "draft"
@@ -436,6 +499,8 @@ public class GitCodeMonitorCoreTest {
         @Expect(loaded.hasMcpCall("evt"), true)
         @Expect(loaded.hasReply("evt"), true)
         @Expect(loaded.backoffUntil("cangjie/compiler"), 1234)
+        @Expect(loaded.hasBaseline("gitcode:cangjie/compiler"), true)
+        @Expect(loaded.baselineSeenCount("gitcode:cangjie/compiler"), 7)
         @Expect(loaded.audit.size, 1)
         if (exists(Path(path))) { remove(Path(path)) }
     }

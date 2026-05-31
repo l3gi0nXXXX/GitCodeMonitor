@@ -44,6 +44,7 @@ public class GcmAsyncScanPayload {
     public let limits: GcmScanJobLimits
     public let offlineFixture: Bool
     public let dryRun: Bool
+    public let backfill: Bool
 
     public init(
         mode!: String = "",
@@ -52,7 +53,8 @@ public class GcmAsyncScanPayload {
         deliveryTargetHash!: String = "",
         limits!: GcmScanJobLimits = GcmScanJobLimits(),
         offlineFixture!: Bool = false,
-        dryRun!: Bool = true
+        dryRun!: Bool = true,
+        backfill!: Bool = false
     ) {
         this.mode = mode
         this.jobId = jobId
@@ -61,6 +63,7 @@ public class GcmAsyncScanPayload {
         this.limits = limits
         this.offlineFixture = offlineFixture
         this.dryRun = dryRun
+        this.backfill = backfill
     }
 }
 
@@ -111,6 +114,7 @@ public class GcmScanJob {
     public let deliveryTargetHash: String
     public let limits: GcmScanJobLimits
     public let offlineFixture: Bool
+    public let backfill: Bool
     public var accepted: Int64
     public var ignored: Int64
     public var emitted: Int64
@@ -132,6 +136,7 @@ public class GcmScanJob {
         this.deliveryTargetHash = payload.deliveryTargetHash
         this.limits = payload.limits
         this.offlineFixture = payload.offlineFixture
+        this.backfill = payload.backfill
         this.accepted = 0
         this.ignored = 0
         this.emitted = 0
@@ -356,7 +361,8 @@ public func parseGcmAsyncScanPayload(payload: String): GcmAsyncScanPayloadParseR
             deliveryTargetHash: deliveryTarget.value,
             limits: limits.value,
             offlineFixture: options.offlineFixture,
-            dryRun: options.dryRun
+            dryRun: options.dryRun,
+            backfill: options.backfill
         )
     )
 }
@@ -475,9 +481,6 @@ func scanOnceRuntimeBoundedForJob(
     job: GcmScanJob,
     eventWriter!: Option<GcmPluginStdioWriter> = None<GcmPluginStdioWriter>
 ): ScanResult {
-    if (job.limits.maxRepos <= 0 && job.limits.maxItems <= 0 && eventWriter.isNone()) {
-        return scanOnceRuntime(config, runtime, state)
-    }
     let result = emptyScanResult(config)
     for (org in config.orgs) {
         var page: Int64 = 1
@@ -497,13 +500,27 @@ func scanOnceRuntimeBoundedForJob(
                     return finalizeScanResult(state, job.jobId, result)
                 }
                 result.scannedRepos++
-                for (event in collectRepoEventsHttp(repo, runtime.gitCode, state)) {
+                let scopeKey = canonicalGitCodeRepoScopeKey(repo)
+                let hadBaseline = state.hasBaseline(scopeKey)
+                let collection = collectRepoEventsHttpDetailed(repo, runtime.gitCode, state)
+                if (!collection.completed) {
+                    result.failedEvents++
+                    result.stopReason = "degraded"
+                    result.addFailedSample(repo.fullName(), collection.errorKind)
+                    state.addAudit(AuditRecord(scopeKey, status: "scan_degraded", reason: collection.errorKind))
+                    if (!hadBaseline) { continue }
+                }
+                let baselineStart = result.baselineSeededEvents
+                var repoCompleted = true
+                for (event in collection.events) {
                     if (job.limits.maxItems > 0 && result.checkedItems >= job.limits.maxItems) {
                         result.stopReason = "max_items_reached"
+                        repoCompleted = false
                         return finalizeScanResult(state, job.jobId, result)
                     }
                     result.checkedItems++
-                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer)
+                    let baselineMode = !job.backfill && !hadBaseline
+                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: baselineMode)
                     if (processed.newEvents > 0) {
                         match (eventWriter) {
                             case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)
@@ -511,6 +528,10 @@ func scanOnceRuntimeBoundedForJob(
                         }
                     }
                     result.absorb(processed)
+                }
+                if (!job.backfill && !hadBaseline && collection.completed && repoCompleted) {
+                    state.markBaseline(scopeKey, result.baselineSeededEvents - baselineStart)
+                    result.baselineScopesCreated++
                 }
             }
             if (repoResult.repos.size < runtime.gitCode.pageSize) { break }
@@ -587,13 +608,14 @@ func gcmScanReportPayload(job: GcmScanJob): String {
         "\"duplicateEvents\":${report.duplicateEvents}," +
         "\"filteredEvents\":${report.filteredEvents}," +
         "\"failedEvents\":${report.failedEvents}," +
+        "\"baseline\":{\"createdScopes\":${report.baselineScopesCreated},\"seededEvents\":${report.baselineSeededEvents},\"backfillEvents\":${report.backfillEvents},\"enabled\":true}," +
         "\"draftsGenerated\":${report.draftsGenerated}," +
         "\"draftsFailed\":${report.draftsFailed}," +
         "\"notificationsSent\":${report.notificationsSent}," +
         "\"writes\":${report.writes}," +
         "\"writeMode\":\"${jsonEscape(report.writeMode)}\"," +
-        "\"samples\":{\"new\":${gcmScanSamplesJson(report.samplesNew)},\"duplicate\":${gcmScanSamplesJson(report.samplesDuplicate)},\"filtered\":${gcmScanSamplesJson(report.samplesFiltered)},\"failed\":${gcmScanSamplesJson(report.samplesFailed)}}," +
-        "\"sampleRemaining\":{\"new\":${gcmSampleRemaining(report.newEvents, report.samplesNew.size)},\"duplicate\":${gcmSampleRemaining(report.duplicateEvents, report.samplesDuplicate.size)},\"filtered\":${gcmSampleRemaining(report.filteredEvents, report.samplesFiltered.size)},\"failed\":${gcmSampleRemaining(report.failedEvents, report.samplesFailed.size)}}" +
+        "\"samples\":{\"new\":${gcmScanSamplesJson(report.samplesNew)},\"duplicate\":${gcmScanSamplesJson(report.samplesDuplicate)},\"filtered\":${gcmScanSamplesJson(report.samplesFiltered)},\"failed\":${gcmScanSamplesJson(report.samplesFailed)},\"baseline\":${gcmScanSamplesJson(report.samplesBaseline)}}," +
+        "\"sampleRemaining\":{\"new\":${gcmSampleRemaining(report.newEvents, report.samplesNew.size)},\"duplicate\":${gcmSampleRemaining(report.duplicateEvents, report.samplesDuplicate.size)},\"filtered\":${gcmSampleRemaining(report.filteredEvents, report.samplesFiltered.size)},\"failed\":${gcmSampleRemaining(report.failedEvents, report.samplesFailed.size)},\"baseline\":${gcmSampleRemaining(report.baselineSeededEvents, report.samplesBaseline.size)}}" +
     "}"
 }
 
@@ -676,11 +698,13 @@ class GcmOptionsResult {
     public let ok: Bool
     public let offlineFixture: Bool
     public let dryRun: Bool
+    public let backfill: Bool
     public let diagnostic: String
-    public init(ok: Bool, offlineFixture!: Bool = false, dryRun!: Bool = true, diagnostic!: String = "") {
+    public init(ok: Bool, offlineFixture!: Bool = false, dryRun!: Bool = true, backfill!: Bool = false, diagnostic!: String = "") {
         this.ok = ok
         this.offlineFixture = offlineFixture
         this.dryRun = dryRun
+        this.backfill = backfill
         this.diagnostic = diagnostic
     }
 }
@@ -739,10 +763,11 @@ func parseGcmAsyncScanOptions(root: JsonObject): GcmOptionsResult {
     }
     let offlineFixture = pluginPayloadBoolField(options, "offlineFixture", defaultValue: false)
     let dryRun = pluginPayloadBoolField(options, "dryRun", defaultValue: true)
-    if (!offlineFixture.ok || !dryRun.ok) {
+    let backfill = pluginPayloadBoolField(options, "backfill", defaultValue: false)
+    if (!offlineFixture.ok || !dryRun.ok || !backfill.ok) {
         return GcmOptionsResult(false, diagnostic: "options fields must be bool")
     }
-    GcmOptionsResult(true, offlineFixture: offlineFixture.value, dryRun: dryRun.value)
+    GcmOptionsResult(true, offlineFixture: offlineFixture.value, dryRun: dryRun.value, backfill: backfill.value)
 }
 
 func gcmPayloadIntField(root: JsonObject, key: String, defaultValue!: Int64 = 0): GcmIntResult {

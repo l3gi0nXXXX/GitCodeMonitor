@@ -281,20 +281,32 @@ public class MonitorState {
     private let mcpCalled = HashSet<String>()
     private let replied = HashSet<String>()
     private let backoff = HashMap<String, Int64>()
+    private let baselineScopes = HashSet<String>()
+    private let baselineCounts = HashMap<String, Int64>()
     public let audit = ArrayList<AuditRecord>()
     public var lastFullScanAtMs: Int64 = 0
     public var skippedOverlappingScans: Int64 = 0
+    public var baselineCreatedAtMs: Int64 = 0
 
     public init() {}
 
     public func hasSeen(eventId: String): Bool { seenEvents.contains(eventId) }
     public func markSeen(eventId: String): Unit { seenEvents.add(eventId) }
+    public func hasBaseline(scopeKey: String): Bool { baselineScopes.contains(scopeKey) }
+    public func markBaseline(scopeKey: String, seededEvents: Int64): Unit {
+        if (scopeKey.trimAscii().isEmpty()) { return }
+        baselineScopes.add(scopeKey)
+        baselineCounts[scopeKey] = if (seededEvents < 0) { 0 } else { seededEvents }
+        if (baselineCreatedAtMs == 0) { baselineCreatedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds() }
+    }
     public func hasMcpCall(eventId: String): Bool { mcpCalled.contains(eventId) }
     public func markMcpCall(eventId: String): Unit { mcpCalled.add(eventId) }
     public func hasReply(eventId: String): Bool { replied.contains(eventId) }
     public func markReply(eventId: String): Unit { replied.add(eventId) }
     public func addAudit(record: AuditRecord): Unit { audit.add(record) }
     public func seenCount(): Int64 { seenEvents.size }
+    public func baselineScopeCount(): Int64 { baselineScopes.size }
+    public func baselineSeenCount(scopeKey: String): Int64 { baselineCounts.get(scopeKey) ?? 0 }
     public func mcpCallCount(): Int64 { mcpCalled.size }
     public func replyCount(): Int64 { replied.size }
     public func setBackoff(key: String, untilMs: Int64): Unit { backoff[key] = untilMs }
@@ -317,6 +329,11 @@ public class MonitorState {
     public func backoffKeys(): Array<String> {
         let out = ArrayList<String>()
         for ((key, _) in backoff) { out.add(key) }
+        out.toArray()
+    }
+    public func baselineScopeIds(): Array<String> {
+        let out = ArrayList<String>()
+        for (id in baselineScopes) { out.add(id) }
         out.toArray()
     }
 }
@@ -346,6 +363,22 @@ public class StateStore {
             state.lastFullScanAtMs = readJsonInt(root, "lastFullScanAtMs")
             state.skippedOverlappingScans = readJsonInt(root, "skippedOverlappingScans")
             for (id in readJsonStringArray(root, "seenEvents")) { state.markSeen(id) }
+            state.baselineCreatedAtMs = readJsonInt(root, "baselineCreatedAtMs")
+            match (root.get("baselineScopes")) {
+                case Some(value) =>
+                    try {
+                        for (item in value.asArray().getItems()) {
+                            try {
+                                let obj = item.asObject()
+                                let scopeKey = readJsonString(obj, "scopeKey")
+                                if (!scopeKey.isEmpty()) {
+                                    state.markBaseline(scopeKey, readJsonInt(obj, "seededEvents"))
+                                }
+                            } catch (_inner: Exception) { () }
+                        }
+                    } catch (_inner: Exception) { () }
+                case None => ()
+            }
             for (id in readJsonStringArray(root, "mcpCalled")) { state.markMcpCall(id) }
             for (id in readJsonStringArray(root, "replied")) { state.markReply(id) }
             match (root.get("backoff")) {
@@ -385,10 +418,19 @@ public class StateStore {
 
 public func stateToJson(state: MonitorState): JsonObject {
     let root = JsonObject()
-    root.put("schemaVersion", JsonInt(1))
+    root.put("schemaVersion", JsonInt(2))
     root.put("lastFullScanAtMs", JsonInt(state.lastFullScanAtMs))
     root.put("skippedOverlappingScans", JsonInt(state.skippedOverlappingScans))
+    root.put("baselineCreatedAtMs", JsonInt(state.baselineCreatedAtMs))
     root.put("seenEvents", stringArrayJson(state.seenIds()))
+    let baselineScopes = JsonArray([])
+    for (scopeKey in state.baselineScopeIds()) {
+        let row = JsonObject()
+        row.put("scopeKey", JsonString(scopeKey))
+        row.put("seededEvents", JsonInt(state.baselineSeenCount(scopeKey)))
+        baselineScopes.add(row)
+    }
+    root.put("baselineScopes", baselineScopes)
     root.put("mcpCalled", stringArrayJson(state.mcpCallIds()))
     root.put("replied", stringArrayJson(state.replyIds()))
     let backoff = JsonArray([])
@@ -472,6 +514,26 @@ public class GitCodeRepo {
         this.htmlUrl = htmlUrl
     }
     public func fullName(): String { "${org}/${name}" }
+}
+
+public func canonicalGitCodeRepoKey(repo: GitCodeRepo): String {
+    "${repo.org.trimAscii().toAsciiLower()}/${repo.name.trimAscii().toAsciiLower()}"
+}
+
+public func canonicalGitCodeRepoScopeKey(repo: GitCodeRepo): String {
+    "gitcode:${canonicalGitCodeRepoKey(repo)}"
+}
+
+public func canonicalGitCodeEventId(repo: GitCodeRepo, kind: String, itemId: String, commentId!: String = ""): String {
+    let normalizedKind = kind.trimAscii().toAsciiLower()
+    let normalizedItem = itemId.trimAscii()
+    let base = "${canonicalGitCodeRepoScopeKey(repo)}:${normalizedKind}:${normalizedItem}"
+    if (commentId.trimAscii().isEmpty()) { return base }
+    "${base}:comment:${commentId.trimAscii()}"
+}
+
+public func gitCodeEventScopeKey(event: GitCodeEvent): String {
+    canonicalGitCodeRepoScopeKey(GitCodeRepo(event.org, event.repo))
 }
 
 public class HttpRequestSpec {
@@ -852,10 +914,25 @@ public func scanOnceRuntime(config: MonitorConfig, runtime: RuntimeContainer, st
             }
             for (repo in repoResult.repos) {
                 result.scannedRepos++
-                for (event in collectRepoEventsHttp(repo, runtime.gitCode, state)) {
+                let scopeKey = canonicalGitCodeRepoScopeKey(repo)
+                let hadBaseline = state.hasBaseline(scopeKey)
+                let collection = collectRepoEventsHttpDetailed(repo, runtime.gitCode, state)
+                if (!collection.completed) {
+                    result.failedEvents++
+                    result.stopReason = "degraded"
+                    result.addFailedSample(repo.fullName(), collection.errorKind)
+                    state.addAudit(AuditRecord(scopeKey, status: "scan_degraded", reason: collection.errorKind))
+                    if (!hadBaseline) { continue }
+                }
+                let baselineStart = result.baselineSeededEvents
+                for (event in collection.events) {
                     result.checkedItems++
-                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer)
+                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: !hadBaseline)
                     result.absorb(processed)
+                }
+                if (!hadBaseline && collection.completed) {
+                    state.markBaseline(scopeKey, result.baselineSeededEvents - baselineStart)
+                    result.baselineScopesCreated++
                 }
             }
             if (repoResult.repos.size < runtime.gitCode.pageSize) { break }
@@ -1006,10 +1083,28 @@ public func refreshReposHttp(config: MonitorConfig, transport: GitCodeHttpTransp
 }
 
 public func collectRepoEventsHttp(repo: GitCodeRepo, transport: GitCodeHttpTransport, state: MonitorState): Array<GitCodeEvent> {
+    collectRepoEventsHttpDetailed(repo, transport, state).events
+}
+
+public class GitCodeRepoEventCollection {
+    public let events: Array<GitCodeEvent>
+    public let completed: Bool
+    public let errorKind: String
+
+    public init(events: Array<GitCodeEvent>, completed!: Bool = true, errorKind!: String = "") {
+        this.events = events
+        this.completed = completed
+        this.errorKind = errorKind
+    }
+}
+
+public func collectRepoEventsHttpDetailed(repo: GitCodeRepo, transport: GitCodeHttpTransport, state: MonitorState): GitCodeRepoEventCollection {
     let out = ArrayList<GitCodeEvent>()
-    collectPagedEvents(repo, "issue", transport, state, out)
-    collectPagedEvents(repo, "pr", transport, state, out)
-    out.toArray()
+    let issueStatus = collectPagedEvents(repo, "issue", transport, state, out)
+    let prStatus = collectPagedEvents(repo, "pr", transport, state, out)
+    let ok = issueStatus == "ok" && prStatus == "ok"
+    let errorKind = if (issueStatus != "ok") { issueStatus } else { if (prStatus != "ok") { prStatus } else { "" } }
+    GitCodeRepoEventCollection(out.toArray(), completed: ok, errorKind: errorKind)
 }
 
 public class DeliveryAudit {
@@ -1470,6 +1565,9 @@ public class ScanResult {
     public var duplicateEvents: Int64
     public var filteredEvents: Int64
     public var failedEvents: Int64
+    public var baselineScopesCreated: Int64
+    public var baselineSeededEvents: Int64
+    public var backfillEvents: Int64
     public var draftsGenerated: Int64
     public var draftsFailed: Int64
     public var notificationsSent: Int64
@@ -1479,6 +1577,7 @@ public class ScanResult {
     public let samplesDuplicate: ArrayList<ScanEventSummary>
     public let samplesFiltered: ArrayList<ScanEventSummary>
     public let samplesFailed: ArrayList<ScanEventSummary>
+    public let samplesBaseline: ArrayList<ScanEventSummary>
 
     public init(
         accepted: Int64,
@@ -1493,6 +1592,9 @@ public class ScanResult {
         duplicateEvents!: Int64 = 0,
         filteredEvents!: Int64 = 0,
         failedEvents!: Int64 = 0,
+        baselineScopesCreated!: Int64 = 0,
+        baselineSeededEvents!: Int64 = 0,
+        backfillEvents!: Int64 = 0,
         draftsGenerated!: Int64 = 0,
         draftsFailed!: Int64 = 0,
         notificationsSent!: Int64 = 0,
@@ -1511,6 +1613,9 @@ public class ScanResult {
         this.duplicateEvents = duplicateEvents
         this.filteredEvents = filteredEvents
         this.failedEvents = failedEvents
+        this.baselineScopesCreated = baselineScopesCreated
+        this.baselineSeededEvents = baselineSeededEvents
+        this.backfillEvents = backfillEvents
         this.draftsGenerated = draftsGenerated
         this.draftsFailed = draftsFailed
         this.notificationsSent = notificationsSent
@@ -1520,6 +1625,7 @@ public class ScanResult {
         this.samplesDuplicate = ArrayList<ScanEventSummary>()
         this.samplesFiltered = ArrayList<ScanEventSummary>()
         this.samplesFailed = ArrayList<ScanEventSummary>()
+        this.samplesBaseline = ArrayList<ScanEventSummary>()
     }
 
     public func absorb(other: ScanResult): Unit {
@@ -1534,6 +1640,9 @@ public class ScanResult {
         this.duplicateEvents += other.duplicateEvents
         this.filteredEvents += other.filteredEvents
         this.failedEvents += other.failedEvents
+        this.baselineScopesCreated += other.baselineScopesCreated
+        this.baselineSeededEvents += other.baselineSeededEvents
+        this.backfillEvents += other.backfillEvents
         this.draftsGenerated += other.draftsGenerated
         this.draftsFailed += other.draftsFailed
         this.notificationsSent += other.notificationsSent
@@ -1544,6 +1653,7 @@ public class ScanResult {
         for (sample in other.samplesDuplicate) { addSampleLimited(this.samplesDuplicate, sample) }
         for (sample in other.samplesFiltered) { addSampleLimited(this.samplesFiltered, sample) }
         for (sample in other.samplesFailed) { addSampleLimited(this.samplesFailed, sample) }
+        for (sample in other.samplesBaseline) { addSampleLimited(this.samplesBaseline, sample) }
     }
 
     public func addNewSample(event: GitCodeEvent, status: String, reason!: String = ""): Unit {
@@ -1561,12 +1671,19 @@ public class ScanResult {
     public func addFailedSample(repo: String, reason: String): Unit {
         addSampleLimited(this.samplesFailed, ScanEventSummary("", repo, "", "", "", "", "", "failed", reason))
     }
+
+    public func addBaselineSample(event: GitCodeEvent, reason: String): Unit {
+        addSampleLimited(this.samplesBaseline, scanEventSummary(event, "baseline", reason))
+    }
 }
 
 public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, state: MonitorState, feishu: FakeNotifier, telegram: FakeNotifier, mcp: FakeMcpClient, writer: FakeCommentWriter): ScanResult {
     let result = emptyScanResult(config)
     for (repo in transport.repos) {
         result.scannedRepos++
+        let scopeKey = canonicalGitCodeRepoScopeKey(repo)
+        let hadBaseline = state.hasBaseline(scopeKey)
+        var baselineSeededForRepo: Int64 = 0
         for (event in transport.scanRepo(repo)) {
             result.checkedItems++
             let filter = filterEvent(event)
@@ -1581,6 +1698,14 @@ public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, sta
                 result.duplicateEvents++
                 result.addDuplicateSample(event, "seen")
                 state.addAudit(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
+                continue
+            }
+            if (!hadBaseline) {
+                state.markSeen(event.id)
+                baselineSeededForRepo++
+                result.baselineSeededEvents++
+                result.addBaselineSample(event, "first_baseline")
+                state.addAudit(AuditRecord(event.id, status: "baseline_seeded", reason: "first_baseline"))
                 continue
             }
             state.markSeen(event.id)
@@ -1621,11 +1746,15 @@ public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, sta
             }
             result.addNewSample(event, sampleStatus, reason: sampleReason)
         }
+        if (!hadBaseline) {
+            state.markBaseline(scopeKey, baselineSeededForRepo)
+            result.baselineScopesCreated++
+        }
     }
     finalizeScanResult(state, "scan_once", result)
 }
 
-func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, feishu: HttpNotifier, telegram: HttpNotifier, mcp: McpHttpClient, writer: GitCodeCommentWriter): ScanResult {
+func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, feishu: HttpNotifier, telegram: HttpNotifier, mcp: McpHttpClient, writer: GitCodeCommentWriter, baselineMode!: Bool = false): ScanResult {
     let filter = filterEvent(event)
     if (filter.ignored) {
         state.addAudit(AuditRecord(event.id, status: "ignored", reason: filter.reason))
@@ -1637,6 +1766,13 @@ func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitC
         state.addAudit(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
         let result = ScanResult(0, 0, 0, 0, 0, duplicateEvents: 1, writeMode: scanWriteMode(config))
         result.addDuplicateSample(event, "seen")
+        return result
+    }
+    if (baselineMode) {
+        state.markSeen(event.id)
+        state.addAudit(AuditRecord(event.id, status: "baseline_seeded", reason: "first_baseline"))
+        let result = ScanResult(0, 0, 0, 0, 0, baselineSeededEvents: 1, writeMode: scanWriteMode(config))
+        result.addBaselineSample(event, "first_baseline")
         return result
     }
     state.markSeen(event.id)
@@ -1697,7 +1833,7 @@ func finalizeScanResult(state: MonitorState, scanId: String, result: ScanResult)
 }
 
 func scanSummaryReason(result: ScanResult): String {
-    "scannedRepos=${result.scannedRepos} checkedItems=${result.checkedItems} newEvents=${result.newEvents} duplicateEvents=${result.duplicateEvents} filteredEvents=${result.filteredEvents} failedEvents=${result.failedEvents} draftsGenerated=${result.draftsGenerated} notificationsSent=${result.notificationsSent} writes=${result.writes} stopReason=${result.stopReason}"
+    "scannedRepos=${result.scannedRepos} checkedItems=${result.checkedItems} newEvents=${result.newEvents} duplicateEvents=${result.duplicateEvents} filteredEvents=${result.filteredEvents} failedEvents=${result.failedEvents} baselineScopesCreated=${result.baselineScopesCreated} baselineSeededEvents=${result.baselineSeededEvents} draftsGenerated=${result.draftsGenerated} notificationsSent=${result.notificationsSent} writes=${result.writes} stopReason=${result.stopReason}"
 }
 
 func normalizeScanStopReason(stopReason: String): String {
@@ -1913,13 +2049,13 @@ func gitCodeAuthPresent(config: MonitorConfig): Bool {
     !config.gitCodeToken.isEmpty() || !config.gitCodeCookie.isEmpty() || (!config.gitCodeUsername.isEmpty() && !config.gitCodePassword.isEmpty())
 }
 
-func collectPagedEvents(repo: GitCodeRepo, kind: String, transport: GitCodeHttpTransport, state: MonitorState, out: ArrayList<GitCodeEvent>): Unit {
+func collectPagedEvents(repo: GitCodeRepo, kind: String, transport: GitCodeHttpTransport, state: MonitorState, out: ArrayList<GitCodeEvent>): String {
     var page: Int64 = 1
     while (true) {
         let result = if (kind == "pr") { transport.listPullRequestsPage(repo, page) } else { transport.listIssuesPage(repo, page) }
         if (result.errorKind != "ok") {
             state.setBackoff(repo.fullName(), result.retryAfterMs)
-            break
+            return result.errorKind
         }
         for (event in result.events) {
             out.add(event)
@@ -1928,7 +2064,7 @@ func collectPagedEvents(repo: GitCodeRepo, kind: String, transport: GitCodeHttpT
                 let comments = transport.listCommentsPage(repo, kind, event.itemId, commentPage)
                 if (comments.errorKind != "ok") {
                     state.setBackoff(repo.fullName(), comments.retryAfterMs)
-                    break
+                    return comments.errorKind
                 }
                 for (comment in comments.events) { out.add(comment) }
                 if (comments.events.size < transport.pageSize) { break }
@@ -1938,6 +2074,7 @@ func collectPagedEvents(repo: GitCodeRepo, kind: String, transport: GitCodeHttpT
         if (result.events.size < transport.pageSize) { break }
         page++
     }
+    "ok"
 }
 
 public func parseMcpToolsResponse(body: String): Array<ToolSchema> {
@@ -2055,7 +2192,7 @@ public func parseItemsResponse(body: String, repo: GitCodeRepo, kind: String): A
             let url = firstJsonString(obj, ["html_url", "web_url", "url"])
             let content = if (desc.isEmpty()) { title } else { "${title}\n${desc}" }
             if (!itemId.isEmpty()) {
-                out.add(GitCodeEvent("${repo.fullName()}:${kind}:${itemId}", repo.org, repo.name, kind, itemId, actor, actorUrl(obj), url, content, updatedAtMs: firstJsonInt(obj, ["updated_at_ms", "updatedAtMs"])))
+                out.add(GitCodeEvent(canonicalGitCodeEventId(repo, kind, itemId), repo.org, repo.name, kind, itemId, actor, actorUrl(obj), url, content, updatedAtMs: firstJsonInt(obj, ["updated_at_ms", "updatedAtMs"])))
             }
         }
     } catch (_: Exception) { () }
@@ -2070,7 +2207,7 @@ public func parseCommentsResponse(body: String, repo: GitCodeRepo, kind: String,
             let commentId = firstJsonString(obj, ["id", "note_id", "comment_id"])
             let bodyText = firstJsonString(obj, ["body", "note", "content"])
             if (!commentId.isEmpty()) {
-                out.add(GitCodeEvent("${repo.fullName()}:${kind}:${itemId}:comment:${commentId}", repo.org, repo.name, kind, itemId, actorName(obj), actorUrl(obj), firstJsonString(obj, ["html_url", "web_url", "url"]), bodyText, updatedAtMs: firstJsonInt(obj, ["updated_at_ms", "updatedAtMs"])))
+                out.add(GitCodeEvent(canonicalGitCodeEventId(repo, kind, itemId, commentId: commentId), repo.org, repo.name, kind, itemId, actorName(obj), actorUrl(obj), firstJsonString(obj, ["html_url", "web_url", "url"]), bodyText, updatedAtMs: firstJsonInt(obj, ["updated_at_ms", "updatedAtMs"])))
             }
         }
     } catch (_: Exception) { () }
