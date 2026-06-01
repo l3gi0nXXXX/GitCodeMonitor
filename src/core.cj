@@ -35,6 +35,7 @@ public class MonitorConfig {
     public var mcpEndpoint: String
     public var mcpServiceToken: String
     public var statePath: String
+    public var webhook: WebhookReceiverConfig
     public var notifyNetworkEnabled: Bool
     public var feishuWebhook: String
     public var telegramBotToken: String
@@ -62,6 +63,7 @@ public class MonitorConfig {
         this.mcpEndpoint = ""
         this.mcpServiceToken = ""
         this.statePath = "data/gitcodemonitor-state.json"
+        this.webhook = defaultWebhookReceiverConfigForStatePath(this.statePath)
         this.notifyNetworkEnabled = false
         this.feishuWebhook = ""
         this.telegramBotToken = ""
@@ -105,6 +107,10 @@ public func validateConfig(config: MonitorConfig): String {
     if (!config.dryRun && config.autoReply && config.repoAllowlist.size == 0) {
         return "writeback enabled but repo allowlist missing"
     }
+    let webhookValidation = validateWebhookReceiverConfig(config.webhook)
+    if (!webhookValidation.ok) {
+        return "webhook ${webhookValidation.status}"
+    }
     if (!config.notifyNetworkEnabled && (!config.feishuWebhook.isEmpty() || !config.telegramBotToken.isEmpty())) {
         return "ok"
     }
@@ -127,7 +133,8 @@ public func configSummary(config: MonitorConfig): String {
         "autoReply=${config.autoReply}\n" +
         "allowlist=${joinStrings(config.repoAllowlist, ",")}\n" +
         "notifyNetworkEnabled=${config.notifyNetworkEnabled}\n" +
-        "statePath=${config.statePath}"
+        "statePath=${config.statePath}\n" +
+        webhookConfigSummary(config.webhook)
 }
 
 public class GitCodeEvent {
@@ -810,6 +817,19 @@ public class GitCodeApiClient {
         let kind = if (event.itemKind == "pr") { "pulls" } else { "issues" }
         let json = "{\"body\":\"${jsonEscape(body + "\n\n" + SELF_MARKER)}\"}"
         HttpRequestSpec("POST", withAuthQuery("${baseUrl}/repos/${urlPart(event.org)}/${urlPart(event.repo)}/${kind}/${urlPart(event.itemId)}/comments"), headers: authHeaders().concat([("Content-Type", "application/json")]), body: json)
+    }
+
+    public func createRepoWebhookRequest(repo: GitCodeRepo, hookUrl: String, token: String, events: Array<String>): HttpRequestSpec {
+        let eventItems = ArrayList<String>()
+        for (eventName in events) {
+            eventItems.add("\"${jsonEscape(eventName)}\"")
+        }
+        let body = "{" +
+            "\"url\":\"${jsonEscape(hookUrl)}\"," +
+            "\"token\":\"${jsonEscape(token)}\"," +
+            "\"events\":[${joinStrings(eventItems.toArray(), ",")}]" +
+        "}"
+        HttpRequestSpec("POST", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/hooks"), headers: authHeaders().concat([("Content-Type", "application/json")]), body: body)
     }
 
     private func withAuthQuery(url: String): String {
@@ -2016,6 +2036,10 @@ func applyGitCodeSection(config: MonitorConfig, obj: JsonObject): Unit {
     if (!username.isEmpty()) { config.gitCodeUsername = username }
     let password = firstJsonString(obj, ["password", "gitCodePassword"])
     if (!password.isEmpty()) { config.gitCodePassword = password }
+    match (obj.get("webhook")) {
+        case Some(v) => try { applyWebhookSection(config, v.asObject()) } catch (_: Exception) { () }
+        case None => ()
+    }
 }
 
 func applyFeishuSection(config: MonitorConfig, obj: JsonObject): Unit {
@@ -2043,7 +2067,12 @@ func applyMonitorSection(config: MonitorConfig, obj: JsonObject): Unit {
     let jitter = firstJsonInt(obj, ["jitterSeconds"])
     if (jitter >= 0) { config.jitterSeconds = jitter }
     let statePath = firstJsonString(obj, ["statePath"])
-    if (!statePath.isEmpty()) { config.statePath = statePath }
+    if (!statePath.isEmpty()) {
+        config.statePath = statePath
+        if (config.webhook.queueDir == "data/webhook-queue") {
+            config.webhook = defaultWebhookReceiverConfigForStatePath(config.statePath)
+        }
+    }
     let transport = firstJsonString(obj, ["transport", "httpTransport"])
     if (!transport.isEmpty()) { config.httpTransport = transport }
     config.dryRun = firstJsonBool(obj, ["dryRun"], config.dryRun)
@@ -2053,6 +2082,57 @@ func applyMonitorSection(config: MonitorConfig, obj: JsonObject): Unit {
     if (orgs.size > 0) { config.orgs = orgs }
     let allowlist = firstJsonStringArray(obj, ["repoAllowlist", "allowlist"])
     if (allowlist.size > 0) { config.repoAllowlist = allowlist }
+}
+
+func applyWebhookSection(config: MonitorConfig, obj: JsonObject): Unit {
+    let endpoints = ArrayList<WebhookEndpointConfig>()
+    match (obj.get("endpoints")) {
+        case Some(value) =>
+            try {
+                for (item in value.asArray().getItems()) {
+                    try {
+                        endpoints.add(parseWebhookEndpoint(item.asObject()))
+                    } catch (_inner: Exception) { () }
+                }
+            } catch (_: Exception) { () }
+        case None => ()
+    }
+    let enabled = firstJsonBool(obj, ["enabled"], config.webhook.enabled)
+    let bindHost = firstNonEmpty([firstJsonString(obj, ["bindHost", "host"]), config.webhook.bindHost])
+    let port = firstPositiveOrDefault(firstJsonInt(obj, ["port"]), config.webhook.port)
+    let publicBaseUrl = firstNonEmpty([firstJsonString(obj, ["publicBaseUrl", "publicUrl"]), config.webhook.publicBaseUrl])
+    let maxBodyBytes = firstPositiveOrDefault(firstJsonInt(obj, ["maxBodyBytes"]), config.webhook.maxBodyBytes)
+    let queueDir = firstNonEmpty([firstJsonString(obj, ["queueDir"]), config.webhook.queueDir])
+    let deadLetterDir = firstJsonString(obj, ["deadLetterDir"])
+    let ackMode = firstNonEmpty([firstJsonString(obj, ["ackMode"]), config.webhook.ackMode])
+    config.webhook = WebhookReceiverConfig(
+        enabled: enabled,
+        bindHost: bindHost,
+        port: port,
+        publicBaseUrl: publicBaseUrl,
+        maxBodyBytes: maxBodyBytes,
+        queueDir: queueDir,
+        deadLetterDir: if (deadLetterDir.isEmpty()) { "" } else { deadLetterDir },
+        ackMode: ackMode,
+        endpoints: if (endpoints.size > 0) { endpoints.toArray() } else { config.webhook.endpoints },
+        processor: config.webhook.processor,
+        reconcile: config.webhook.reconcile
+    )
+}
+
+func parseWebhookEndpoint(obj: JsonObject): WebhookEndpointConfig {
+    WebhookEndpointConfig(
+        firstJsonString(obj, ["id", "name"]),
+        firstJsonString(obj, ["path"]),
+        token: firstJsonString(obj, ["token", "secretToken"]),
+        signatureSecret: firstJsonString(obj, ["signatureSecret", "signingSecret"]),
+        allowedEvents: if (firstJsonStringArray(obj, ["allowedEvents", "events"]).size > 0) { firstJsonStringArray(obj, ["allowedEvents", "events"]) } else { ["Merge Request Hook", "Issue Hook", "Note Hook"] },
+        enabled: firstJsonBool(obj, ["enabled"], true)
+    )
+}
+
+func firstPositiveOrDefault(value: Int64, fallback: Int64): Int64 {
+    if (value > 0) { value } else { fallback }
 }
 
 func gitCodeAuthPresent(config: MonitorConfig): Bool {

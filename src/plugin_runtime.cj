@@ -639,6 +639,63 @@ public func handleGcmPluginInputLineWithJobs(line: String, config: MonitorConfig
                 return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, cancelled.status, gcmJobErrorPayload(cancelled.status, jobId: jobId)))
             }
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "cancel_requested", "{\"ok\":true,\"status\":\"cancel_requested\",\"jobId\":\"${jsonEscape(jobId)}\",\"summary\":\"GitCode scan cancellation requested\"}"))
+        case "gitcode.webhook.status" =>
+            let queue = WebhookQueue(config.webhook.queueDir)
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", webhookStatusPayload(config, queue)))
+        case "gitcode.webhook.dead_letter_list" =>
+            let queue = WebhookQueue(config.webhook.queueDir)
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", deadLetterListPayload(queue)))
+        case "gitcode.webhook.dead_letter_inspect" =>
+            let deliveryId = parseWebhookDeliveryIdPayload(frame.payload)
+            if (deliveryId.isEmpty()) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "delivery_payload_invalid", "{\"ok\":false,\"status\":\"delivery_payload_invalid\"}"))
+            }
+            let queue = WebhookQueue(config.webhook.queueDir)
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", deadLetterInspectPayload(queue, deliveryId)))
+        case "gitcode.webhook.replay" =>
+            let deliveryId = parseWebhookDeliveryIdPayload(frame.payload)
+            if (deliveryId.isEmpty()) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "delivery_payload_invalid", "{\"ok\":false,\"status\":\"delivery_payload_invalid\"}"))
+            }
+            let queue = WebhookQueue(config.webhook.queueDir)
+            let replay = replayWebhookDelivery(queue, deliveryId)
+            GcmPluginFrameHandleResult(replay.ok, frame: gcmPluginResponseFrame(frame, replay.ok, replay.status, "{\"ok\":${replay.ok},\"status\":\"${jsonEscape(replay.status)}\",\"deliveryId\":\"${jsonEscape(sanitizeDeliveryIdForPath(deliveryId))}\"}"))
+        case "gitcode.webhook.cancel" =>
+            let deliveryId = parseWebhookDeliveryIdPayload(frame.payload)
+            if (deliveryId.isEmpty()) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "delivery_payload_invalid", "{\"ok\":false,\"status\":\"delivery_payload_invalid\"}"))
+            }
+            let queue = WebhookQueue(config.webhook.queueDir)
+            let cancelled = cancelWebhookDelivery(queue, deliveryId)
+            GcmPluginFrameHandleResult(cancelled.ok, frame: gcmPluginResponseFrame(frame, cancelled.ok, cancelled.status, "{\"ok\":${cancelled.ok},\"status\":\"${jsonEscape(cancelled.status)}\",\"deliveryId\":\"${jsonEscape(sanitizeDeliveryIdForPath(deliveryId))}\"}"))
+        case "gitcode.webhook.reconcile_hooks" =>
+            let parsed = parsePluginPayloadObject(frame.payload)
+            if (!parsed.ok) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, parsed.status, "{\"ok\":false,\"status\":\"${jsonEscape(parsed.status)}\"}"))
+            }
+            let apply = pluginPayloadBoolField(parsed.payloadObject, "apply", defaultValue: false)
+            if (!apply.ok) {
+                return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, apply.status, "{\"ok\":false,\"status\":\"${jsonEscape(apply.status)}\"}"))
+            }
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", hookReconcilePayload(config, apply.value)))
+        case "gitcode.webhook.reconcile_events" =>
+            let mode = scanPayloadMode(frame.payload)
+            if (mode == "async") {
+                let parsed = parseGcmAsyncScanPayload(frame.payload)
+                if (!parsed.ok) {
+                    return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, parsed.status, gcmJobErrorPayload(parsed.status, diagnostic: parsed.diagnostic)))
+                }
+                let created = jobs.createOrGet(parsed.payload)
+                if (!created.ok) {
+                    return GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, created.status, gcmJobErrorPayload(created.status, jobId: parsed.payload.jobId)))
+                }
+                return GcmPluginFrameHandleResult(
+                    true,
+                    frame: gcmPluginResponseFrame(frame, true, "accepted", gcmJobAcceptedPayload(created.job, created.alreadyRunning)),
+                    asyncJobId: if (created.alreadyRunning) { "" } else { created.job.jobId }
+                )
+            }
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "accepted", eventReconcilePayload(config)))
         case "gitcode.writeback.apply_result" =>
             let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state))
             GcmPluginFrameHandleResult(applied.ok, frame: gcmPluginResponseFrame(frame, applied.ok, applied.decision.reason, "{\"ok\":${applied.ok},\"status\":\"${applied.decision.reason}\",\"writerCalled\":${applied.writerCalled},\"replyUrl\":\"${jsonEscape(applied.replyUrl)}\"}"))
@@ -794,6 +851,21 @@ func parseGcmJobIdPayload(payload: String): String {
     let jobId = pluginPayloadStringField(parsed.payloadObject, "jobId", maxBytes: 128)
     if (!jobId.ok || !isGcmJobIdSafe(jobId.value)) { return "" }
     jobId.value
+}
+
+func parseWebhookDeliveryIdPayload(payload: String): String {
+    let parsed = parsePluginPayloadObject(payload)
+    if (!parsed.ok) { return "" }
+    let deliveryId = pluginPayloadStringField(parsed.payloadObject, "deliveryId", maxBytes: 256)
+    if (!deliveryId.ok || !isWebhookDeliveryIdSafe(deliveryId.value)) { return "" }
+    deliveryId.value
+}
+
+func isWebhookDeliveryIdSafe(value: String): Bool {
+    let id = value.trimAscii()
+    if (id.isEmpty()) { return false }
+    if (id.contains("/") || id.contains("\\") || id.contains("..") || id.contains(" ")) { return false }
+    true
 }
 
 private func pluginArgValue(args: Array<String>, key: String): ?String {

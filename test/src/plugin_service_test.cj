@@ -25,9 +25,9 @@ public class GitCodeMonitorPluginServiceTest {
     }
 
     @TestCase
-    public func buildGitCodeMonitorCapabilityDeclarationsContainsFourteenRecords(): Unit {
+    public func buildGitCodeMonitorCapabilityDeclarationsContainsTwentyOneRecords(): Unit {
         let records = buildGitCodeMonitorCapabilityDeclarations()
-        @Expect(records.size, 14)
+        @Expect(records.size, 21)
         let check = validateGitCodeMonitorCapabilitySet(records)
         @Expect(check.ok, true)
         @Expect(check.missingCapabilityIds.size, 0)
@@ -36,17 +36,19 @@ public class GitCodeMonitorPluginServiceTest {
         @Expect(records[0].direction, "metis-to-gcm")
         @Expect(records[2].capabilityId, "gitcode.monitor.job_status")
         @Expect(records[3].capabilityId, "gitcode.monitor.cancel_job")
-        @Expect(records[5].capabilityId, "gitcode.monitor.scan_completed")
-        @Expect(records[10].capabilityId, "gitcode.agent.draft_request")
-        @Expect(records[10].requiredHostApis[0], "host.agent.invoke")
-        @Expect(records[11].capabilityId, "gitcode.notification.generated_reply")
-        @Expect(records[11].requiredHostApis[0], "host.notification.publish")
+        @Expect(records[4].capabilityId, "gitcode.webhook.status")
+        @Expect(records[10].capabilityId, "gitcode.webhook.reconcile_events")
+        @Expect(records[12].capabilityId, "gitcode.monitor.scan_completed")
+        @Expect(records[17].capabilityId, "gitcode.agent.draft_request")
+        @Expect(records[17].requiredHostApis[0], "host.agent.invoke")
+        @Expect(records[18].capabilityId, "gitcode.notification.generated_reply")
+        @Expect(records[18].requiredHostApis[0], "host.notification.publish")
     }
 
     @TestCase
     public func validateGitCodeMonitorCapabilitySetReportsMissingRecordAndAllowsExperimental(): Unit {
         let records = buildGitCodeMonitorCapabilityDeclarations()
-        records.remove(at: 12)
+        records.remove(at: 19)
         records.add(ServiceCapabilityRecord("gitcode.experimental.trace", "event", direction: "gcm-to-metis"))
         let check = validateGitCodeMonitorCapabilitySet(records)
         @Expect(check.ok, false)
@@ -58,7 +60,7 @@ public class GitCodeMonitorPluginServiceTest {
     @TestCase
     public func validateGitCodeMonitorCapabilitySetMarksMissingHostApiDegraded(): Unit {
         let records = buildGitCodeMonitorCapabilityDeclarations()
-        records.remove(at: 11)
+        records.remove(at: 18)
         records.add(ServiceCapabilityRecord("gitcode.notification.generated_reply", "notificationTopic"))
         let check = validateGitCodeMonitorCapabilitySet(records)
         @Expect(check.ok, true)
@@ -67,14 +69,16 @@ public class GitCodeMonitorPluginServiceTest {
     }
 
     @TestCase
-    public func manifestContainsServiceSchemaAndFourteenCapabilitiesWithoutSecrets(): Unit {
+    public func manifestContainsServiceSchemaAndTwentyOneCapabilitiesWithoutSecrets(): Unit {
         let manifest = buildGitCodeMonitorServicePluginManifest()
         let root = JsonValue.fromStr(manifest).asObject()
         @Expect(root.get("schema").getOrThrow().asString().getValue(), "metis.servicePlugin.v1")
         @Expect(root.get("pluginId").getOrThrow().asString().getValue(), "gitcode-monitor")
         @Expect(root.get("kind").getOrThrow().asString().getValue(), "service")
-        @Expect(root.get("capabilityDeclarations").getOrThrow().asArray().getItems().size, 14)
+        @Expect(root.get("capabilityDeclarations").getOrThrow().asArray().getItems().size, 21)
         @Expect(manifest.contains("gitcode.monitor.scan_once"), true)
+        @Expect(manifest.contains("gitcode.webhook.status"), true)
+        @Expect(manifest.contains("gitcode.webhook.reconcile_events"), true)
         @Expect(manifest.contains("gitcode.monitor.job_status"), true)
         @Expect(manifest.contains("gitcode.monitor.scan_completed"), true)
         @Expect(manifest.contains("gitcode.writeback.audit"), true)
@@ -102,11 +106,15 @@ public class GitCodeMonitorPluginServiceTest {
         let checkedIn = JsonValue.fromStr(checkedInText).asObject()
         let checkedInEntry = checkedIn.get("entry").getOrThrow().asObject()
         let checkedInArgs = jsonStringArray(checkedInEntry.get("args").getOrThrow())
+        let checkedInCapabilities = checkedIn.get("capabilityDeclarations").getOrThrow().asArray().getItems()
         @Expect(checkedInEntry.get("command").getOrThrow().asString().getValue(), generatedEntry.get("command").getOrThrow().asString().getValue())
         @Expect(checkedInArgs.size, generatedArgs.size)
+        @Expect(checkedInCapabilities.size, 21)
         for (i in 0..generatedArgs.size) {
             @Expect(checkedInArgs[i], generatedArgs[i])
         }
+        @Expect(checkedInText.contains("gitcode.webhook.status"), true)
+        @Expect(checkedInText.contains("gitcode.webhook.reconcile_events"), true)
         @Expect(checkedInText.contains("token"), false)
         @Expect(checkedInText.contains("Authorization"), false)
         @Expect(checkedInText.contains("/Users/"), false)
@@ -117,7 +125,7 @@ public class GitCodeMonitorPluginServiceTest {
         let initLine = readFirstExisting(["test/fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl", "../test/fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl", "fixtures/service_plugin/stdio_protocol/valid_initialize.jsonl"])
         let scanLine = readFirstExisting(["test/fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl", "../test/fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl", "fixtures/service_plugin/stdio_protocol/valid_scan_response.jsonl"])
         let noisy = readFirstExisting(["test/fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt", "../test/fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt", "fixtures/service_plugin/stdio_protocol/noisy_stdout_before_response.txt"])
-        @Expect(initLine, "{\"type\":\"response\",\"frameId\":\"initialize\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ok\",\"capabilities\":14}}")
+        @Expect(initLine, "{\"type\":\"response\",\"frameId\":\"initialize\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ok\",\"capabilities\":21}}")
         @Expect(scanLine, "{\"type\":\"response\",\"frameId\":\"response-scan-1\",\"serviceId\":\"gitcode-monitor\",\"method\":\"invokeCapability\",\"capabilityId\":\"gitcode.monitor.scan_once\",\"correlationId\":\"corr-scan-1\",\"payload\":{\"ok\":true,\"status\":\"ok\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"stateSaved\":true}}")
         let noisyLines = noisy.split("\n")
         @Expect(noisyLines.size, 3)

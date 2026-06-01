@@ -55,6 +55,13 @@ public func requiredGitCodeMonitorCapabilityIds(): Array<String> {
         "gitcode.monitor.scan_once",
         "gitcode.monitor.job_status",
         "gitcode.monitor.cancel_job",
+        "gitcode.webhook.status",
+        "gitcode.webhook.dead_letter_list",
+        "gitcode.webhook.dead_letter_inspect",
+        "gitcode.webhook.replay",
+        "gitcode.webhook.cancel",
+        "gitcode.webhook.reconcile_hooks",
+        "gitcode.webhook.reconcile_events",
         "gitcode.monitor.scan_progress",
         "gitcode.monitor.scan_completed",
         "gitcode.monitor.scan_failed",
@@ -100,6 +107,60 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         description: "Request cancellation for a GitCode scan job",
         inputSchema: "schemas/gitcode.monitor.cancel_job.input.json",
         outputSchema: "schemas/gitcode.monitor.cancel_job.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.status",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Read GitCode webhook receiver, queue, and processor status",
+        outputSchema: "schemas/gitcode.webhook.status.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.dead_letter_list",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "List GitCode webhook dead-letter deliveries",
+        outputSchema: "schemas/gitcode.webhook.dead_letter_list.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.dead_letter_inspect",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Inspect one GitCode webhook dead-letter delivery",
+        inputSchema: "schemas/gitcode.webhook.delivery.input.json",
+        outputSchema: "schemas/gitcode.webhook.dead_letter_inspect.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.replay",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Replay one GitCode webhook dead-letter or cancelled delivery",
+        inputSchema: "schemas/gitcode.webhook.delivery.input.json",
+        outputSchema: "schemas/gitcode.webhook.replay.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.cancel",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Cancel one pending or processing GitCode webhook delivery",
+        inputSchema: "schemas/gitcode.webhook.delivery.input.json",
+        outputSchema: "schemas/gitcode.webhook.cancel.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.reconcile_hooks",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Compare configured GitCode webhook endpoints with repository hooks",
+        inputSchema: "schemas/gitcode.webhook.reconcile_hooks.input.json",
+        outputSchema: "schemas/gitcode.webhook.reconcile_hooks.output.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.webhook.reconcile_events",
+        "controlAction",
+        direction: "metis-to-gcm",
+        description: "Start a bounded scan reconciliation job for missed webhook events",
+        inputSchema: "schemas/gitcode.webhook.reconcile_events.input.json",
+        outputSchema: "schemas/gitcode.webhook.reconcile_events.output.json"
     ))
     records.add(ServiceCapabilityRecord(
         "gitcode.monitor.scan_progress",

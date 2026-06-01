@@ -47,7 +47,7 @@ public class GitCodeMonitorPluginRuntimeTest {
         let initResult = initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: path, hostApis: ["host.agent.invoke"]))
         @Expect(initResult.ok, true)
         @Expect(initResult.serviceId, GCM_SERVICE_PLUGIN_ID)
-        @Expect(initResult.capabilities.size, 14)
+        @Expect(initResult.capabilities.size, 21)
         @Expect(initResult.diagnostic.contains("fake-token"), false)
         @Expect(initializeGcmPlugin(ServiceInitializeRequest("2.0", configRef: path)).status, "incompatible_protocol")
         @Expect(initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: "")).status, "missing_config_ref")
