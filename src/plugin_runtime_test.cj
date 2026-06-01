@@ -1,12 +1,19 @@
 package gitcodemonitor
 
 import std.fs.{Directory, File, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 
 @Test
 public class GitCodeMonitorPluginRuntimeTest {
     private func tempConfigPath(name: String): String {
         Path("/tmp").join("${name}.json").toString()
+    }
+
+    private func tempRuntimeDir(name: String): Path {
+        let dir = Path("/tmp").join("${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        Directory.create(dir, recursive: true)
+        dir
     }
 
     private func writeConfig(path: String, text!: String = "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"data/state.json\"},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\"}}"): Unit {
@@ -53,6 +60,69 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: "")).status, "missing_config_ref")
         @Expect(loadGcmRuntimeConfig("/tmp/does-not-exist-gcm-plugin.json").status, "config_missing")
         if (exists(Path(path))) { remove(Path(path)) }
+    }
+
+    @TestCase
+    public func initializeReportsWebhookReceiverDisabledWithoutSecretLeaks(): Unit {
+        let dir = tempRuntimeDir("gcm-plugin-init-webhook-disabled")
+        let path = dir.join("gcm.json").toString()
+        writeConfig(
+            path,
+            text: "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"${dir.join("state.json").toString()}\"},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\",\"webhook\":{\"enabled\":false}}}"
+        )
+        let initResult = initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: path))
+        @Expect(initResult.ok, true)
+        @Expect(initResult.status, "ok")
+        @Expect(initResult.diagnostic.contains("webhookReceiver.status=disabled"), true)
+        @Expect(initResult.diagnostic.contains("fake-token"), false)
+        let payload = gcmInitializeResponsePayload(initResult)
+        @Expect(payload.contains("\"webhookReceiverStatus\":\"disabled\""), true)
+        @Expect(payload.contains("fake-token"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func initializeReportsWebhookReceiverRunningWithRedactedSummary(): Unit {
+        let dir = tempRuntimeDir("gcm-plugin-init-webhook-running")
+        let queueDir = dir.join("queue").toString()
+        let path = dir.join("gcm.json").toString()
+        writeConfig(
+            path,
+            text: "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"${dir.join("state.json").toString()}\"},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\",\"webhook\":{\"enabled\":true,\"bindHost\":\"127.0.0.1\",\"port\":18080,\"queueDir\":\"${queueDir}\",\"endpoints\":[{\"id\":\"main\",\"path\":\"/webhooks/gitcode/main\",\"token\":\"receiver-token\",\"signatureSecret\":\"signature-secret\"}]}}}"
+        )
+        let initResult = initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: path))
+        @Expect(initResult.ok, true)
+        @Expect(initResult.status, "ok")
+        @Expect(initResult.diagnostic.contains("webhookReceiver.status=running"), true)
+        let payload = gcmInitializeResponsePayload(initResult)
+        @Expect(payload.contains("\"webhookReceiverStatus\":\"running\""), true)
+        @Expect(payload.contains("\"webhookBind\":\"127.0.0.1:18080\""), true)
+        @Expect(payload.contains("\"webhookEndpointCount\":1"), true)
+        @Expect(payload.contains("\"webhookQueueDir\""), true)
+        @Expect(payload.contains("receiver-token"), false)
+        @Expect(payload.contains("signature-secret"), false)
+        @Expect(payload.contains("fake-token"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func initializeDegradesWebhookReceiverWithoutCrashingWhenSecretMissing(): Unit {
+        let dir = tempRuntimeDir("gcm-plugin-init-webhook-degraded")
+        let path = dir.join("gcm.json").toString()
+        writeConfig(
+            path,
+            text: "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"${dir.join("state.json").toString()}\"},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\",\"webhook\":{\"enabled\":true,\"bindHost\":\"127.0.0.1\",\"port\":18080,\"queueDir\":\"${dir.join("queue").toString()}\",\"endpoints\":[{\"id\":\"main\",\"path\":\"/webhooks/gitcode/main\"}]}}}"
+        )
+        let initResult = initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: path))
+        @Expect(initResult.ok, true)
+        @Expect(initResult.status, "capability_degraded")
+        @Expect(initResult.diagnostic.contains("webhookReceiver.status=degraded"), true)
+        @Expect(initResult.diagnostic.contains("missing_endpoint_secret"), true)
+        let payload = gcmInitializeResponsePayload(initResult)
+        @Expect(payload.contains("\"webhookReceiverStatus\":\"degraded\""), true)
+        @Expect(payload.contains("missing_endpoint_secret"), true)
+        @Expect(payload.contains("fake-token"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
     @TestCase

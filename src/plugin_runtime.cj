@@ -25,6 +25,7 @@ public class ServiceInitializeResult {
     public let protocolVersion: String
     public let capabilities: ArrayList<ServiceCapabilityRecord>
     public let diagnostic: String
+    public let webhookReceiver: WebhookReceiverRuntimeStatus
 
     public init(
         ok: Bool,
@@ -32,7 +33,8 @@ public class ServiceInitializeResult {
         serviceId!: String = GCM_SERVICE_PLUGIN_ID,
         protocolVersion!: String = GCM_SERVICE_PROTOCOL_VERSION,
         capabilities!: ArrayList<ServiceCapabilityRecord> = ArrayList<ServiceCapabilityRecord>(),
-        diagnostic!: String = ""
+        diagnostic!: String = "",
+        webhookReceiver!: WebhookReceiverRuntimeStatus = WebhookReceiverRuntimeStatus("unknown")
     ) {
         this.ok = ok
         this.status = status
@@ -40,6 +42,7 @@ public class ServiceInitializeResult {
         this.protocolVersion = protocolVersion
         this.capabilities = capabilities
         this.diagnostic = diagnostic
+        this.webhookReceiver = webhookReceiver
     }
 }
 
@@ -419,18 +422,18 @@ public func gcmPluginMain(args: Array<String>): Int64 {
     let configRef = pluginArgValue(args, "--config") ?? pluginArgValue(args, "configRef") ?? defaultConfigPath()
     let initResult = initializeGcmPlugin(ServiceInitializeRequest(GCM_SERVICE_PROTOCOL_VERSION, configRef: configRef, hostApis: ["host.agent.invoke", "host.audit.append"]))
     if (!initResult.ok) {
-        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${initResult.status}\"}"))
+        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(initResult)))
         return 2
     }
     let loaded = loadGcmRuntimeConfig(configRef)
     if (!loaded.ok) {
-        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${loaded.status}\"}"))
+        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":false,\"status\":\"${jsonEscape(loaded.status)}\"}"))
         return 2
     }
     let runtime = RuntimeContainer(loaded.config, pluginStdioMode: true)
     let state = runtime.store.load()
     let jobs = GcmScanJobStore(maxConcurrent: 1)
-    writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: "{\"ok\":true,\"status\":\"${initResult.status}\",\"capabilities\":${initResult.capabilities.size}}"))
+    writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(initResult)))
     let stdin = getStdIn()
     while (true) {
         let line = try {
@@ -473,7 +476,26 @@ public func initializeGcmPlugin(request: ServiceInitializeRequest): ServiceIniti
     }
     let caps = buildGitCodeMonitorCapabilities(loaded.config)
     let check = validateGitCodeMonitorCapabilitySet(caps)
-    ServiceInitializeResult(check.ok, if (check.ok) { "ok" } else { "capability_degraded" }, capabilities: caps, diagnostic: pluginJoin(check.diagnostics, ","))
+    let receiver = evaluateWebhookReceiverRuntime(loaded.config)
+    let status = if (!check.ok || receiver.status == "degraded") { "capability_degraded" } else { "ok" }
+    let diagnostics = ArrayList<String>()
+    if (!check.ok) {
+        let capabilityDiagnostics = pluginJoin(check.diagnostics, ",")
+        if (!capabilityDiagnostics.isEmpty()) { diagnostics.add(capabilityDiagnostics) }
+    }
+    diagnostics.add(webhookReceiverRuntimeDiagnostic(receiver))
+    ServiceInitializeResult(true, status, capabilities: caps, diagnostic: pluginJoin(diagnostics.toArray(), ","), webhookReceiver: receiver)
+}
+
+public func gcmInitializeResponsePayload(result: ServiceInitializeResult): String {
+    "{\"ok\":${result.ok}," +
+        "\"status\":\"${jsonEscape(result.status)}\"," +
+        "\"capabilities\":${result.capabilities.size}," +
+        "\"webhookReceiverStatus\":\"${jsonEscape(result.webhookReceiver.status)}\"," +
+        "\"webhookBind\":\"${jsonEscape(result.webhookReceiver.bind)}\"," +
+        "\"webhookEndpointCount\":${result.webhookReceiver.endpointCount}," +
+        "\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(result.webhookReceiver.queueDir).text)}\"," +
+        "\"lastError\":\"${jsonEscape(result.webhookReceiver.lastError)}\"}"
 }
 
 public func runGcmPluginLoop(context: GcmPluginContext): Int64 {

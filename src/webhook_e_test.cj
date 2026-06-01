@@ -191,6 +191,7 @@ public class GitCodeWebhookETest {
         let queue = WebhookQueue(config.webhook.queueDir)
         @Expect(queue.enqueue(GitCodeWebhookDelivery("dlq-1", "main", "Issue Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), "{}".toArray()).ok, true)
         let status = renderWebhookStatus(config, queue)
+        @Expect(status.contains("receiver=running"), true)
         @Expect(status.contains("pending=1"), true)
         @Expect(status.contains("token-secret"), false)
         let client = GitCodeApiClient(token: "gitcode-token")
@@ -208,6 +209,8 @@ public class GitCodeWebhookETest {
         let frame = ServiceFrame("request", "webhook-status-1", GCM_SERVICE_PLUGIN_ID, method: "invokeCapability", capabilityId: "gitcode.webhook.status", correlationId: "corr-webhook-status", payload: "{}")
         let handled = handleGcmPluginInputLine(encodeServiceFrame(frame).trimAscii(), config, runtime, state)
         @Expect(handled.ok, true)
+        @Expect(handled.frame.payload.contains("\"receiver\":\"running\""), true)
+        @Expect(handled.frame.payload.contains("\"lastError\":\"\""), true)
         @Expect(handled.frame.payload.contains("\"summary\""), true)
         @Expect(handled.frame.payload.contains("token-secret"), false)
         let reconcilePayload = "{" +
@@ -223,6 +226,59 @@ public class GitCodeWebhookETest {
         @Expect(reconcileHandled.ok, true)
         @Expect(reconcileHandled.asyncJobId, "gcm-reconcile-1")
         @Expect(reconcileHandled.frame.payload.contains("gcm-reconcile-1"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func webhookStatusReflectsDisabledRunningAndDegradedRuntimeSemantics(): Unit {
+        let disabledDir = tempDir("gcm-webhook-status-disabled")
+        let disabled = defaultConfig()
+        disabled.webhook = WebhookReceiverConfig(enabled: false, queueDir: disabledDir.join("queue").toString())
+        let disabledQueue = WebhookQueue(disabled.webhook.queueDir)
+        let disabledPayload = webhookStatusPayload(disabled, disabledQueue)
+        @Expect(disabledPayload.contains("\"receiver\":\"disabled\""), true)
+        @Expect(disabledPayload.contains("\"pending\":0"), true)
+
+        let runningDir = tempDir("gcm-webhook-status-running")
+        let running = enabledConfig(runningDir.join("queue").toString())
+        let runningQueue = WebhookQueue(running.webhook.queueDir)
+        @Expect(runningQueue.enqueue(GitCodeWebhookDelivery("pending-1", "main", "Issue Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), "{}".toArray()).ok, true)
+        let runningPayload = webhookStatusPayload(running, runningQueue)
+        @Expect(runningPayload.contains("\"receiver\":\"running\""), true)
+        @Expect(runningPayload.contains("\"pending\":1"), true)
+        @Expect(runningPayload.contains("token-secret"), false)
+
+        let degradedDir = tempDir("gcm-webhook-status-degraded")
+        let degraded = enabledConfig(degradedDir.join("queue").toString())
+        degraded.webhook = WebhookReceiverConfig(
+            enabled: true,
+            bindHost: "127.0.0.1",
+            port: 18080,
+            queueDir: degraded.webhook.queueDir,
+            endpoints: [WebhookEndpointConfig("main", "/webhooks/gitcode/main")]
+        )
+        let degradedPayload = webhookStatusPayload(degraded, WebhookQueue(degraded.webhook.queueDir))
+        @Expect(degradedPayload.contains("\"receiver\":\"degraded\""), true)
+        @Expect(degradedPayload.contains("missing_endpoint_secret"), true)
+
+        try { remove(disabledDir, recursive: true) } catch (_: Exception) { () }
+        try { remove(runningDir, recursive: true) } catch (_: Exception) { () }
+        try { remove(degradedDir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func webhookRuntimeStatusDegradesWhenQueueDirCannotBeInitialized(): Unit {
+        let dir = tempDir("gcm-webhook-status-queue-unavailable")
+        let queuePath = dir.join("queue-file")
+        File.writeTo(queuePath, "not-a-directory".toArray())
+        let config = enabledConfig(queuePath.toString())
+        let runtime = evaluateWebhookReceiverRuntime(config)
+        @Expect(runtime.status, "degraded")
+        @Expect(runtime.lastError, "queue_unavailable")
+        let payload = webhookStatusPayload(config, WebhookQueue(config.webhook.queueDir))
+        @Expect(payload.contains("\"receiver\":\"degraded\""), true)
+        @Expect(payload.contains("queue_unavailable"), true)
+        @Expect(payload.contains("token-secret"), false)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 }

@@ -123,12 +123,14 @@ public func cancelWebhookDelivery(queue: WebhookQueue, deliveryId: String): Webh
 }
 
 public func renderWebhookStatus(config: MonitorConfig, queue: WebhookQueue): String {
-    let receiver = if (config.webhook.enabled) { "configured" } else { "disabled" }
-    "GitCode Webhook status=${receiver} pending=${queue.countByStatus("pending")} processing=${queue.countByStatus("processing")} processed=${queue.countByStatus("processed")} deadLetter=${queue.countByStatus("dead-letter")} cancelled=${queue.countByStatus("cancelled")}"
+    let receiver = evaluateWebhookReceiverRuntime(config)
+    let errorPart = if (receiver.lastError.isEmpty()) { "" } else { " lastError=${receiver.lastError}" }
+    "GitCode Webhook receiver=${receiver.status} pending=${queue.countByStatus("pending")} processing=${queue.countByStatus("processing")} processed=${queue.countByStatus("processed")} deadLetter=${queue.countByStatus("dead-letter")} cancelled=${queue.countByStatus("cancelled")}${errorPart}"
 }
 
 public func webhookStatusPayload(config: MonitorConfig, queue: WebhookQueue): String {
-    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${if (config.webhook.enabled) { "configured" } else { "disabled" }}\",\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue))}\"}"
+    let receiver = evaluateWebhookReceiverRuntime(config)
+    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue))}\"}"
 }
 
 public func deadLetterListPayload(queue: WebhookQueue): String {
