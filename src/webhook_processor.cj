@@ -46,7 +46,15 @@ public class WebhookHookReconcileResult {
     }
 }
 
-public func processWebhookBatch(config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState, queue: WebhookQueue, nowMs!: Int64 = DateTime.now().toUnixTimeStamp().toMilliseconds(), maxItems!: Int64 = 20): WebhookBatchResult {
+public func processWebhookBatch(
+    config: MonitorConfig,
+    runtime: RuntimeContainer,
+    state: MonitorState,
+    queue: WebhookQueue,
+    nowMs!: Int64 = DateTime.now().toUnixTimeStamp().toMilliseconds(),
+    maxItems!: Int64 = 20,
+    eventWriter!: ?GcmPluginStdioWriter = None<GcmPluginStdioWriter>
+): WebhookBatchResult {
     if (!config.webhook.processor.enabled) {
         return WebhookBatchResult(true, "processor_disabled")
     }
@@ -80,6 +88,12 @@ public func processWebhookBatch(config: MonitorConfig, runtime: RuntimeContainer
             let _ = queue.markRetry(delivery.deliveryId, "runtime_failed", nowMs + 60000)
             retried++
         } else {
+            if (result.newEvents > 0) {
+                match (eventWriter) {
+                    case Some(writer) => emitGcmAcceptedScanEvent("webhook-${sanitizeDeliveryIdForPath(delivery.deliveryId)}", parsed.event, writer)
+                    case None => ()
+                }
+            }
             let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)
             processed++
         }
@@ -122,15 +136,31 @@ public func cancelWebhookDelivery(queue: WebhookQueue, deliveryId: String): Webh
     }
 }
 
-public func renderWebhookStatus(config: MonitorConfig, queue: WebhookQueue): String {
-    let receiver = evaluateWebhookReceiverRuntime(config)
+public func renderWebhookStatus(
+    config: MonitorConfig,
+    queue: WebhookQueue,
+    listenerSnapshot!: ?WebhookHttpServerSnapshot = None<WebhookHttpServerSnapshot>,
+    processorSnapshot!: ?WebhookProcessorLoopSnapshot = None<WebhookProcessorLoopSnapshot>
+): String {
+    let receiver = evaluateWebhookReceiverRuntime(config, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot)
     let errorPart = if (receiver.lastError.isEmpty()) { "" } else { " lastError=${receiver.lastError}" }
-    "GitCode Webhook receiver=${receiver.status} pending=${queue.countByStatus("pending")} processing=${queue.countByStatus("processing")} processed=${queue.countByStatus("processed")} deadLetter=${queue.countByStatus("dead-letter")} cancelled=${queue.countByStatus("cancelled")}${errorPart}"
+    "GitCode Webhook receiver=${receiver.status} listener=${receiver.listenerStatus} processor=${receiver.processorStatus} pending=${queue.countByStatus("pending")} processing=${queue.countByStatus("processing")} processed=${queue.countByStatus("processed")} deadLetter=${queue.countByStatus("dead-letter")} cancelled=${queue.countByStatus("cancelled")}${errorPart}"
 }
 
-public func webhookStatusPayload(config: MonitorConfig, queue: WebhookQueue): String {
-    let receiver = evaluateWebhookReceiverRuntime(config)
-    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue))}\"}"
+public func webhookStatusPayload(
+    config: MonitorConfig,
+    queue: WebhookQueue,
+    listenerSnapshot!: ?WebhookHttpServerSnapshot = None<WebhookHttpServerSnapshot>,
+    processorSnapshot!: ?WebhookProcessorLoopSnapshot = None<WebhookProcessorLoopSnapshot>
+): String {
+    let receiver = evaluateWebhookReceiverRuntime(config, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot)
+    let processorDetails = match (processorSnapshot) {
+        case Some(snapshot) =>
+            "\"lastBatchAtMs\":${snapshot.lastBatchAtMs},\"lastBatchProcessed\":${snapshot.lastBatchProcessed},\"lastBatchIgnored\":${snapshot.lastBatchIgnored},\"lastBatchRetried\":${snapshot.lastBatchRetried},\"lastBatchDeadLettered\":${snapshot.lastBatchDeadLettered},\"emptyTickCount\":${snapshot.emptyTickCount},"
+        case None =>
+            "\"lastBatchAtMs\":0,\"lastBatchProcessed\":0,\"lastBatchIgnored\":0,\"lastBatchRetried\":0,\"lastBatchDeadLettered\":0,\"emptyTickCount\":0,"
+    }
+    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${processorDetails}\"queue\":{\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")}},\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
 }
 
 public func deadLetterListPayload(queue: WebhookQueue): String {
@@ -156,8 +186,11 @@ public func reconcileWebhookHooksDryRun(config: MonitorConfig, repos: Array<GitC
 }
 
 public func hookReconcilePayload(config: MonitorConfig, apply: Bool): String {
-    let status = if (apply) { "not_implemented" } else { "dry_run" }
-    "{\"ok\":true,\"status\":\"${status}\",\"apply\":${apply},\"aligned\":0,\"missing\":0,\"updated\":0,\"summary\":\"GitCode webhook hook reconcile ${status}\"}"
+    if (apply && config.webhook.publicBaseUrl.trimAscii().isEmpty()) {
+        return "{\"ok\":false,\"status\":\"apply_rejected\",\"apply\":true,\"applyRejected\":true,\"rejectReason\":\"publicBaseUrl missing\",\"aligned\":0,\"missing\":0,\"wrong_url\":0,\"wrong_events\":0,\"auth_failed\":0,\"failed\":0,\"summary\":\"GitCode webhook hook reconcile apply rejected\"}"
+    }
+    let status = if (apply) { "apply_unavailable" } else { "dry_run" }
+    "{\"ok\":true,\"status\":\"${status}\",\"apply\":${apply},\"aligned\":0,\"missing\":0,\"wrong_url\":0,\"wrong_events\":0,\"auth_failed\":0,\"failed\":0,\"updated\":0,\"summary\":\"GitCode webhook hook reconcile ${status}\"}"
 }
 
 public func eventReconcilePayload(config: MonitorConfig): String {

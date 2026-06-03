@@ -420,9 +420,9 @@ public class GcmMcpClientMode {
 public func gcmPluginMain(args: Array<String>): Int64 {
     let writer = GcmPluginStdioWriter(GcmStdoutLineSink())
     let configRef = pluginArgValue(args, "--config") ?? pluginArgValue(args, "configRef") ?? defaultConfigPath()
-    let initResult = initializeGcmPlugin(ServiceInitializeRequest(GCM_SERVICE_PROTOCOL_VERSION, configRef: configRef, hostApis: ["host.agent.invoke", "host.audit.append"]))
-    if (!initResult.ok) {
-        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(initResult)))
+    let bootstrap = initializeGcmPlugin(ServiceInitializeRequest(GCM_SERVICE_PROTOCOL_VERSION, configRef: configRef, hostApis: ["host.agent.invoke", "host.audit.append"]))
+    if (!bootstrap.ok) {
+        writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(bootstrap)))
         return 2
     }
     let loaded = loadGcmRuntimeConfig(configRef)
@@ -433,6 +433,16 @@ public func gcmPluginMain(args: Array<String>): Int64 {
     let runtime = RuntimeContainer(loaded.config, pluginStdioMode: true)
     let state = runtime.store.load()
     let jobs = GcmScanJobStore(maxConcurrent: 1)
+    let queue = WebhookQueue(loaded.config.webhook.queueDir)
+    let listener = WebhookHttpServerRuntime(loaded.config, queue)
+    let _ = listener.start()
+    let processorLoop = WebhookProcessorLoopRuntime(loaded.config, runtime, state, queue)
+    processorLoop.start(eventWriter: Some<GcmPluginStdioWriter>(writer))
+    let initResult = buildGcmPluginInitializeResult(
+        loaded.config,
+        listenerSnapshot: Some<WebhookHttpServerSnapshot>(listener.snapshot()),
+        processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
+    )
     writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(initResult)))
     let stdin = getStdIn()
     while (true) {
@@ -443,7 +453,15 @@ public func gcmPluginMain(args: Array<String>): Int64 {
         }
         match (line) {
             case Some(raw) =>
-                let handled = handleGcmPluginInputLineWithJobs(raw, loaded.config, runtime, state, jobs)
+                let handled = handleGcmPluginInputLineWithJobs(
+                    raw,
+                    loaded.config,
+                    runtime,
+                    state,
+                    jobs,
+                    listenerSnapshot: Some<WebhookHttpServerSnapshot>(listener.snapshot()),
+                    processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
+                )
                 if (!handled.frame.frameType.isEmpty()) {
                     writer.writeFrame(handled.frame)
                 }
@@ -452,10 +470,14 @@ public func gcmPluginMain(args: Array<String>): Int64 {
                 }
                 if (handled.shouldStop) {
                     let _ = runtime.store.save(state)
+                    processorLoop.stop()
+                    listener.stop()
                     return 0
                 }
             case None =>
                 let _ = runtime.store.save(state)
+                processorLoop.stop()
+                listener.stop()
                 return 0
         }
     }
@@ -474,9 +496,17 @@ public func initializeGcmPlugin(request: ServiceInitializeRequest): ServiceIniti
     if (!loaded.ok) {
         return ServiceInitializeResult(false, loaded.status, diagnostic: loaded.diagnostic)
     }
-    let caps = buildGitCodeMonitorCapabilities(loaded.config)
+    buildGcmPluginInitializeResult(loaded.config)
+}
+
+public func buildGcmPluginInitializeResult(
+    config: MonitorConfig,
+    listenerSnapshot!: ?WebhookHttpServerSnapshot = None<WebhookHttpServerSnapshot>,
+    processorSnapshot!: ?WebhookProcessorLoopSnapshot = None<WebhookProcessorLoopSnapshot>
+): ServiceInitializeResult {
+    let caps = buildGitCodeMonitorCapabilities(config)
     let check = validateGitCodeMonitorCapabilitySet(caps)
-    let receiver = evaluateWebhookReceiverRuntime(loaded.config)
+    let receiver = evaluateWebhookReceiverRuntime(config, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot)
     let status = if (!check.ok || receiver.status == "degraded") { "capability_degraded" } else { "ok" }
     let diagnostics = ArrayList<String>()
     if (!check.ok) {
@@ -492,9 +522,14 @@ public func gcmInitializeResponsePayload(result: ServiceInitializeResult): Strin
         "\"status\":\"${jsonEscape(result.status)}\"," +
         "\"capabilities\":${result.capabilities.size}," +
         "\"webhookReceiverStatus\":\"${jsonEscape(result.webhookReceiver.status)}\"," +
+        "\"configStatus\":\"${jsonEscape(result.webhookReceiver.configStatus)}\"," +
+        "\"queueStatus\":\"${jsonEscape(result.webhookReceiver.queueStatus)}\"," +
+        "\"listenerStatus\":\"${jsonEscape(result.webhookReceiver.listenerStatus)}\"," +
+        "\"processorStatus\":\"${jsonEscape(result.webhookReceiver.processorStatus)}\"," +
         "\"webhookBind\":\"${jsonEscape(result.webhookReceiver.bind)}\"," +
         "\"webhookEndpointCount\":${result.webhookReceiver.endpointCount}," +
         "\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(result.webhookReceiver.queueDir).text)}\"," +
+        "\"diagnostic\":\"${jsonEscape(result.webhookReceiver.diagnostic)}\"," +
         "\"lastError\":\"${jsonEscape(result.webhookReceiver.lastError)}\"}"
 }
 
@@ -593,7 +628,15 @@ public func handleGcmPluginInputLine(line: String, config: MonitorConfig, runtim
     handleGcmPluginInputLineWithJobs(line, config, runtime, state, GcmScanJobStore(maxConcurrent: 1))
 }
 
-public func handleGcmPluginInputLineWithJobs(line: String, config: MonitorConfig, runtime: RuntimeContainer, state: MonitorState, jobs: GcmScanJobStore): GcmPluginFrameHandleResult {
+public func handleGcmPluginInputLineWithJobs(
+    line: String,
+    config: MonitorConfig,
+    runtime: RuntimeContainer,
+    state: MonitorState,
+    jobs: GcmScanJobStore,
+    listenerSnapshot!: ?WebhookHttpServerSnapshot = None<WebhookHttpServerSnapshot>,
+    processorSnapshot!: ?WebhookProcessorLoopSnapshot = None<WebhookProcessorLoopSnapshot>
+): GcmPluginFrameHandleResult {
     let decoded = decodeServiceFrame(line)
     if (!decoded.ok) {
         return GcmPluginFrameHandleResult(false, frame: gcmPluginErrorFrame("decode-error", "", decoded.errorKind, decoded.diagnostic))
@@ -663,7 +706,7 @@ public func handleGcmPluginInputLineWithJobs(line: String, config: MonitorConfig
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "cancel_requested", "{\"ok\":true,\"status\":\"cancel_requested\",\"jobId\":\"${jsonEscape(jobId)}\",\"summary\":\"GitCode scan cancellation requested\"}"))
         case "gitcode.webhook.status" =>
             let queue = WebhookQueue(config.webhook.queueDir)
-            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", webhookStatusPayload(config, queue)))
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", webhookStatusPayload(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot)))
         case "gitcode.webhook.dead_letter_list" =>
             let queue = WebhookQueue(config.webhook.queueDir)
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", deadLetterListPayload(queue)))

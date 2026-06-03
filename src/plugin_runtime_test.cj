@@ -82,7 +82,7 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
-    public func initializeReportsWebhookReceiverRunningWithRedactedSummary(): Unit {
+    public func initializeReportsWebhookReceiverNotStartedWithRedactedSummary(): Unit {
         let dir = tempRuntimeDir("gcm-plugin-init-webhook-running")
         let queueDir = dir.join("queue").toString()
         let path = dir.join("gcm.json").toString()
@@ -92,10 +92,12 @@ public class GitCodeMonitorPluginRuntimeTest {
         )
         let initResult = initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: path))
         @Expect(initResult.ok, true)
-        @Expect(initResult.status, "ok")
-        @Expect(initResult.diagnostic.contains("webhookReceiver.status=running"), true)
+        @Expect(initResult.status, "capability_degraded")
+        @Expect(initResult.diagnostic.contains("webhookReceiver.status=degraded"), true)
+        @Expect(initResult.diagnostic.contains("listenerStatus=not_started"), true)
         let payload = gcmInitializeResponsePayload(initResult)
-        @Expect(payload.contains("\"webhookReceiverStatus\":\"running\""), true)
+        @Expect(payload.contains("\"webhookReceiverStatus\":\"degraded\""), true)
+        @Expect(payload.contains("\"listenerStatus\":\"not_started\""), true)
         @Expect(payload.contains("\"webhookBind\":\"127.0.0.1:18080\""), true)
         @Expect(payload.contains("\"webhookEndpointCount\":1"), true)
         @Expect(payload.contains("\"webhookQueueDir\""), true)

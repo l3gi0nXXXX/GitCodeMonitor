@@ -123,6 +123,41 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func httpServerRequestConversionAndHandlerKeepReceiverSemantics(): Unit {
+        let dir = tempDir("gcm-webhook-http-server")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let converted = convertWebhookHttpRequest(
+            "POST",
+            "/webhooks/gitcode/main",
+            [("Content-Type", "application/json"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook"), ("X-GitCode-Delivery", "delivery-http-1")],
+            mrPayload().toArray(),
+            "198.51.100.11"
+        )
+        @Expect(converted.method, "POST")
+        @Expect(converted.path, "/webhooks/gitcode/main")
+        @Expect(webhookHeader(converted.headers, ["Content-Type"]), "application/json")
+        @Expect(String.fromUtf8(converted.body).contains("\"merge_request\""), true)
+        @Expect(converted.remoteAddr, "198.51.100.11")
+
+        let ok = handleWebhookHttpServerRequest(config, queue, converted)
+        @Expect(ok.statusCode, 202)
+        @Expect(queue.countByStatus("pending"), 1)
+        let duplicate = handleWebhookHttpServerRequest(config, queue, converted)
+        @Expect(duplicate.statusCode, 202)
+        @Expect(duplicate.body.contains("duplicate accepted"), true)
+        @Expect(queue.countByStatus("pending"), 1)
+
+        @Expect(handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("GET", "/webhooks/gitcode/main", converted.headers, Array<Byte>(), "198.51.100.12")).statusCode, 405)
+        @Expect(handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/wrong", converted.headers, mrPayload().toArray(), "198.51.100.13")).statusCode, 404)
+        @Expect(handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/webhooks/gitcode/main", [("Content-Type", "application/json"), ("X-GitCode-Token", "wrong"), ("X-GitCode-Event", "Merge Request Hook")], mrPayload().toArray(), "198.51.100.14")).statusCode, 401)
+        @Expect(handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/webhooks/gitcode/main", [("Content-Type", "text/plain"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook")], mrPayload().toArray(), "198.51.100.15")).statusCode, 415)
+        @Expect(handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/webhooks/gitcode/main", [("Content-Type", "application/json"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook")], "{".toArray(), "198.51.100.16")).statusCode, 400)
+        @Expect(handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/webhooks/gitcode/main", [("Content-Type", "application/json"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook")], Array<Byte>(4097, repeat: 120), "198.51.100.17")).statusCode, 413)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func queueClaimsRetriesDeadLettersReplaysAndCancelsSafely(): Unit {
         let dir = tempDir("gcm-webhook-queue")
         let queue = WebhookQueue(dir.join("queue").toString())
@@ -185,13 +220,63 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func processorEmitsAcceptedServiceEventWhenWriterIsConfigured(): Unit {
+        let dir = tempDir("gcm-webhook-processor-event-writer")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let delivery = GitCodeWebhookDelivery("d-event", "main", "Merge Request Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash")
+        @Expect(queue.enqueue(delivery, mrPayload().toArray()).ok, true)
+        let sender = FakeHttpSender()
+        sender.nextResponse = HttpResponseSpec(200, body: "{\"approved\":true,\"draft\":\"thanks\"}")
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = MonitorState()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+        @Expect(result.processed, 1)
+        @Expect(sink.lines.size, 1)
+        let decoded = decodeServiceFrame(sink.lines[0])
+        @Expect(decoded.ok, true)
+        @Expect(decoded.frame.capabilityId, "gitcode.event.accepted")
+        @Expect(decoded.frame.payload.contains("webhook-d-event"), true)
+        @Expect(decoded.frame.payload.contains("https://gitcode.com/cangjie/compiler/pulls/71"), true)
+        @Expect(decoded.frame.payload.contains("token-secret"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func processorLoopTickConsumesPendingAndIdleTickSleeps(): Unit {
+        let dir = tempDir("gcm-webhook-processor-loop")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let delivery = GitCodeWebhookDelivery("loop-d1", "main", "Merge Request Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash")
+        @Expect(queue.enqueue(delivery, mrPayload().toArray()).ok, true)
+        let sender = FakeHttpSender()
+        sender.nextResponse = HttpResponseSpec(200, body: "{\"approved\":true,\"draft\":\"thanks\"}")
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = MonitorState()
+        let loop = WebhookProcessorLoopRuntime(config, runtime, state, queue, idleSleepMs: 250, failureSleepMs: 1000)
+        let processed = loop.tick(nowMs: 2000)
+        @Expect(processed.result.processed, 1)
+        @Expect(processed.sleepMs, 0)
+        @Expect(loop.snapshot().processorStatus, "running")
+        @Expect(loop.snapshot().lastBatchProcessed, 1)
+        let idle = loop.tick(nowMs: 3000)
+        @Expect(idle.result.processed, 0)
+        @Expect(idle.sleepMs, 250)
+        @Expect(loop.snapshot().emptyTickCount >= 1, true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func statusReconcileAndPluginCapabilitiesReturnStructuredSafePayloads(): Unit {
         let dir = tempDir("gcm-webhook-status")
         let config = enabledConfig(dir.join("queue").toString())
         let queue = WebhookQueue(config.webhook.queueDir)
         @Expect(queue.enqueue(GitCodeWebhookDelivery("dlq-1", "main", "Issue Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), "{}".toArray()).ok, true)
         let status = renderWebhookStatus(config, queue)
-        @Expect(status.contains("receiver=running"), true)
+        @Expect(status.contains("receiver=degraded"), true)
+        @Expect(status.contains("listener=not_started"), true)
         @Expect(status.contains("pending=1"), true)
         @Expect(status.contains("token-secret"), false)
         let client = GitCodeApiClient(token: "gitcode-token")
@@ -209,7 +294,8 @@ public class GitCodeWebhookETest {
         let frame = ServiceFrame("request", "webhook-status-1", GCM_SERVICE_PLUGIN_ID, method: "invokeCapability", capabilityId: "gitcode.webhook.status", correlationId: "corr-webhook-status", payload: "{}")
         let handled = handleGcmPluginInputLine(encodeServiceFrame(frame).trimAscii(), config, runtime, state)
         @Expect(handled.ok, true)
-        @Expect(handled.frame.payload.contains("\"receiver\":\"running\""), true)
+        @Expect(handled.frame.payload.contains("\"receiver\":\"degraded\""), true)
+        @Expect(handled.frame.payload.contains("\"listenerStatus\":\"not_started\""), true)
         @Expect(handled.frame.payload.contains("\"lastError\":\"\""), true)
         @Expect(handled.frame.payload.contains("\"summary\""), true)
         @Expect(handled.frame.payload.contains("token-secret"), false)
@@ -243,10 +329,22 @@ public class GitCodeWebhookETest {
         let running = enabledConfig(runningDir.join("queue").toString())
         let runningQueue = WebhookQueue(running.webhook.queueDir)
         @Expect(runningQueue.enqueue(GitCodeWebhookDelivery("pending-1", "main", "Issue Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), "{}".toArray()).ok, true)
-        let runningPayload = webhookStatusPayload(running, runningQueue)
+        let runningPayload = webhookStatusPayload(
+            running,
+            runningQueue,
+            listenerSnapshot: Some<WebhookHttpServerSnapshot>(WebhookHttpServerSnapshot("listening", bind: "127.0.0.1:18080")),
+            processorSnapshot: Some<WebhookProcessorLoopSnapshot>(WebhookProcessorLoopSnapshot("running"))
+        )
         @Expect(runningPayload.contains("\"receiver\":\"running\""), true)
+        @Expect(runningPayload.contains("\"listenerStatus\":\"listening\""), true)
+        @Expect(runningPayload.contains("\"processorStatus\":\"running\""), true)
         @Expect(runningPayload.contains("\"pending\":1"), true)
         @Expect(runningPayload.contains("token-secret"), false)
+
+        let notStartedPayload = webhookStatusPayload(running, runningQueue)
+        @Expect(notStartedPayload.contains("\"receiver\":\"degraded\""), true)
+        @Expect(notStartedPayload.contains("\"listenerStatus\":\"not_started\""), true)
+        @Expect(notStartedPayload.contains("listener_not_started"), true)
 
         let degradedDir = tempDir("gcm-webhook-status-degraded")
         let degraded = enabledConfig(degradedDir.join("queue").toString())

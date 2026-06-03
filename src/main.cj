@@ -1,5 +1,7 @@
 package gitcodemonitor
 
+import std.time.*
+
 main(args: Array<String>): Int64 {
     var commandArgs = args
     var configPath = defaultConfigPath()
@@ -22,6 +24,34 @@ main(args: Array<String>): Int64 {
         let saved = runtime.store.save(state)
         println("scan-once accepted=${result.accepted} ignored=${result.ignored} notified=${result.notified} mcpCalls=${result.mcpCalls} writes=${result.writes}")
         if (!saved) { println("state=save_failed") }
+        return 0
+    }
+    if (commandArgs.size > 0 && commandArgs[0] == "webhook-http") {
+        if (!config.webhook.enabled) {
+            println("webhook-http status=disabled")
+            return 2
+        }
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
+        let listener = WebhookHttpServerRuntime(config, queue)
+        let processorLoop = WebhookProcessorLoopRuntime(config, runtime, state, queue)
+        let started = listener.start()
+        processorLoop.start()
+        let receiver = evaluateWebhookReceiverRuntime(
+            config,
+            listenerSnapshot: Some<WebhookHttpServerSnapshot>(listener.snapshot()),
+            processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
+        )
+        println("webhook-http status=${receiver.status} listener=${receiver.listenerStatus} processor=${receiver.processorStatus} bind=${receiver.bind} diagnostic=${receiver.diagnostic}")
+        if (!started.ok && config.webhook.enabled) {
+            processorLoop.stop()
+            listener.stop()
+            return 2
+        }
+        while (true) {
+            sleep(Duration.second)
+        }
         return 0
     }
     if (commandArgs.size > 0 && commandArgs[0] == "serve") {
