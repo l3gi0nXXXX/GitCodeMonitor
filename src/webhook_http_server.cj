@@ -13,6 +13,10 @@ public class WebhookHttpServerSnapshot {
     public let lastError: String
     public let acceptedCount: Int64
     public let rejectedCount: Int64
+    public let lastResponseStatus: Int64
+    public let lastRequestDurationMs: Int64
+    public let healthzCount: Int64
+    public let activeRequestCount: Int64
 
     public init(
         status: String,
@@ -21,7 +25,11 @@ public class WebhookHttpServerSnapshot {
         lastRequestAtMs!: Int64 = 0,
         lastError!: String = "",
         acceptedCount!: Int64 = 0,
-        rejectedCount!: Int64 = 0
+        rejectedCount!: Int64 = 0,
+        lastResponseStatus!: Int64 = 0,
+        lastRequestDurationMs!: Int64 = 0,
+        healthzCount!: Int64 = 0,
+        activeRequestCount!: Int64 = 0
     ) {
         this.listenerStatus = status.trimAscii()
         this.bind = bind.trimAscii()
@@ -30,6 +38,10 @@ public class WebhookHttpServerSnapshot {
         this.lastError = lastError.trimAscii()
         this.acceptedCount = acceptedCount
         this.rejectedCount = rejectedCount
+        this.lastResponseStatus = lastResponseStatus
+        this.lastRequestDurationMs = lastRequestDurationMs
+        this.healthzCount = healthzCount
+        this.activeRequestCount = activeRequestCount
     }
 }
 
@@ -68,6 +80,10 @@ public class WebhookHttpServerRuntime {
     private var lastError: String = ""
     private var acceptedCount: Int64 = 0
     private var rejectedCount: Int64 = 0
+    private var lastResponseStatus: Int64 = 0
+    private var lastRequestDurationMs: Int64 = 0
+    private var healthzCount: Int64 = 0
+    private var activeRequestCount: Int64 = 0
 
     public init(config: MonitorConfig, queue: WebhookQueue) {
         this.config = config
@@ -101,8 +117,7 @@ public class WebhookHttpServerRuntime {
                     })
                 }
                 s.distributor.register("/healthz", { ctx =>
-                    ctx.responseBuilder.header("content-type", "text/plain; charset=utf-8")
-                    ctx.responseBuilder.body("ok")
+                    this.handleHealthzContext(ctx)
                 })
                 this.server = Some<Server>(s)
                 this.listenerStatus = "listening"
@@ -144,7 +159,32 @@ public class WebhookHttpServerRuntime {
         }
     }
 
+    private func handleHealthzContext(ctx: HttpContext): Unit {
+        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        synchronized(this.lock) {
+            this.activeRequestCount++
+        }
+        let response = handleWebhookHealthzRequest()
+        let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        synchronized(this.lock) {
+            this.lastRequestAtMs = ended
+            this.lastResponseStatus = response.statusCode
+            this.lastRequestDurationMs = if (ended >= started) { ended - started } else { 0 }
+            this.healthzCount++
+            if (this.activeRequestCount > 0) { this.activeRequestCount-- }
+        }
+        ctx.responseBuilder.status(UInt16(response.statusCode))
+        for ((key, value) in response.headers) {
+            ctx.responseBuilder.header(key, value)
+        }
+        ctx.responseBuilder.body(response.body)
+    }
+
     private func handleHttpContext(ctx: HttpContext, routePath: String): Unit {
+        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        synchronized(this.lock) {
+            this.activeRequestCount++
+        }
         let read = readWebhookRequestBody(ctx, this.config.webhook.maxBodyBytes + 1)
         let response = if (read.ok) {
             handleWebhookHttpServerRequest(
@@ -161,13 +201,17 @@ public class WebhookHttpServerRuntime {
         } else {
             WebhookHttpResponse(if (read.status == "payload_too_large") { 413 } else { 408 }, read.status)
         }
+        let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
         synchronized(this.lock) {
-            this.lastRequestAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            this.lastRequestAtMs = ended
+            this.lastResponseStatus = response.statusCode
+            this.lastRequestDurationMs = if (ended >= started) { ended - started } else { 0 }
             if (response.statusCode >= 200 && response.statusCode < 300) {
                 this.acceptedCount++
             } else {
                 this.rejectedCount++
             }
+            if (this.activeRequestCount > 0) { this.activeRequestCount-- }
         }
         ctx.responseBuilder.status(UInt16(response.statusCode))
         for ((key, value) in response.headers) {
@@ -184,7 +228,11 @@ public class WebhookHttpServerRuntime {
             lastRequestAtMs: this.lastRequestAtMs,
             lastError: this.lastError,
             acceptedCount: this.acceptedCount,
-            rejectedCount: this.rejectedCount
+            rejectedCount: this.rejectedCount,
+            lastResponseStatus: this.lastResponseStatus,
+            lastRequestDurationMs: this.lastRequestDurationMs,
+            healthzCount: this.healthzCount,
+            activeRequestCount: this.activeRequestCount
         )
     }
 }
@@ -195,6 +243,10 @@ public func convertWebhookHttpRequest(method: String, path: String, headers: Arr
 
 public func handleWebhookHttpServerRequest(config: MonitorConfig, queue: WebhookQueue, request: WebhookHttpRequest): WebhookHttpResponse {
     handleGitCodeWebhookRequest(config, request, queue)
+}
+
+public func handleWebhookHealthzRequest(): WebhookHttpResponse {
+    WebhookHttpResponse(200, "ok")
 }
 
 public func collectWebhookHeaders(ctx: HttpContext): Array<(String, String)> {

@@ -6,30 +6,45 @@ import std.time.*
 public class WebhookProcessorLoopSnapshot {
     public let processorStatus: String
     public let lastBatchAtMs: Int64
+    public let lastBatchClaimed: Int64
     public let lastBatchProcessed: Int64
     public let lastBatchIgnored: Int64
     public let lastBatchRetried: Int64
     public let lastBatchDeadLettered: Int64
     public let emptyTickCount: Int64
+    public let lastStateSaveStatus: String
+    public let lastStateSaveSkipped: Bool
+    public let lastStateSaveDurationMs: Int64
+    public let lastStateSaveBytes: Int64
     public let lastError: String
 
     public init(
         status: String,
         lastBatchAtMs!: Int64 = 0,
+        lastBatchClaimed!: Int64 = 0,
         lastBatchProcessed!: Int64 = 0,
         lastBatchIgnored!: Int64 = 0,
         lastBatchRetried!: Int64 = 0,
         lastBatchDeadLettered!: Int64 = 0,
         emptyTickCount!: Int64 = 0,
+        lastStateSaveStatus!: String = "not_started",
+        lastStateSaveSkipped!: Bool = false,
+        lastStateSaveDurationMs!: Int64 = 0,
+        lastStateSaveBytes!: Int64 = 0,
         lastError!: String = ""
     ) {
         this.processorStatus = status.trimAscii()
         this.lastBatchAtMs = lastBatchAtMs
+        this.lastBatchClaimed = lastBatchClaimed
         this.lastBatchProcessed = lastBatchProcessed
         this.lastBatchIgnored = lastBatchIgnored
         this.lastBatchRetried = lastBatchRetried
         this.lastBatchDeadLettered = lastBatchDeadLettered
         this.emptyTickCount = emptyTickCount
+        this.lastStateSaveStatus = lastStateSaveStatus.trimAscii()
+        this.lastStateSaveSkipped = lastStateSaveSkipped
+        this.lastStateSaveDurationMs = lastStateSaveDurationMs
+        this.lastStateSaveBytes = lastStateSaveBytes
         this.lastError = lastError.trimAscii()
     }
 }
@@ -56,11 +71,16 @@ public class WebhookProcessorLoopRuntime {
     private var worker: Option<Future<Unit>> = None
     private var processorStatus: String = "not_started"
     private var lastBatchAtMs: Int64 = 0
+    private var lastBatchClaimed: Int64 = 0
     private var lastBatchProcessed: Int64 = 0
     private var lastBatchIgnored: Int64 = 0
     private var lastBatchRetried: Int64 = 0
     private var lastBatchDeadLettered: Int64 = 0
     private var emptyTickCount: Int64 = 0
+    private var lastStateSaveStatus: String = "not_started"
+    private var lastStateSaveSkipped: Bool = false
+    private var lastStateSaveDurationMs: Int64 = 0
+    private var lastStateSaveBytes: Int64 = 0
     private var lastError: String = ""
 
     public init(
@@ -123,10 +143,15 @@ public class WebhookProcessorLoopRuntime {
         synchronized(this.lock) {
             this.processorStatus = if (result.ok) { "running" } else { "degraded" }
             this.lastBatchAtMs = nowMs
+            this.lastBatchClaimed = result.claimed
             this.lastBatchProcessed = result.processed
             this.lastBatchIgnored = result.ignored
             this.lastBatchRetried = result.retried
             this.lastBatchDeadLettered = result.deadLettered
+            this.lastStateSaveStatus = result.stateSaveStatus
+            this.lastStateSaveSkipped = result.stateSaveSkipped
+            this.lastStateSaveDurationMs = result.stateSaveDurationMs
+            this.lastStateSaveBytes = result.stateSaveBytes
             if (!didWork) { this.emptyTickCount++ }
             this.lastError = if (result.ok) { "" } else { result.status }
         }
@@ -138,11 +163,16 @@ public class WebhookProcessorLoopRuntime {
             WebhookProcessorLoopSnapshot(
                 this.processorStatus,
                 lastBatchAtMs: this.lastBatchAtMs,
+                lastBatchClaimed: this.lastBatchClaimed,
                 lastBatchProcessed: this.lastBatchProcessed,
                 lastBatchIgnored: this.lastBatchIgnored,
                 lastBatchRetried: this.lastBatchRetried,
                 lastBatchDeadLettered: this.lastBatchDeadLettered,
                 emptyTickCount: this.emptyTickCount,
+                lastStateSaveStatus: this.lastStateSaveStatus,
+                lastStateSaveSkipped: this.lastStateSaveSkipped,
+                lastStateSaveDurationMs: this.lastStateSaveDurationMs,
+                lastStateSaveBytes: this.lastStateSaveBytes,
                 lastError: this.lastError
             )
         }

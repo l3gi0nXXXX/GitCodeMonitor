@@ -706,7 +706,7 @@ public func handleGcmPluginInputLineWithJobs(
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "cancel_requested", "{\"ok\":true,\"status\":\"cancel_requested\",\"jobId\":\"${jsonEscape(jobId)}\",\"summary\":\"GitCode scan cancellation requested\"}"))
         case "gitcode.webhook.status" =>
             let queue = WebhookQueue(config.webhook.queueDir)
-            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", webhookStatusPayload(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot)))
+            GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", webhookStatusPayload(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot, state: Some<MonitorState>(state))))
         case "gitcode.webhook.dead_letter_list" =>
             let queue = WebhookQueue(config.webhook.queueDir)
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", deadLetterListPayload(queue)))

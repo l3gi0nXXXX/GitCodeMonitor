@@ -12,6 +12,7 @@ import stdx.net.http.*
 import stdx.net.tls.*
 
 public let SELF_MARKER = "<!-- gitcodemonitor:auto-reply:v1 -->"
+public const DEFAULT_MAX_AUDIT_RECORDS: Int64 = 1000
 
 public class MonitorConfig {
     public var orgs: Array<String>
@@ -300,6 +301,7 @@ public class MonitorState {
     private let backoff = HashMap<String, Int64>()
     private let baselineScopes = HashSet<String>()
     private let baselineCounts = HashMap<String, Int64>()
+    private var changeVersion: Int64 = 0
     public let audit = ArrayList<AuditRecord>()
     public var lastFullScanAtMs: Int64 = 0
     public var skippedOverlappingScans: Int64 = 0
@@ -307,26 +309,69 @@ public class MonitorState {
 
     public init() {}
 
+    public func version(): Int64 { changeVersion }
+    public func touch(): Unit { changeVersion++ }
+    public func resetVersion(): Unit { changeVersion = 0 }
     public func hasSeen(eventId: String): Bool { seenEvents.contains(eventId) }
-    public func markSeen(eventId: String): Unit { seenEvents.add(eventId) }
+    public func markSeen(eventId: String): Unit {
+        let id = eventId.trimAscii()
+        if (id.isEmpty() || seenEvents.contains(id)) { return }
+        seenEvents.add(id)
+        touch()
+    }
     public func hasBaseline(scopeKey: String): Bool { baselineScopes.contains(scopeKey) }
     public func markBaseline(scopeKey: String, seededEvents: Int64): Unit {
-        if (scopeKey.trimAscii().isEmpty()) { return }
-        baselineScopes.add(scopeKey)
-        baselineCounts[scopeKey] = if (seededEvents < 0) { 0 } else { seededEvents }
-        if (baselineCreatedAtMs == 0) { baselineCreatedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds() }
+        let key = scopeKey.trimAscii()
+        if (key.isEmpty()) { return }
+        let normalizedCount = if (seededEvents < 0) { 0 } else { seededEvents }
+        var changed = false
+        if (!baselineScopes.contains(key)) {
+            baselineScopes.add(key)
+            changed = true
+        }
+        if ((baselineCounts.get(key) ?? -1) != normalizedCount) {
+            baselineCounts[key] = normalizedCount
+            changed = true
+        }
+        if (baselineCreatedAtMs == 0) {
+            baselineCreatedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            changed = true
+        }
+        if (changed) { touch() }
     }
     public func hasMcpCall(eventId: String): Bool { mcpCalled.contains(eventId) }
-    public func markMcpCall(eventId: String): Unit { mcpCalled.add(eventId) }
+    public func markMcpCall(eventId: String): Unit {
+        let id = eventId.trimAscii()
+        if (id.isEmpty() || mcpCalled.contains(id)) { return }
+        mcpCalled.add(id)
+        touch()
+    }
     public func hasReply(eventId: String): Bool { replied.contains(eventId) }
-    public func markReply(eventId: String): Unit { replied.add(eventId) }
-    public func addAudit(record: AuditRecord): Unit { audit.add(record) }
+    public func markReply(eventId: String): Unit {
+        let id = eventId.trimAscii()
+        if (id.isEmpty() || replied.contains(id)) { return }
+        replied.add(id)
+        touch()
+    }
+    public func addAudit(record: AuditRecord): Unit {
+        audit.add(record)
+        while (audit.size > DEFAULT_MAX_AUDIT_RECORDS) {
+            audit.remove(at: 0)
+        }
+        touch()
+    }
     public func seenCount(): Int64 { seenEvents.size }
     public func baselineScopeCount(): Int64 { baselineScopes.size }
     public func baselineSeenCount(scopeKey: String): Int64 { baselineCounts.get(scopeKey) ?? 0 }
     public func mcpCallCount(): Int64 { mcpCalled.size }
     public func replyCount(): Int64 { replied.size }
-    public func setBackoff(key: String, untilMs: Int64): Unit { backoff[key] = untilMs }
+    public func setBackoff(key: String, untilMs: Int64): Unit {
+        let normalized = key.trimAscii()
+        if (normalized.isEmpty()) { return }
+        if ((backoff.get(normalized) ?? -1) == untilMs) { return }
+        backoff[normalized] = untilMs
+        touch()
+    }
     public func backoffUntil(key: String): Int64 { backoff.get(key) ?? 0 }
     public func seenIds(): Array<String> {
         let out = ArrayList<String>()
@@ -355,19 +400,78 @@ public class MonitorState {
     }
 }
 
+public class StateSaveResult {
+    public let saved: Bool
+    public let skipped: Bool
+    public let status: String
+    public let durationMs: Int64
+    public let bytes: Int64
+    public let diagnostic: String
+
+    public init(saved: Bool, skipped: Bool, status: String, durationMs!: Int64 = 0, bytes!: Int64 = 0, diagnostic!: String = "") {
+        this.saved = saved
+        this.skipped = skipped
+        this.status = status.trimAscii()
+        this.durationMs = durationMs
+        this.bytes = bytes
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
 public class StateStore {
     public let path: Path
     public var loadDegraded: Bool = false
+    public var lastSaveStatus: String = "not_started"
+    public var lastSaveStartedAtMs: Int64 = 0
+    public var lastSaveDurationMs: Int64 = 0
+    public var lastSaveBytes: Int64 = 0
+    public var lastSaveSkippedReason: String = ""
+    public var lastSaveDiagnostic: String = ""
     public init(path: String) { this.path = Path(path) }
 
     public func save(state: MonitorState): Bool {
+        this.writeState(state).saved
+    }
+
+    public func saveIfChanged(state: MonitorState, sinceVersion: Int64): StateSaveResult {
+        if (state.version() == sinceVersion) {
+            return this.markSaveSkipped("skipped_unchanged", "unchanged")
+        }
+        this.writeState(state)
+    }
+
+    public func markSaveSkipped(status: String, reason: String): StateSaveResult {
+        this.lastSaveStatus = status.trimAscii()
+        this.lastSaveStartedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        this.lastSaveDurationMs = 0
+        this.lastSaveBytes = 0
+        this.lastSaveSkippedReason = reason.trimAscii()
+        this.lastSaveDiagnostic = ""
+        StateSaveResult(false, true, this.lastSaveStatus)
+    }
+
+    private func writeState(state: MonitorState): StateSaveResult {
+        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        this.lastSaveStartedAtMs = started
+        this.lastSaveSkippedReason = ""
         try {
             let parent = path.parent
             if (!exists(parent)) { Directory.create(parent, recursive: true) }
-            File.writeTo(path, stateToJson(state).toJsonString().toArray())
-            true
-        } catch (_: Exception) {
-            false
+            let bytes = stateToJson(state).toJsonString().toArray()
+            File.writeTo(path, bytes)
+            let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            this.lastSaveStatus = "saved"
+            this.lastSaveDurationMs = if (ended >= started) { ended - started } else { 0 }
+            this.lastSaveBytes = bytes.size
+            this.lastSaveDiagnostic = ""
+            StateSaveResult(true, false, "saved", durationMs: this.lastSaveDurationMs, bytes: this.lastSaveBytes)
+        } catch (e: Exception) {
+            let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            this.lastSaveStatus = "state_save_failed"
+            this.lastSaveDurationMs = if (ended >= started) { ended - started } else { 0 }
+            this.lastSaveBytes = 0
+            this.lastSaveDiagnostic = hashRawPayload(e.message)
+            StateSaveResult(false, false, "state_save_failed", durationMs: this.lastSaveDurationMs, diagnostic: this.lastSaveDiagnostic)
         }
     }
 
@@ -421,6 +525,7 @@ public class StateStore {
                     }
                 case None => ()
             }
+            state.resetVersion()
         } catch (_: Exception) {
             loadDegraded = true
             try {

@@ -220,6 +220,112 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func processorEmptyQueueDoesNotPersistState(): Unit {
+        let dir = tempDir("gcm-webhook-empty-queue-no-save")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 20)
+
+        @Expect(result.ok, true)
+        @Expect(result.claimed, 0)
+        @Expect(result.processed, 0)
+        @Expect(result.stateSaved, false)
+        @Expect(result.stateSaveSkipped, true)
+        @Expect(result.stateSaveStatus, "skipped_empty_queue")
+        @Expect(runtime.store.lastSaveStatus, "skipped_empty_queue")
+        @Expect(runtime.store.lastSaveSkippedReason, "empty_queue")
+        @Expect(exists(Path(config.statePath)), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func monitorStateVersionAndStateStoreSaveOnlyWhenDirty(): Unit {
+        let dir = tempDir("gcm-webhook-state-dirty-save")
+        let store = StateStore(dir.join("state.json").toString())
+        let state = MonitorState()
+        let version0 = state.version()
+
+        let clean = store.saveIfChanged(state, version0)
+        @Expect(clean.saved, false)
+        @Expect(clean.skipped, true)
+        @Expect(clean.status, "skipped_unchanged")
+        @Expect(exists(store.path), false)
+
+        state.markSeen("gitcode:cangjie/compiler:issue:1")
+        let version1 = state.version()
+        @Expect(version1 > version0, true)
+        state.markSeen("gitcode:cangjie/compiler:issue:1")
+        @Expect(state.version(), version1)
+
+        let dirty = store.saveIfChanged(state, version0)
+        @Expect(dirty.saved, true)
+        @Expect(dirty.skipped, false)
+        @Expect(dirty.status, "saved")
+        @Expect(dirty.bytes > 0, true)
+        @Expect(exists(store.path), true)
+        @Expect(store.lastSaveStatus, "saved")
+
+        let unchanged = store.saveIfChanged(state, state.version())
+        @Expect(unchanged.saved, false)
+        @Expect(unchanged.skipped, true)
+        @Expect(unchanged.status, "skipped_unchanged")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func monitorStateAuditIsCappedWhenPersistedAndLoaded(): Unit {
+        let dir = tempDir("gcm-webhook-audit-cap")
+        let store = StateStore(dir.join("state.json").toString())
+        let state = MonitorState()
+        for (i in 0..(DEFAULT_MAX_AUDIT_RECORDS + 5)) {
+            state.addAudit(AuditRecord("audit-${i}", status: "accepted"))
+        }
+
+        @Expect(state.audit.size, DEFAULT_MAX_AUDIT_RECORDS)
+        @Expect(state.audit[0].eventId, "audit-5")
+        @Expect(store.save(state), true)
+        let loaded = store.load()
+        @Expect(loaded.audit.size, DEFAULT_MAX_AUDIT_RECORDS)
+        @Expect(loaded.audit[0].eventId, "audit-5")
+        @Expect(loaded.audit[loaded.audit.size - 1].eventId, "audit-${DEFAULT_MAX_AUDIT_RECORDS + 4}")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func wrongWebhookTokenDoesNotEnqueueOrPersistState(): Unit {
+        let dir = tempDir("gcm-webhook-bad-token-no-side-effects")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let response = handleGitCodeWebhookRequest(config, WebhookHttpRequest(
+            "POST",
+            "/webhooks/gitcode/main",
+            [("Content-Type", "application/json"), ("X-GitCode-Token", "wrong"), ("X-GitCode-Event", "Merge Request Hook")],
+            mrPayload().toArray(),
+            "203.0.113.22"
+        ), queue)
+
+        @Expect(response.statusCode, 401)
+        @Expect(queue.countByStatus("pending"), 0)
+        @Expect(queue.countByStatus("processing"), 0)
+        @Expect(queue.countByStatus("processed"), 0)
+        @Expect(exists(Path(config.statePath)), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func healthzResponseIsIndependentFromWebhookTokenBodyAndQueue(): Unit {
+        let healthz = handleWebhookHealthzRequest()
+        @Expect(healthz.statusCode, 200)
+        @Expect(healthz.body, "ok")
+        @Expect(healthz.headers[0][0].toAsciiLower(), "content-type")
+        @Expect(healthz.body.contains("token"), false)
+        @Expect(healthz.body.contains("{"), false)
+    }
+
+    @TestCase
     public func processorEmitsAcceptedServiceEventWhenWriterIsConfigured(): Unit {
         let dir = tempDir("gcm-webhook-processor-event-writer")
         let config = enabledConfig(dir.join("queue").toString())
@@ -257,14 +363,24 @@ public class GitCodeWebhookETest {
         let state = MonitorState()
         let loop = WebhookProcessorLoopRuntime(config, runtime, state, queue, idleSleepMs: 250, failureSleepMs: 1000)
         let processed = loop.tick(nowMs: 2000)
+        @Expect(processed.result.claimed, 1)
         @Expect(processed.result.processed, 1)
+        @Expect(processed.result.stateSaved, true)
+        @Expect(processed.result.stateSaveStatus, "saved")
         @Expect(processed.sleepMs, 0)
         @Expect(loop.snapshot().processorStatus, "running")
+        @Expect(loop.snapshot().lastBatchClaimed, 1)
         @Expect(loop.snapshot().lastBatchProcessed, 1)
+        @Expect(loop.snapshot().lastStateSaveStatus, "saved")
         let idle = loop.tick(nowMs: 3000)
+        @Expect(idle.result.claimed, 0)
         @Expect(idle.result.processed, 0)
+        @Expect(idle.result.stateSaved, false)
+        @Expect(idle.result.stateSaveSkipped, true)
+        @Expect(idle.result.stateSaveStatus, "skipped_empty_queue")
         @Expect(idle.sleepMs, 250)
         @Expect(loop.snapshot().emptyTickCount >= 1, true)
+        @Expect(loop.snapshot().lastStateSaveStatus, "skipped_empty_queue")
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
@@ -332,12 +448,20 @@ public class GitCodeWebhookETest {
         let runningPayload = webhookStatusPayload(
             running,
             runningQueue,
-            listenerSnapshot: Some<WebhookHttpServerSnapshot>(WebhookHttpServerSnapshot("listening", bind: "127.0.0.1:18080")),
-            processorSnapshot: Some<WebhookProcessorLoopSnapshot>(WebhookProcessorLoopSnapshot("running"))
+            listenerSnapshot: Some<WebhookHttpServerSnapshot>(WebhookHttpServerSnapshot("listening", bind: "127.0.0.1:18080", lastResponseStatus: 202, lastRequestDurationMs: 3, healthzCount: 2, activeRequestCount: 0)),
+            processorSnapshot: Some<WebhookProcessorLoopSnapshot>(WebhookProcessorLoopSnapshot("running", lastBatchClaimed: 1, lastStateSaveStatus: "saved", lastStateSaveDurationMs: 4, lastStateSaveBytes: 512))
         )
         @Expect(runningPayload.contains("\"receiver\":\"running\""), true)
         @Expect(runningPayload.contains("\"listenerStatus\":\"listening\""), true)
+        @Expect(runningPayload.contains("\"listenerLastStatus\":202"), true)
+        @Expect(runningPayload.contains("\"listenerLastDurationMs\":3"), true)
+        @Expect(runningPayload.contains("\"healthzCount\":2"), true)
+        @Expect(runningPayload.contains("\"activeRequestCount\":0"), true)
         @Expect(runningPayload.contains("\"processorStatus\":\"running\""), true)
+        @Expect(runningPayload.contains("\"lastBatchClaimed\":1"), true)
+        @Expect(runningPayload.contains("\"stateSaveStatus\":\"saved\""), true)
+        @Expect(runningPayload.contains("\"stateSaveDurationMs\":4"), true)
+        @Expect(runningPayload.contains("\"stateSaveBytes\":512"), true)
         @Expect(runningPayload.contains("\"pending\":1"), true)
         @Expect(runningPayload.contains("token-secret"), false)
 
