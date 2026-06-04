@@ -38,7 +38,8 @@ public func handleGitCodeWebhookRequest(config: MonitorConfig, request: WebhookH
         case Some(ep) =>
             let contentType = webhookHeader(request.headers, ["Content-Type"])
             if (!contentType.toAsciiLower().contains("application/json")) { return WebhookHttpResponse(415, "unsupported content type") }
-            if (request.body.size > config.webhook.maxBodyBytes) { return WebhookHttpResponse(413, "payload too large") }
+            if (request.body.size == 0) { return WebhookHttpResponse(400, "empty_body") }
+            if (request.body.size > config.webhook.maxBodyBytes) { return WebhookHttpResponse(413, "payload_too_large") }
             let eventName = webhookHeader(request.headers, ["X-GitCode-Event", "X-Gitlab-Event", "X-Gitee-Event"])
             if (!arrayContains(ep.allowedEvents, eventName)) { return WebhookHttpResponse(400, "rejected unknown event") }
             let auth = verifyGitCodeWebhookAuth(ep, request.headers, request.body)
@@ -51,7 +52,7 @@ public func handleGitCodeWebhookRequest(config: MonitorConfig, request: WebhookH
             try {
                 let _ = JsonValue.fromStr(bodyText).asObject()
             } catch (_: Exception) {
-                return WebhookHttpResponse(400, "payload must be json object")
+                return WebhookHttpResponse(400, "malformed_json")
             }
             let deliveryId = deriveWebhookDeliveryId(eventName, request.headers, bodyText)
             let delivery = GitCodeWebhookDelivery(

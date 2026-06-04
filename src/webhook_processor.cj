@@ -9,6 +9,7 @@ public class WebhookBatchResult {
     public let status: String
     public let claimed: Int64
     public let processed: Int64
+    public let duplicates: Int64
     public let ignored: Int64
     public let retried: Int64
     public let deadLettered: Int64
@@ -24,6 +25,7 @@ public class WebhookBatchResult {
         status: String,
         claimed!: Int64 = 0,
         processed!: Int64 = 0,
+        duplicates!: Int64 = 0,
         ignored!: Int64 = 0,
         retried!: Int64 = 0,
         deadLettered!: Int64 = 0,
@@ -38,6 +40,7 @@ public class WebhookBatchResult {
         this.status = status
         this.claimed = claimed
         this.processed = processed
+        this.duplicates = duplicates
         this.ignored = ignored
         this.retried = retried
         this.deadLettered = deadLettered
@@ -88,7 +91,7 @@ public func processWebhookBatch(
     let beforeVersion = state.version()
     let claimed = queue.claim(nowMs, limit)
     if (claimed.size == 0) {
-        let skipped = runtime.store.markSaveSkipped("skipped_empty_queue", "empty_queue")
+        let skipped = runtime.store.markSaveSkipped("skipped_unchanged", "empty_queue")
         return WebhookBatchResult(
             true,
             "ok",
@@ -101,6 +104,7 @@ public func processWebhookBatch(
         )
     }
     var processed: Int64 = 0
+    var duplicates: Int64 = 0
     var ignored: Int64 = 0
     var retried: Int64 = 0
     var dead: Int64 = 0
@@ -124,6 +128,7 @@ public func processWebhookBatch(
             continue
         }
         let result = processRuntimeEvent(config, state, parsed.event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: false)
+        duplicates += result.duplicateEvents
         if (result.failedEvents > 0) {
             let _ = queue.markRetry(delivery.deliveryId, "runtime_failed", nowMs + 60000)
             retried++
@@ -138,13 +143,19 @@ public func processWebhookBatch(
             processed++
         }
     }
-    let saved = runtime.store.saveIfChanged(state, beforeVersion)
+    let saveReason = if (claimed.size > 0 && processed > 0 && duplicates == processed && ignored == 0 && retried == 0 && dead == 0) {
+        "duplicate_only"
+    } else {
+        "batch_processed"
+    }
+    let saved = runtime.store.saveIfChanged(state, beforeVersion, reason: saveReason)
     let ok = saved.saved || saved.skipped
     WebhookBatchResult(
         ok,
         if (ok) { "ok" } else { saved.status },
         claimed: claimed.size,
         processed: processed,
+        duplicates: duplicates,
         ignored: ignored,
         retried: retried,
         deadLettered: dead,
@@ -218,11 +229,15 @@ public func webhookStatusPayload(
         case Some(value) => value.audit.size
         case None => 0
     }
+    let duplicateSuppressed = match (state) {
+        case Some(value) => value.duplicateAuditSuppressedCount
+        case None => 0
+    }
     let processorDetails = match (processorSnapshot) {
         case Some(snapshot) =>
-            "\"lastBatchAtMs\":${snapshot.lastBatchAtMs},\"lastBatchClaimed\":${snapshot.lastBatchClaimed},\"lastBatchProcessed\":${snapshot.lastBatchProcessed},\"lastBatchIgnored\":${snapshot.lastBatchIgnored},\"lastBatchRetried\":${snapshot.lastBatchRetried},\"lastBatchDeadLettered\":${snapshot.lastBatchDeadLettered},\"emptyTickCount\":${snapshot.emptyTickCount},\"stateSaveStatus\":\"${jsonEscape(snapshot.lastStateSaveStatus)}\",\"stateSaveSkipped\":${snapshot.lastStateSaveSkipped},\"stateSaveDurationMs\":${snapshot.lastStateSaveDurationMs},\"stateSaveBytes\":${snapshot.lastStateSaveBytes},"
+            "\"lastBatchAtMs\":${snapshot.lastBatchAtMs},\"lastBatchClaimed\":${snapshot.lastBatchClaimed},\"lastBatchProcessed\":${snapshot.lastBatchProcessed},\"lastBatchDuplicates\":${snapshot.lastBatchDuplicates},\"lastBatchIgnored\":${snapshot.lastBatchIgnored},\"lastBatchRetried\":${snapshot.lastBatchRetried},\"lastBatchDeadLettered\":${snapshot.lastBatchDeadLettered},\"emptyTickCount\":${snapshot.emptyTickCount},\"stateSaveStatus\":\"${jsonEscape(snapshot.lastStateSaveStatus)}\",\"stateSaveSkipped\":${snapshot.lastStateSaveSkipped},\"stateSaveDurationMs\":${snapshot.lastStateSaveDurationMs},\"stateSaveBytes\":${snapshot.lastStateSaveBytes},"
         case None =>
-            "\"lastBatchAtMs\":0,\"lastBatchClaimed\":0,\"lastBatchProcessed\":0,\"lastBatchIgnored\":0,\"lastBatchRetried\":0,\"lastBatchDeadLettered\":0,\"emptyTickCount\":0,\"stateSaveStatus\":\"not_started\",\"stateSaveSkipped\":false,\"stateSaveDurationMs\":0,\"stateSaveBytes\":0,"
+            "\"lastBatchAtMs\":0,\"lastBatchClaimed\":0,\"lastBatchProcessed\":0,\"lastBatchDuplicates\":0,\"lastBatchIgnored\":0,\"lastBatchRetried\":0,\"lastBatchDeadLettered\":0,\"emptyTickCount\":0,\"stateSaveStatus\":\"not_started\",\"stateSaveSkipped\":false,\"stateSaveDurationMs\":0,\"stateSaveBytes\":0,"
     }
     let listenerDetails = match (listenerSnapshot) {
         case Some(snapshot) =>
@@ -230,7 +245,12 @@ public func webhookStatusPayload(
         case None =>
             "\"listenerLastStatus\":0,\"listenerLastDurationMs\":0,\"healthzCount\":0,\"activeRequestCount\":0,"
     }
-    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${listenerDetails}${processorDetails}\"queue\":{\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")}},\"pending\":${queue.countByStatus("pending")},\"processing\":${queue.countByStatus("processing")},\"processed\":${queue.countByStatus("processed")},\"deadLetter\":${queue.countByStatus("dead-letter")},\"cancelled\":${queue.countByStatus("cancelled")},\"auditCount\":${auditCount},\"auditMax\":${DEFAULT_MAX_AUDIT_RECORDS},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
+    let pending = queue.countByStatus("pending")
+    let processing = queue.countByStatus("processing")
+    let processed = queue.countByStatus("processed")
+    let deadLetter = queue.countByStatus("dead-letter")
+    let cancelled = queue.countByStatus("cancelled")
+    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${listenerDetails}${processorDetails}\"receiverHealth\":{${listenerDetails}\"stateSaveStatus\":\"${jsonEscape(receiver.processorStatus)}\"},\"processor\":{${processorDetails}\"status\":\"${jsonEscape(receiver.processorStatus)}\"},\"stateSave\":{\"status\":\"${jsonEscape(match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveStatus case None => "not_started" })}\",\"skipped\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveSkipped case None => false }},\"durationMs\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveDurationMs case None => 0 }},\"bytes\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveBytes case None => 0 }}},\"queue\":{\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled}},\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled},\"auditCount\":${auditCount},\"auditMax\":${DEFAULT_MAX_AUDIT_RECORDS},\"duplicateSuppressed\":${duplicateSuppressed},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
 }
 
 public func deadLetterListPayload(queue: WebhookQueue): String {

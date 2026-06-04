@@ -302,10 +302,13 @@ public class MonitorState {
     private let baselineScopes = HashSet<String>()
     private let baselineCounts = HashMap<String, Int64>()
     private var changeVersion: Int64 = 0
+    private var lastCoalescedAuditKey: String = ""
     public let audit = ArrayList<AuditRecord>()
     public var lastFullScanAtMs: Int64 = 0
     public var skippedOverlappingScans: Int64 = 0
     public var baselineCreatedAtMs: Int64 = 0
+    public var transientAuditCount: Int64 = 0
+    public var duplicateAuditSuppressedCount: Int64 = 0
 
     public init() {}
 
@@ -359,6 +362,19 @@ public class MonitorState {
             audit.remove(at: 0)
         }
         touch()
+    }
+    public func addAuditTransient(record: AuditRecord): Unit {
+        let _ = record
+        transientAuditCount++
+    }
+    public func addAuditCoalesced(record: AuditRecord): Unit {
+        let key = "${record.eventId}:${record.status}:${record.reason}"
+        if (key == lastCoalescedAuditKey) {
+            duplicateAuditSuppressedCount++
+        } else {
+            lastCoalescedAuditKey = key
+            duplicateAuditSuppressedCount++
+        }
     }
     public func seenCount(): Int64 { seenEvents.size }
     public func baselineScopeCount(): Int64 { baselineScopes.size }
@@ -433,9 +449,13 @@ public class StateStore {
         this.writeState(state).saved
     }
 
-    public func saveIfChanged(state: MonitorState, sinceVersion: Int64): StateSaveResult {
+    public func saveIfChanged(state: MonitorState, sinceVersion: Int64, reason!: String = "unchanged"): StateSaveResult {
         if (state.version() == sinceVersion) {
-            return this.markSaveSkipped("skipped_unchanged", "unchanged")
+            let normalized = reason.trimAscii()
+            if (normalized == "duplicate_only") {
+                return this.markSaveSkipped("skipped_duplicate_only", normalized)
+            }
+            return this.markSaveSkipped("skipped_unchanged", if (normalized.isEmpty()) { "unchanged" } else { normalized })
         }
         this.writeState(state)
     }
@@ -1898,7 +1918,7 @@ func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitC
         return result
     }
     if (state.hasSeen(event.id)) {
-        state.addAudit(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
+        state.addAuditCoalesced(AuditRecord(event.id, status: "skipped_duplicate", reason: "seen"))
         let result = ScanResult(0, 0, 0, 0, 0, duplicateEvents: 1, writeMode: scanWriteMode(config))
         result.addDuplicateSample(event, "seen")
         return result

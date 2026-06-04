@@ -1,6 +1,7 @@
 package gitcodemonitor
 
 import std.collection.*
+import std.convert.Parsable
 import std.sync.*
 import std.time.*
 import stdx.net.http.*
@@ -272,7 +273,9 @@ public func collectWebhookHeaders(ctx: HttpContext): Array<(String, String)> {
         "X-Forwarded-For",
         "x-forwarded-for",
         "X-Real-IP",
-        "x-real-ip"
+        "x-real-ip",
+        "Content-Length",
+        "content-length"
     ]
     let headers = ArrayList<(String, String)>()
     for (name in names) {
@@ -294,11 +297,28 @@ public func webhookRequestRemoteAddress(ctx: HttpContext): String {
 
 public func readWebhookRequestBody(ctx: HttpContext, maxBytes: Int64): WebhookBodyReadResult {
     try {
+        let contentLength = ctx.request.headers.getFirst("Content-Length") ?? ctx.request.headers.getFirst("content-length") ?? ""
+        if (!contentLength.trimAscii().isEmpty()) {
+            let declared = try {
+                Int64.parse(contentLength.trimAscii())
+            } catch (_: Exception) {
+                return WebhookBodyReadResult(false, "malformed_content_length")
+            }
+            if (maxBytes > 0 && declared > maxBytes) {
+                return WebhookBodyReadResult(false, "payload_too_large")
+            }
+        }
         let output = ArrayList<Byte>()
         let buffer = Array<Byte>(8192, repeat: 0)
+        var chunks: Int64 = 0
+        let maxChunks = if (maxBytes <= 0) { 4096 } else { (maxBytes / 8192) + 2 }
         while (true) {
             let n = ctx.request.body.read(buffer)
             if (n <= 0) { break }
+            chunks++
+            if (chunks > maxChunks) {
+                return WebhookBodyReadResult(false, "body_read_chunk_limit")
+            }
             if (maxBytes > 0 && Int64(output.size) + Int64(n) > maxBytes) {
                 return WebhookBodyReadResult(false, "payload_too_large")
             }

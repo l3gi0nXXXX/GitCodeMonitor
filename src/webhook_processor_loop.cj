@@ -8,6 +8,7 @@ public class WebhookProcessorLoopSnapshot {
     public let lastBatchAtMs: Int64
     public let lastBatchClaimed: Int64
     public let lastBatchProcessed: Int64
+    public let lastBatchDuplicates: Int64
     public let lastBatchIgnored: Int64
     public let lastBatchRetried: Int64
     public let lastBatchDeadLettered: Int64
@@ -23,6 +24,7 @@ public class WebhookProcessorLoopSnapshot {
         lastBatchAtMs!: Int64 = 0,
         lastBatchClaimed!: Int64 = 0,
         lastBatchProcessed!: Int64 = 0,
+        lastBatchDuplicates!: Int64 = 0,
         lastBatchIgnored!: Int64 = 0,
         lastBatchRetried!: Int64 = 0,
         lastBatchDeadLettered!: Int64 = 0,
@@ -37,6 +39,7 @@ public class WebhookProcessorLoopSnapshot {
         this.lastBatchAtMs = lastBatchAtMs
         this.lastBatchClaimed = lastBatchClaimed
         this.lastBatchProcessed = lastBatchProcessed
+        this.lastBatchDuplicates = lastBatchDuplicates
         this.lastBatchIgnored = lastBatchIgnored
         this.lastBatchRetried = lastBatchRetried
         this.lastBatchDeadLettered = lastBatchDeadLettered
@@ -66,6 +69,8 @@ public class WebhookProcessorLoopRuntime {
     private let queue: WebhookQueue
     private let idleSleepMs: Int64
     private let failureSleepMs: Int64
+    private let maxConsecutiveWorkBatchesBeforeYield: Int64
+    private let workYieldMs: Int64
     private let lock = Mutex()
     private let stopRequested = AtomicBool(false)
     private var worker: Option<Future<Unit>> = None
@@ -73,6 +78,7 @@ public class WebhookProcessorLoopRuntime {
     private var lastBatchAtMs: Int64 = 0
     private var lastBatchClaimed: Int64 = 0
     private var lastBatchProcessed: Int64 = 0
+    private var lastBatchDuplicates: Int64 = 0
     private var lastBatchIgnored: Int64 = 0
     private var lastBatchRetried: Int64 = 0
     private var lastBatchDeadLettered: Int64 = 0
@@ -82,6 +88,7 @@ public class WebhookProcessorLoopRuntime {
     private var lastStateSaveDurationMs: Int64 = 0
     private var lastStateSaveBytes: Int64 = 0
     private var lastError: String = ""
+    private var consecutiveWorkBatches: Int64 = 0
 
     public init(
         config: MonitorConfig,
@@ -89,7 +96,9 @@ public class WebhookProcessorLoopRuntime {
         state: MonitorState,
         queue: WebhookQueue,
         idleSleepMs!: Int64 = 1000,
-        failureSleepMs!: Int64 = 5000
+        failureSleepMs!: Int64 = 5000,
+        maxConsecutiveWorkBatchesBeforeYield!: Int64 = 10,
+        workYieldMs!: Int64 = 1
     ) {
         this.config = config
         this.runtime = runtime
@@ -97,6 +106,8 @@ public class WebhookProcessorLoopRuntime {
         this.queue = queue
         this.idleSleepMs = if (idleSleepMs < 0) { 0 } else { idleSleepMs }
         this.failureSleepMs = if (failureSleepMs < 0) { 0 } else { failureSleepMs }
+        this.maxConsecutiveWorkBatchesBeforeYield = if (maxConsecutiveWorkBatchesBeforeYield <= 0) { 10 } else { maxConsecutiveWorkBatchesBeforeYield }
+        this.workYieldMs = if (workYieldMs < 0) { 0 } else { workYieldMs }
     }
 
     public func start(eventWriter!: ?GcmPluginStdioWriter = None<GcmPluginStdioWriter>): Unit {
@@ -133,18 +144,28 @@ public class WebhookProcessorLoopRuntime {
     public func tick(nowMs!: Int64 = DateTime.now().toUnixTimeStamp().toMilliseconds(), eventWriter!: ?GcmPluginStdioWriter = None<GcmPluginStdioWriter>): WebhookProcessorLoopTickResult {
         let result = processWebhookBatch(this.config, this.runtime, this.state, this.queue, nowMs: nowMs, maxItems: this.config.webhook.processor.maxBatchSize, eventWriter: eventWriter)
         let didWork = result.processed > 0 || result.ignored > 0 || result.retried > 0 || result.deadLettered > 0
-        let sleepMs = if (!result.ok) {
-            this.failureSleepMs
+        var sleepMs: Int64 = 0
+        if (!result.ok) {
+            this.consecutiveWorkBatches = 0
+            sleepMs = this.failureSleepMs
         } else if (didWork) {
-            0
+            this.consecutiveWorkBatches++
+            if (this.consecutiveWorkBatches >= this.maxConsecutiveWorkBatchesBeforeYield) {
+                this.consecutiveWorkBatches = 0
+                sleepMs = this.workYieldMs
+            } else {
+                sleepMs = 0
+            }
         } else {
-            this.idleSleepMs
+            this.consecutiveWorkBatches = 0
+            sleepMs = this.idleSleepMs
         }
         synchronized(this.lock) {
             this.processorStatus = if (result.ok) { "running" } else { "degraded" }
             this.lastBatchAtMs = nowMs
             this.lastBatchClaimed = result.claimed
             this.lastBatchProcessed = result.processed
+            this.lastBatchDuplicates = result.duplicates
             this.lastBatchIgnored = result.ignored
             this.lastBatchRetried = result.retried
             this.lastBatchDeadLettered = result.deadLettered
@@ -165,6 +186,7 @@ public class WebhookProcessorLoopRuntime {
                 lastBatchAtMs: this.lastBatchAtMs,
                 lastBatchClaimed: this.lastBatchClaimed,
                 lastBatchProcessed: this.lastBatchProcessed,
+                lastBatchDuplicates: this.lastBatchDuplicates,
                 lastBatchIgnored: this.lastBatchIgnored,
                 lastBatchRetried: this.lastBatchRetried,
                 lastBatchDeadLettered: this.lastBatchDeadLettered,

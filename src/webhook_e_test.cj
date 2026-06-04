@@ -1,8 +1,9 @@
 package gitcodemonitor
 
 import std.fs.{Directory, File, Path, exists, remove}
-import std.time.DateTime
+import std.time.*
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonValue
 
 @Test
 public class GitCodeWebhookETest {
@@ -51,6 +52,15 @@ public class GitCodeWebhookETest {
         "}"
     }
 
+    private func issuePayload(): String {
+        "{" +
+            "\"object_kind\":\"issue\"," +
+            "\"project\":{\"path_with_namespace\":\"cangjie/compiler\"}," +
+            "\"object_attributes\":{\"iid\":72,\"action\":\"open\",\"title\":\"Fix docs\",\"description\":\"please document\",\"url\":\"https://gitcode.com/cangjie/compiler/issues/72\"}," +
+            "\"user\":{\"name\":\"alice\",\"username\":\"alice\"}" +
+        "}"
+    }
+
     private func notePayload(noteableType: String): String {
         "{" +
             "\"object_kind\":\"note\"," +
@@ -59,6 +69,38 @@ public class GitCodeWebhookETest {
             "\"object_attributes\":{\"id\":9001,\"note\":\"Looks good token=secret /Users/alice/.metis\",\"noteable_type\":\"${noteableType}\",\"url\":\"https://gitcode.com/cangjie/compiler/pulls/71#note_9001\"}," +
             "\"user\":{\"name\":\"bob\"}" +
         "}"
+    }
+
+    private func fixtureLine(name: String): String {
+        let candidates = [
+            "test/fixtures/service_plugin/gcm_webhook/${name}",
+            "../test/fixtures/service_plugin/gcm_webhook/${name}",
+            "fixtures/service_plugin/gcm_webhook/${name}"
+        ]
+        for (path in candidates) {
+            if (exists(Path(path))) {
+                return String.fromUtf8(File.readFrom(Path(path))).trimAscii()
+            }
+        }
+        ""
+    }
+
+    private func payloadHasField(payload: String, field: String): Bool {
+        let root = JsonValue.fromStr(payload).asObject()
+        match (root.get(field)) {
+            case Some(_) => true
+            case None => false
+        }
+    }
+
+    private func payloadString(payload: String, field: String): String {
+        let root = JsonValue.fromStr(payload).asObject()
+        firstJsonString(root, [field])
+    }
+
+    private func stateFileSize(path: String): Int64 {
+        if (!exists(Path(path))) { return 0 }
+        File.readFrom(Path(path)).size
     }
 
     @TestCase
@@ -158,6 +200,47 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func p1Neg01OversizedWebhookBodyReturnsPayloadTooLargeWithoutQueueMutation(): Unit {
+        let dir = tempDir("gcm-webhook-p1-oversized")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let beforePending = queue.countByStatus("pending")
+
+        let response = handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest(
+            "POST",
+            "/webhooks/gitcode/main",
+            [("Content-Type", "application/json"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook"), ("Content-Length", "4097")],
+            Array<Byte>(4097, repeat: 120),
+            "198.51.100.18"
+        ))
+
+        @Expect(response.statusCode, 413)
+        @Expect(response.body, "payload_too_large")
+        @Expect(queue.countByStatus("pending"), beforePending)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Neg02MalformedAndEmptyWebhookBodiesReturnExplicitBadRequestWithoutQueueMutation(): Unit {
+        let dir = tempDir("gcm-webhook-p1-malformed")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let headers = [("Content-Type", "application/json"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook")]
+
+        let malformed = handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/webhooks/gitcode/main", headers, "{".toArray(), "198.51.100.19"))
+        let empty = handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest("POST", "/webhooks/gitcode/main", headers, Array<Byte>(), "198.51.100.20"))
+
+        @Expect(malformed.statusCode, 400)
+        @Expect(malformed.body, "malformed_json")
+        @Expect(empty.statusCode, 400)
+        @Expect(empty.body, "empty_body")
+        @Expect(queue.countByStatus("pending"), 0)
+        @Expect(queue.countByStatus("processed"), 0)
+        @Expect(queue.countByStatus("dead-letter"), 0)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func queueClaimsRetriesDeadLettersReplaysAndCancelsSafely(): Unit {
         let dir = tempDir("gcm-webhook-queue")
         let queue = WebhookQueue(dir.join("queue").toString())
@@ -220,6 +303,73 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func p1Ut01DuplicateRuntimeEventDoesNotAdvanceStateVersionOrAudit(): Unit {
+        let config = defaultConfig()
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        let event = GitCodeEvent("gitcode:cangjie/compiler:pr:71", "cangjie", "compiler", "pr", "71", "alice", "", "https://gitcode.com/cangjie/compiler/pulls/71", "Fix parser")
+        state.markSeen(event.id)
+        let versionBefore = state.version()
+        let auditCountBefore = state.audit.size
+
+        let result = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: false)
+
+        @Expect(result.duplicateEvents, 1)
+        @Expect(state.version(), versionBefore)
+        @Expect(state.audit.size, auditCountBefore)
+    }
+
+    @TestCase
+    public func p0Ut03DuplicateWebhookDoesNotForceFullStateSaveEveryTime(): Unit {
+        let dir = tempDir("gcm-webhook-p0-duplicate-save")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("dup-first", "main", "Merge Request Hook", 1000, "payload-1", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+        let first = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1)
+        @Expect(first.stateSaved, true)
+        @Expect(first.stateSaveStatus, "saved")
+        let versionBeforeDuplicate = state.version()
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("dup-second", "main", "Merge Request Hook", 3000, "payload-2", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+
+        let second = processWebhookBatch(config, runtime, state, queue, nowMs: 4000, maxItems: 1)
+
+        @Expect(second.duplicates, 1)
+        @Expect(second.stateSaved, false)
+        @Expect(second.stateSaveSkipped, true)
+        @Expect(second.stateSaveStatus, "skipped_duplicate_only")
+        @Expect(state.version(), versionBeforeDuplicate)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Ut02DuplicateOnlyBatchSkipsStateSaveAndKeepsStateFileStable(): Unit {
+        let dir = tempDir("gcm-webhook-p1-duplicate-only")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("p1-first", "main", "Merge Request Hook", 1000, "payload-1", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+        let first = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1)
+        @Expect(first.processed, 1)
+        @Expect(first.stateSaved, true)
+        let stateTextBefore = String.fromUtf8(File.readFrom(Path(config.statePath)))
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("p1-second", "main", "Merge Request Hook", 3000, "payload-2", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+
+        let duplicate = processWebhookBatch(config, runtime, state, queue, nowMs: 4000, maxItems: 1)
+
+        @Expect(duplicate.claimed, 1)
+        @Expect(duplicate.processed, 1)
+        @Expect(duplicate.duplicates, 1)
+        @Expect(duplicate.stateSaved, false)
+        @Expect(duplicate.stateSaveSkipped, true)
+        @Expect(duplicate.stateSaveStatus, "skipped_duplicate_only")
+        @Expect(String.fromUtf8(File.readFrom(Path(config.statePath))), stateTextBefore)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func processorEmptyQueueDoesNotPersistState(): Unit {
         let dir = tempDir("gcm-webhook-empty-queue-no-save")
         let config = enabledConfig(dir.join("queue").toString())
@@ -234,10 +384,29 @@ public class GitCodeWebhookETest {
         @Expect(result.processed, 0)
         @Expect(result.stateSaved, false)
         @Expect(result.stateSaveSkipped, true)
-        @Expect(result.stateSaveStatus, "skipped_empty_queue")
-        @Expect(runtime.store.lastSaveStatus, "skipped_empty_queue")
+        @Expect(result.stateSaveStatus, "skipped_unchanged")
+        @Expect(runtime.store.lastSaveStatus, "skipped_unchanged")
         @Expect(runtime.store.lastSaveSkippedReason, "empty_queue")
         @Expect(exists(Path(config.statePath)), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Ut03StateStoreSaveIfChangedReportsDuplicateOnlySkip(): Unit {
+        let dir = tempDir("gcm-webhook-p1-state-store-duplicate")
+        let store = StateStore(dir.join("state.json").toString())
+        let state = MonitorState()
+
+        let result = store.saveIfChanged(state, state.version(), reason: "duplicate_only")
+
+        @Expect(result.saved, false)
+        @Expect(result.skipped, true)
+        @Expect(result.status, "skipped_duplicate_only")
+        @Expect(result.durationMs, 0)
+        @Expect(result.bytes, 0)
+        @Expect(store.lastSaveStatus, "skipped_duplicate_only")
+        @Expect(store.lastSaveSkippedReason, "duplicate_only")
+        @Expect(exists(store.path), false)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
@@ -272,6 +441,34 @@ public class GitCodeWebhookETest {
         @Expect(unchanged.saved, false)
         @Expect(unchanged.skipped, true)
         @Expect(unchanged.status, "skipped_unchanged")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Bnd01DuplicateWebhookFloodDoesNotGrowStateFileOrPersistAudit(): Unit {
+        let dir = tempDir("gcm-webhook-p1-duplicate-boundary")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("flood-first", "main", "Merge Request Hook", 1000, "payload-1", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+        let first = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1)
+        @Expect(first.stateSaved, true)
+        let sizeBefore = stateFileSize(config.statePath)
+        let auditBefore = state.audit.size
+        var duplicateCount: Int64 = 0
+        var skippedCount: Int64 = 0
+        for (i in 0..1000) {
+            @Expect(queue.enqueue(GitCodeWebhookDelivery("flood-${i}", "main", "Merge Request Hook", 3000 + i, "payload-${i}", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+            let ticked = processWebhookBatch(config, runtime, state, queue, nowMs: 5000 + i, maxItems: 1)
+            duplicateCount += ticked.duplicates
+            if (ticked.stateSaveStatus == "skipped_duplicate_only") { skippedCount++ }
+        }
+
+        @Expect(stateFileSize(config.statePath), sizeBefore)
+        @Expect(state.audit.size, auditBefore)
+        @Expect(skippedCount, 1000)
+        @Expect(duplicateCount, 1000)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
@@ -351,6 +548,32 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func p1Pos01NewWebhookBatchSavesStateAndEmitsAcceptedFrame(): Unit {
+        let dir = tempDir("gcm-webhook-p1-positive")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("p1-pos", "main", "Merge Request Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+
+        @Expect(result.claimed, 1)
+        @Expect(result.processed, 1)
+        @Expect(result.duplicates, 0)
+        @Expect(result.stateSaved, true)
+        @Expect(result.stateSaveStatus, "saved")
+        @Expect(sink.lines.size, 1)
+        let decoded = decodeServiceFrame(sink.lines[0])
+        @Expect(decoded.frame.frameType, "event")
+        @Expect(decoded.frame.capabilityId, "gitcode.event.accepted")
+        @Expect(state.hasSeen("gitcode:cangjie/compiler:pr:71"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func processorLoopTickConsumesPendingAndIdleTickSleeps(): Unit {
         let dir = tempDir("gcm-webhook-processor-loop")
         let config = enabledConfig(dir.join("queue").toString())
@@ -377,10 +600,91 @@ public class GitCodeWebhookETest {
         @Expect(idle.result.processed, 0)
         @Expect(idle.result.stateSaved, false)
         @Expect(idle.result.stateSaveSkipped, true)
-        @Expect(idle.result.stateSaveStatus, "skipped_empty_queue")
+        @Expect(idle.result.stateSaveStatus, "skipped_unchanged")
         @Expect(idle.sleepMs, 250)
         @Expect(loop.snapshot().emptyTickCount >= 1, true)
-        @Expect(loop.snapshot().lastStateSaveStatus, "skipped_empty_queue")
+        @Expect(loop.snapshot().lastStateSaveStatus, "skipped_unchanged")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Stress01DuplicateProcessorLoadYieldsAndHealthzRemainsFastInFakeRuntime(): Unit {
+        let dir = tempDir("gcm-webhook-p1-stress")
+        let config = enabledConfig(dir.join("queue").toString())
+        let port = 19000 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 1000)
+        config.webhook = WebhookReceiverConfig(
+            enabled: true,
+            bindHost: config.webhook.bindHost,
+            port: port,
+            publicBaseUrl: config.webhook.publicBaseUrl,
+            maxBodyBytes: config.webhook.maxBodyBytes,
+            queueDir: config.webhook.queueDir,
+            endpoints: config.webhook.endpoints,
+            processor: WebhookProcessorConfig(maxBatchSize: 1)
+        )
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        let server = WebhookHttpServerRuntime(config, queue)
+        let started = server.start()
+        @Expect(started.ok, true)
+        sleep(Duration.millisecond * 20)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("stress-first", "main", "Merge Request Hook", 1000, "payload-1", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+        let loop = WebhookProcessorLoopRuntime(config, runtime, state, queue, idleSleepMs: 250, failureSleepMs: 1000, maxConsecutiveWorkBatchesBeforeYield: 10, workYieldMs: 1)
+        let first = loop.tick(nowMs: 2000)
+        @Expect(first.result.processed, 1)
+        for (i in 0..500) {
+            @Expect(queue.enqueue(GitCodeWebhookDelivery("stress-${i}", "main", "Merge Request Hook", 3000 + i, "payload-${i}", "", "pending", 0, "", 0, "ip-hash"), mrPayload().toArray()).ok, true)
+        }
+        var healthzOk: Int64 = 0
+        var yielded: Bool = false
+        var duplicates: Int64 = 0
+        let curl = CurlHttpSender()
+        for (i in 0..500) {
+            let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            let healthz = curl.send(HttpRequestSpec("GET", "http://127.0.0.1:${port}/healthz"))
+            let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            if (healthz.statusCode == 200 && healthz.body.trimAscii() == "ok" && ended - started < 1000) { healthzOk++ }
+            let ticked = loop.tick(nowMs: 4000 + i)
+            duplicates += ticked.result.duplicates
+            if (ticked.sleepMs == 1) { yielded = true }
+        }
+
+        @Expect(healthzOk, 500)
+        @Expect(duplicates, 500)
+        @Expect(yielded, true)
+        @Expect(loop.snapshot().processorStatus, "running")
+        @Expect(queue.countByStatus("dead-letter"), 0)
+        server.stop()
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p8E2e02FakeHttpPostQueuesProcessesAndEmitsAcceptedFrame(): Unit {
+        let dir = tempDir("gcm-webhook-p8-e2e")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let response = handleWebhookHttpServerRequest(config, queue, convertWebhookHttpRequest(
+            "POST",
+            "/webhooks/gitcode/main",
+            [("Content-Type", "application/json"), ("X-GitCode-Token", "token-secret"), ("X-GitCode-Event", "Merge Request Hook"), ("X-GitCode-Delivery", "p8-e2e")],
+            mrPayload().toArray(),
+            "198.51.100.21"
+        ))
+        @Expect(response.statusCode, 202)
+        @Expect(queue.countByStatus("pending"), 1)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = MonitorState()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+
+        let processed = processWebhookBatch(config, runtime, state, queue, nowMs: 3000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+
+        @Expect(processed.processed, 1)
+        @Expect(queue.countByStatus("pending"), 0)
+        @Expect(queue.countByStatus("processed"), 1)
+        @Expect(sink.lines.size, 1)
+        @Expect(decodeServiceFrame(sink.lines[0]).frame.capabilityId, "gitcode.event.accepted")
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
@@ -462,6 +766,10 @@ public class GitCodeWebhookETest {
         @Expect(runningPayload.contains("\"stateSaveStatus\":\"saved\""), true)
         @Expect(runningPayload.contains("\"stateSaveDurationMs\":4"), true)
         @Expect(runningPayload.contains("\"stateSaveBytes\":512"), true)
+        @Expect(runningPayload.contains("\"receiverHealth\""), true)
+        @Expect(runningPayload.contains("\"stateSave\""), true)
+        @Expect(runningPayload.contains("\"processor\""), true)
+        @Expect(runningPayload.contains("\"queue\""), true)
         @Expect(runningPayload.contains("\"pending\":1"), true)
         @Expect(runningPayload.contains("token-secret"), false)
 
@@ -486,6 +794,79 @@ public class GitCodeWebhookETest {
         try { remove(disabledDir, recursive: true) } catch (_: Exception) { () }
         try { remove(runningDir, recursive: true) } catch (_: Exception) { () }
         try { remove(degradedDir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p6GcmStatusPayloadExposesReceiverQueueProcessorAndStateSaveSnapshots(): Unit {
+        let dir = tempDir("gcm-webhook-p6-status")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("p6-pending", "main", "Issue Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), "{}".toArray()).ok, true)
+
+        let payload = webhookStatusPayload(
+            config,
+            queue,
+            listenerSnapshot: Some<WebhookHttpServerSnapshot>(WebhookHttpServerSnapshot("listening", bind: "127.0.0.1:18080", lastResponseStatus: 202, lastRequestDurationMs: 5, healthzCount: 3, activeRequestCount: 1)),
+            processorSnapshot: Some<WebhookProcessorLoopSnapshot>(WebhookProcessorLoopSnapshot("running", lastBatchClaimed: 2, lastBatchProcessed: 1, lastStateSaveStatus: "skipped_duplicate_only", lastStateSaveSkipped: true, lastStateSaveDurationMs: 0, lastStateSaveBytes: 0))
+        )
+
+        @Expect(payload.contains("\"receiverHealth\""), true)
+        @Expect(payload.contains("\"healthzCount\":3"), true)
+        @Expect(payload.contains("\"activeRequestCount\":1"), true)
+        @Expect(payload.contains("\"queue\""), true)
+        @Expect(payload.contains("\"processor\""), true)
+        @Expect(payload.contains("\"lastBatchClaimed\":2"), true)
+        @Expect(payload.contains("\"stateSave\""), true)
+        @Expect(payload.contains("\"stateSaveStatus\":\"skipped_duplicate_only\""), true)
+        @Expect(payload.contains("token-secret"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p7Ut01GcmWebhookAcceptedPrFixtureContainsRequiredProducerFields(): Unit {
+        let decoded = decodeServiceFrame(fixtureLine("gitcode_event_accepted_pr.jsonl"))
+
+        @Expect(decoded.ok, true)
+        @Expect(decoded.frame.frameType, "event")
+        @Expect(decoded.frame.serviceId, GCM_SERVICE_PLUGIN_ID)
+        @Expect(decoded.frame.capabilityId, "gitcode.event.accepted")
+        for (field in ["jobId", "eventId", "repo", "kind", "number", "url", "title"]) {
+            @Expect(payloadHasField(decoded.frame.payload, field), true)
+        }
+    }
+
+    @TestCase
+    public func p7Pos01GcmWebhookAcceptedFixturesCoverPrIssueAndCommentWithoutSensitiveRawData(): Unit {
+        let fixtures = [
+            ("gitcode_event_accepted_pr.jsonl", "pr", "/pulls/71"),
+            ("gitcode_event_accepted_issue.jsonl", "issue", "/issues/72"),
+            ("gitcode_event_accepted_comment.jsonl", "comment", "#comment-9001")
+        ]
+        for ((name, kind, urlPart) in fixtures) {
+            let decoded = decodeServiceFrame(fixtureLine(name))
+            @Expect(decoded.ok, true)
+            @Expect(decoded.frame.capabilityId, "gitcode.event.accepted")
+            @Expect(payloadString(decoded.frame.payload, "kind"), kind)
+            @Expect(payloadString(decoded.frame.payload, "url").contains(urlPart), true)
+            @Expect(decoded.frame.payload.contains("Authorization"), false)
+            @Expect(decoded.frame.payload.contains("Bearer secret"), false)
+            @Expect(decoded.frame.payload.contains("X-GitCode-Token"), false)
+            @Expect(decoded.frame.payload.contains("rawBody"), false)
+        }
+    }
+
+    @TestCase
+    public func p7GcmProducerTruncatesLongAcceptedContentAndFlagsRedaction(): Unit {
+        let longContent = "Authorization: Bearer secret token=abc " + String(Array<Rune>(5000, repeat: r'x'))
+        let event = GitCodeEvent("gitcode:cangjie/compiler:pr:80", "cangjie", "compiler", "pr", "80", "alice", "", "https://gitcode.com/cangjie/compiler/pulls/80", longContent)
+        let frame = gcmAcceptedScanEventFrame("webhook-long", event)
+
+        @Expect(frame.payload.contains("Authorization"), false)
+        @Expect(frame.payload.contains("Bearer secret"), false)
+        @Expect(frame.payload.contains("token=abc"), false)
+        @Expect(frame.payload.contains("\"contentRedacted\":true"), true)
+        @Expect(frame.payload.contains("\"truncated\":true"), true)
+        @Expect(payloadString(frame.payload, "content").toRuneArray().size <= 4096, true)
     }
 
     @TestCase
