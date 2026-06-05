@@ -1440,8 +1440,9 @@ public class McpResult {
     public let needsHumanReview: Bool
     public let errorKind: String
     public let reason: String
+    public let diagnostic: String
     public let citations: Array<String>
-    public init(ok: Bool, summary!: String = "", draft!: String = "", approved!: Bool = true, needsHumanReview!: Bool = false, errorKind!: String = "", reason!: String = "", citations!: Array<String> = []) {
+    public init(ok: Bool, summary!: String = "", draft!: String = "", approved!: Bool = true, needsHumanReview!: Bool = false, errorKind!: String = "", reason!: String = "", diagnostic!: String = "", citations!: Array<String> = []) {
         this.ok = ok
         this.summary = summary
         this.draft = draft
@@ -1449,6 +1450,7 @@ public class McpResult {
         this.needsHumanReview = needsHumanReview
         this.errorKind = errorKind
         this.reason = reason
+        this.diagnostic = if (diagnostic.isEmpty()) { reason } else { diagnostic }
         this.citations = citations
     }
 }
@@ -1460,6 +1462,7 @@ public class McpHttpClient {
     public var requestSeq: Int64 = 0
     public var initialized: Bool = false
     public var degradedReason: String = ""
+    public var diagnostic: String = ""
     public let schemaCache = ArrayList<ToolSchema>()
 
     public init(endpoint: String, serviceToken!: String = "", sender!: HttpSender = FakeHttpSender()) {
@@ -1515,13 +1518,22 @@ public class McpHttpClient {
         }
         while (!schemaCache.isEmpty()) { schemaCache.remove(at: 0) }
         for (schema in parsed) { schemaCache.add(schema) }
-        if (!hasRequiredGitCodeTools()) { degradedReason = "mcp_required_tools_missing" }
+        let missing = missingGitCodeToolGroups()
+        if (missing.size > 0) {
+            degradedReason = "mcp_required_tools_missing"
+            diagnostic = requiredToolsDiagnostic("", missing)
+        } else {
+            degradedReason = ""
+            diagnostic = ""
+        }
         schemaCache.toArray()
     }
 
     public func call(input: ToolInput): McpResult {
         if (!hasGitCodeTool(input.toolName)) {
-            return McpResult(false, approved: false, needsHumanReview: true, errorKind: "tool_not_available")
+            let message = requiredToolsDiagnostic(input.toolName, missingGitCodeToolGroups())
+            diagnostic = message
+            return McpResult(false, approved: false, needsHumanReview: true, errorKind: "tool_not_available", reason: message, diagnostic: message)
         }
         let res = sender.send(buildToolsCallRequest(input))
         if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -1550,12 +1562,47 @@ public class McpHttpClient {
         false
     }
 
+    public func hasAnyGitCodeTool(names: Array<String>): Bool {
+        if (schemaCache.isEmpty()) { let _ = toolsList() }
+        for (schema in schemaCache) {
+            for (name in names) {
+                if (schema.name == name) { return true }
+            }
+        }
+        false
+    }
+
+    public func missingGitCodeToolGroups(): Array<String> {
+        let missing = ArrayList<String>()
+        if (!hasAnyGitCodeTool(["gitcode_issue_summary", "gitcode_issue_summarize"])) {
+            missing.add("issue_summary|issue_summarize")
+        }
+        if (!hasAnyGitCodeTool(["gitcode_pr_summary", "gitcode_pr_summarize"])) {
+            missing.add("pr_summary|pr_summarize")
+        }
+        if (!hasAnyGitCodeTool(["gitcode_safety_review", "gitcode_reply_safety_review"])) {
+            missing.add("safety_review|reply_safety_review")
+        }
+        if (!hasAnyGitCodeTool(["gitcode_issue_draft_reply"])) {
+            missing.add("issue_draft_reply")
+        }
+        if (!hasAnyGitCodeTool(["gitcode_pr_draft_reply"])) {
+            missing.add("pr_draft_reply")
+        }
+        missing.toArray()
+    }
+
     private func hasRequiredGitCodeTools(): Bool {
-        hasGitCodeTool("gitcode_issue_summary") &&
-            hasGitCodeTool("gitcode_issue_draft_reply") &&
-            hasGitCodeTool("gitcode_pr_summary") &&
-            hasGitCodeTool("gitcode_pr_draft_reply") &&
-            hasGitCodeTool("gitcode_safety_review")
+        missingGitCodeToolGroups().size == 0
+    }
+
+    private func requiredToolsDiagnostic(requestedTool: String, missingGroups: Array<String>): String {
+        var message = ""
+        if (!requestedTool.isEmpty()) {
+            message += "requestedTool=${requestedTool} "
+        }
+        message += "availableTools=${schemaCache.size} missingGroups=${joinStrings(missingGroups, "|")}"
+        redactSecrets(message)
     }
 }
 
