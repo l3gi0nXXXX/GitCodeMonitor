@@ -578,13 +578,7 @@ func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent): ServiceFrame
 }
 
 func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent): String {
-    let redacted = containsSecret(event.content) || containsSecret(scanEventTitle(event))
-    let truncated = event.content.toRuneArray().size > 4096
-    let content = compactSummary(redactSecrets(event.content), limit: 4096)
-    let commentId = scanEventCommentId(event)
-    let kind = if (commentId.isEmpty()) { event.itemKind } else { "comment" }
-    let commentPart = if (commentId.isEmpty()) { "" } else { ",\"commentId\":\"${jsonEscape(commentId)}\"" }
-    "{\"jobId\":\"${jsonEscape(jobId.trimAscii())}\",\"eventId\":\"${jsonEscape(event.id)}\",\"repo\":\"${jsonEscape(event.org)}/${jsonEscape(event.repo)}\",\"kind\":\"${jsonEscape(kind)}\",\"number\":\"${jsonEscape(event.itemId)}\"${commentPart},\"author\":\"${jsonEscape(event.actor)}\",\"url\":\"${jsonEscape(event.url)}\",\"title\":\"${jsonEscape(compactSummary(redactSecrets(scanEventTitle(event)), limit: 160))}\",\"content\":\"${jsonEscape(content)}\",\"contentRedacted\":${redacted},\"truncated\":${truncated}}"
+    renderReviewRequestJson(jobId, event)
 }
 
 func gcmScanJobEventFrame(job: GcmScanJob): ServiceFrame {
