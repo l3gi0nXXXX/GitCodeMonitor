@@ -1,5 +1,6 @@
 package gitcodemonitor
 
+import std.collection.ArrayList
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.*
 import std.unittest.testmacro.*
@@ -883,5 +884,172 @@ public class GitCodeWebhookETest {
         @Expect(payload.contains("queue_unavailable"), true)
         @Expect(payload.contains("token-secret"), false)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    private func reviewFactsIssuePayload(email!: String = "alice@example.com", action!: String = "open", body!: String = "details"): String {
+        "{" +
+            "\"object_kind\":\"issue\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/cangjie_tools\"}," +
+            "\"object_attributes\":{\"iid\":71,\"action\":\"${action}\",\"title\":\"[Bug]: parser\",\"description\":\"${body}\",\"url\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/71\"}," +
+            "\"user\":{\"name\":\"Alice\",\"username\":\"alice\",\"email\":\"${email}\",\"html_url\":\"https://gitcode.com/alice\"}" +
+        "}"
+    }
+
+    @TestCase
+    public func reviewContractValidationCoversRequiredAndUnsafePayloads(): Unit {
+        // T-CONTRACT-001, T-CONTRACT-002, T-CONTRACT-003, T-CONTRACT-004, T-CONTRACT-005, T-CONTRACT-009
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:1", "cangjie", "compiler", "issue", "1", "alice", "", "https://gitcode.com/cangjie/compiler/issues/1", "bug body")
+        let payload = renderReviewRequestJson("job-contract", event, issueKind: "bug")
+        let ok = validateReviewRequestForTest(payload)
+        @Expect(ok.ok, true)
+        @Expect(ok.contractVersion, "gcm-metis-gitcode-review-v1")
+        @Expect(validateReviewRequestForTest("{\"reviewRequest\":{\"repo\":\"cangjie/compiler\"}}").status, "contract_version_missing")
+        @Expect(validateReviewRequestForTest("{\"contractVersion\":\"unknown\",\"reviewRequest\":{\"repo\":\"cangjie/compiler\"}}").status, "contract_version_unsupported")
+        let secret = validateReviewRequestForTest("{\"contractVersion\":\"gcm-metis-gitcode-review-v1\",\"reviewRequest\":{\"repo\":\"cangjie/compiler\",\"body\":\"Authorization: Bearer x\"}}")
+        @Expect(secret.status, "payload_contains_secret")
+        @Expect(secret.diagnostic.contains("Bearer x"), false)
+        let localPath = validateReviewRequestForTest("{\"contractVersion\":\"gcm-metis-gitcode-review-v1\",\"reviewRequest\":{\"repo\":\"cangjie/compiler\",\"body\":\"/Users/alice/private\"}}")
+        @Expect(localPath.status, "payload_contains_local_path")
+        @Expect(localPath.diagnostic.contains("/Users/alice"), false)
+        @Expect(validateReviewRequestForTest("{\"contractVersion\":\"gcm-metis-gitcode-review-v1\",\"reviewRequest\":{\"repo\":\"\"}}").status, "repo_missing")
+    }
+
+    @TestCase
+    public func reviewIdentityExtractsEmailsClassifiesCorporateAndDegrades(): Unit {
+        // T-IDENTITY-001, T-IDENTITY-002, T-IDENTITY-003, T-IDENTITY-004, T-IDENTITY-005, T-IDENTITY-006, T-IDENTITY-007, T-IDENTITY-008, T-IDENTITY-010
+        let corporate = JsonValue.fromStr(reviewFactsIssuePayload(email: "A@HUAWEI.COM")).asObject()
+        let corporateIdentity = classifyCorporateAuthor(resolveAuthorEmails(corporate, GitCodeApiClient()), ["@huawei.com", "@h-partners.com"])
+        @Expect(corporateIdentity.decision, "record_only")
+        @Expect(corporateIdentity.corporateDomain, "@huawei.com")
+        let partner = JsonValue.fromStr("{\"user\":{\"username\":\"u\",\"emails\":[\"a@example.com\",\"b@h-partners.com\"]}}").asObject()
+        @Expect(classifyCorporateAuthor(resolveAuthorEmails(partner, GitCodeApiClient()), ["@huawei.com", "@h-partners.com"]).decision, "record_only")
+        let external = JsonValue.fromStr(reviewFactsIssuePayload(email: "user@example.com")).asObject()
+        @Expect(classifyCorporateAuthor(resolveAuthorEmails(external, GitCodeApiClient()), ["@huawei.com", "@h-partners.com"]).decision, "process")
+        let missing = JsonValue.fromStr("{\"user\":{\"username\":\"unknown\"}}").asObject()
+        let missingIdentity = classifyCorporateAuthor(resolveAuthorEmails(missing, GitCodeApiClient()), ["@huawei.com"])
+        @Expect(missingIdentity.emailResolveStatus, "email_unavailable")
+        @Expect(missingIdentity.decision, "process")
+        let malformed = JsonValue.fromStr("{\"user\":{\"username\":\"bad\",\"email\":\"not-mail\"}}").asObject()
+        @Expect(resolveAuthorEmails(malformed, GitCodeApiClient()).diagnostics[0].code, "invalid_email")
+        let mrAuthor = JsonValue.fromStr("{\"merge_request\":{\"author\":{\"username\":\"carol\",\"name\":\"Carol\"}}}").asObject()
+        @Expect(extractAuthorIdentityFromWebhook(mrAuthor).login, "carol")
+        @Expect(extractAuthorIdentityFromWebhook(mrAuthor).displayName, "Carol")
+        let objectAuthor = JsonValue.fromStr("{\"object_attributes\":{\"author\":{\"username\":\"dan\",\"name\":\"Dan\"}}}").asObject()
+        @Expect(extractAuthorIdentityFromWebhook(objectAuthor).login, "dan")
+        let timeout = JsonValue.fromStr("{\"user\":{\"username\":\"erin\"},\"emailResolveStatus\":\"timeout\"}").asObject()
+        @Expect(resolveAuthorEmails(timeout, GitCodeApiClient()).emailResolveStatus, "timeout")
+    }
+
+    @TestCase
+    public func reviewMaintainersParseResolveAndRenderContract(): Unit {
+        // T-MAINT-001, T-MAINT-002, T-MAINT-004, T-MAINT-005, T-MAINT-006, T-MAINT-007, T-MAINT-008
+        let text = "<table><tr><th>Team</th><th>Team Leader</th><th>org</th><th>repo_name</th></tr>" +
+            "<tr><td>Tools Team</td><td><a href=\"https://atomgit.com/l3gi0n\">@l3gi0n</a> / <a href=\"https://gitcode.com/zjdd\">@zjdd</a></td><td>Cangjie</td><td>cangjie_tools</td></tr>" +
+            "<tr><td>Empty Team</td><td></td><td>Cangjie</td><td>empty</td></tr></table>"
+        let parsed = parseRepoListMd(text)
+        @Expect(parsed.rows.size, 2)
+        let resolved = resolveTeamLeaders("cangjie/CANGJIE_TOOLS", rows: parsed.rows)
+        @Expect(resolved.teamLeaderStatus, "resolved")
+        @Expect(resolved.team, "Tools Team")
+        @Expect(resolved.teamLeaders[0].mention, "@l3gi0n")
+        @Expect(resolved.teamLeaders[0].url, "https://atomgit.com/l3gi0n")
+        @Expect(resolveTeamLeaders("Cangjie/empty", rows: parsed.rows).teamLeaderStatus, "not_found")
+        @Expect(resolveTeamLeaders("Cangjie/missing", rows: parsed.rows).teamLeaderStatus, "not_found")
+        @Expect(parseRepoListMd(String(Array<Rune>(210000, repeat: r'x'))).status, "truncated_catalog")
+        let event = GitCodeEvent("gitcode:cangjie/cangjie_tools:issue:1", "cangjie", "cangjie_tools", "issue", "1", "alice", "", "", "body")
+        let contract = renderReviewRequestJson("job-maint", event, maintainer: resolved)
+        @Expect(contract.contains("\"teamLeaders\""), true)
+        @Expect(contract.contains("@l3gi0n"), true)
+    }
+
+    @TestCase
+    public func reviewCodeownersParseMatchOverrideAndRenderStatuses(): Unit {
+        // T-CODEOWNERS-001, T-CODEOWNERS-002, T-CODEOWNERS-003, T-CODEOWNERS-004, T-CODEOWNERS-007, T-CODEOWNERS-008, T-CODEOWNERS-009, T-CODEOWNERS-010
+        let parsed = parseCodeowners("# comment\n/.gitcode/ @jyf219 bad-owner\n/cjpm/ @old\n/cjpm/main.cj @new\n")
+        @Expect(parsed.rules.size, 3)
+        @Expect(parsed.diagnostics[0].code, "invalid_owner")
+        @Expect(resolveCodeownersForPaths(parsed.rules, [".gitcode/config.yml"]).owners[0].mention, "@jyf219")
+        let overridden = resolveCodeownersForPaths(parsed.rules, ["cjpm/main.cj"])
+        @Expect(overridden.owners[0].mention, "@new")
+        @Expect(resolveCodeownersForPaths(parseCodeowners("").rules, ["a.cj"]).codeownerStatus, "empty")
+        let many = ArrayList<String>()
+        for (i in 0..110) { many.add("cjpm/file${i}.cj") }
+        @Expect(resolveCodeownersForPaths(parsed.rules, many.toArray()).changedFilesTruncated, true)
+        let prEvent = GitCodeEvent("gitcode:cangjie/cangjie_tools:pr:9", "cangjie", "cangjie_tools", "pr", "9", "alice", "", "", "pr")
+        @Expect(renderReviewRequestJson("job-codeowners", prEvent, codeowners: overridden).contains("\"codeownerStatus\":\"resolved\""), true)
+        let issueEvent = GitCodeEvent("gitcode:cangjie/cangjie_tools:issue:9", "cangjie", "cangjie_tools", "issue", "9", "alice", "", "", "issue")
+        @Expect(renderReviewRequestJson("job-codeowners-issue", issueEvent).contains("\"codeownerStatus\":\"not_applicable\""), true)
+    }
+
+    @TestCase
+    public func reviewTemplatesClassifyExtractAndRedact(): Unit {
+        // T-TEMPLATE-001, T-TEMPLATE-002, T-TEMPLATE-003, T-TEMPLATE-004, T-TEMPLATE-005, T-TEMPLATE-006, T-TEMPLATE-007, T-TEMPLATE-008, T-TEMPLATE-009, T-TEMPLATE-010, T-TEMPLATE-011, T-TEMPLATE-012
+        let bugBody = "### cjc版本信息 | cjc version information\n0.53.4\n### 分支版本信息 | Branch version information\n- [x] main\n- [ ] dev\nAuthorization: Bearer secret\n/Users/alice/private\n"
+        let bugFields = extractIssueFields(bugBody, "bug", [])
+        @Expect(bugFields.cjcVersion, "0.53.4")
+        @Expect(bugFields.branchVersions[0], "main")
+        @Expect(bugFields.description.contains("Bearer secret"), false)
+        @Expect(bugFields.description.contains("/Users/alice"), false)
+        @Expect(classifyIssueKind("[Feature]: add cache", [], "", []), "feature-request")
+        @Expect(classifyIssueKind("need help", ["question"], "", []), "question")
+        @Expect(classifyIssueKind("broken yaml", [], "name: [", []), "unknown")
+        let prEn = extractPrFields("## Change Type\n- [x] Bugfix\n## Related Issue\nhttps://gitcode.com/cangjie/compiler/issues/1", [])
+        @Expect(prEn.changeTypes[0], "Bugfix")
+        @Expect(prEn.relatedIssues[0], "https://gitcode.com/cangjie/compiler/issues/1")
+        @Expect(extractPrFields("## 变更类型\n- [x] 问题修复\n## 关联 Issue\n无", []).changeTypes[0], "问题修复")
+    }
+
+    @TestCase
+    public func reviewWebhookEnvelopeAndCorporateProcessorRecordOnly(): Unit {
+        // T-CONTRACT-007, T-TEMPLATE-013, T-TEMPLATE-014, T-IDENTITY-009, T-E2E-001, T-DIAG-003
+        let parsed = parseGitCodeWebhookPayload("Note Hook", "{" +
+            "\"project\":{\"path_with_namespace\":\"cangjie/compiler\"}," +
+            "\"issue\":{\"iid\":12,\"title\":\"question\",\"description\":\"issue body\"}," +
+            "\"object_attributes\":{\"id\":9001,\"action\":\"create\",\"note\":\"comment body\",\"noteable_type\":\"Issue\",\"url\":\"https://gitcode.com/cangjie/compiler/issues/12#note_9001\"}," +
+            "\"user\":{\"username\":\"alice\",\"email\":\"alice@example.com\"}" +
+        "}")
+        @Expect(parsed.ok, true)
+        @Expect(parsed.envelope.isSome(), true)
+        @Expect(parsed.envelope.getOrThrow().eventType, "comment")
+        @Expect(parsed.envelope.getOrThrow().commentBody, "comment body")
+        @Expect(parsed.envelope.getOrThrow().body, "issue body")
+        let missingComment = parseGitCodeWebhookPayload("Note Hook", "{\"project\":{\"path_with_namespace\":\"cangjie/compiler\"},\"issue\":{\"iid\":12},\"object_attributes\":{\"note\":\"x\",\"noteable_type\":\"Issue\"}}")
+        @Expect(missingComment.ok, false)
+        @Expect(missingComment.errorKind, "missing_comment_id")
+        let dir = tempDir("gcm-record-only")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let delivery = GitCodeWebhookDelivery("delivery-corporate", "main", "Issue Hook", 1000, hashRawPayload("payload"), "", "pending", 0, "", 0, "ip")
+        @Expect(queue.enqueue(delivery, reviewFactsIssuePayload(email: "dev@huawei.com").toArray()).ok, true)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = runtime.store.load()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+        let result = processWebhookBatch(config, runtime, state, queue, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+        @Expect(result.processed, 1)
+        @Expect(state.hasSeen("gitcode:cangjie/cangjie_tools:issue:71"), true)
+        @Expect(state.audit[state.audit.size - 1].status, "record_only")
+        @Expect(state.audit[state.audit.size - 1].reason, "corporate_author")
+        @Expect(sink.lines.size, 0)
+        let statusPayload = webhookStatusPayload(config, queue, state: Some<MonitorState>(state))
+        @Expect(statusPayload.contains("\"recordOnly\":1"), true)
+        @Expect(statusPayload.contains("\"accepted\":0"), true)
+        @Expect(statusPayload.contains("token-secret"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func reviewGitCodeRequestBuildersCoverContentsAndPullRequestFiles(): Unit {
+        // T-MAINT-003, T-CODEOWNERS-005, T-CODEOWNERS-006, T-TEMPLATE-006
+        let client = GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5/", token: "secret")
+        let contents = client.contentsRequest(GitCodeRepo("Cangjie", "community"), "team/repo_list.md", "main")
+        @Expect(contents.method, "GET")
+        @Expect(contents.url, "https://mock.gitcode.test/api/v5/repos/Cangjie/community/contents/team%2Frepo_list.md?ref=main")
+        @Expect(contents.redactedLogLine().contains("secret"), false)
+        @Expect(fetchRepoListMd(client).status, "fetch_failed")
+        @Expect(fetchCodeowners(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main").status, "missing")
+        @Expect(fetchIssueTemplateCatalog(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main").status, "missing")
+        @Expect(fetchPrTemplateCatalog(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main").status, "missing")
+        @Expect(client.pullRequestFilesRequest(GitCodeRepo("Cangjie", "cangjie_tools"), 9).url, "https://mock.gitcode.test/api/v5/repos/Cangjie/cangjie_tools/pulls/9/files")
     }
 }

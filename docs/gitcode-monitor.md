@@ -2,6 +2,16 @@
 
 GitCodeMonitor owns GitCode API access, scan state, notification audit, MCP client calls, and GitCode comment writeback. Metis is only called through MCP and never receives GitCode credentials.
 
+## Review Contract
+
+GCM to Metis review events are governed by these contract documents:
+
+- [gcm-metis-gitcode-review-contract-v1.md](gcm-metis-gitcode-review-contract-v1.md)
+- [gcm-gitcode-review-domain-model-v1.md](gcm-gitcode-review-domain-model-v1.md)
+- [gcm-gitcode-review-footer-format-v1.md](gcm-gitcode-review-footer-format-v1.md)
+
+`gitcode.event.accepted` keeps legacy top-level fields and adds `contractVersion` plus `reviewRequest`.
+
 For field-by-field configuration guidance, especially `feishu.webhook`,
 `telegram.botToken`, `telegram.chatId`, `gitcode.token`, and staged dry-run to
 writeback rollout, see [configuration.zh.md](configuration.zh.md).

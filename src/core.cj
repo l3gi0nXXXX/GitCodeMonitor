@@ -938,6 +938,14 @@ public class GitCodeApiClient {
         HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls/${urlPart(itemId)}/comments?page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
     }
 
+    public func contentsRequest(repo: GitCodeRepo, path: String, ref: String): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/contents/${urlPart(path)}?ref=${urlPart(ref)}"), headers: authHeaders())
+    }
+
+    public func pullRequestFilesRequest(repo: GitCodeRepo, number: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls/${number}/files"), headers: authHeaders())
+    }
+
     public func postCommentRequest(event: GitCodeEvent, body: String): HttpRequestSpec {
         let kind = if (event.itemKind == "pr") { "pulls" } else { "issues" }
         let json = "{\"body\":\"${jsonEscape(body + "\n\n" + SELF_MARKER)}\"}"

@@ -3,6 +3,7 @@ package gitcodemonitor
 import std.collection.*
 import std.fs.{File, Path}
 import std.time.DateTime
+import stdx.encoding.json.JsonValue
 
 public class WebhookBatchResult {
     public let ok: Bool
@@ -127,6 +128,14 @@ public func processWebhookBatch(
             ignored++
             continue
         }
+        let identity = classifyCorporateAuthor(resolveAuthorEmails(JsonValue.fromStr(payload.payload).asObject(), runtime.gitCode.client), ["@huawei.com", "@h-partners.com"])
+        if (identity.decision == "record_only") {
+            state.markSeen(parsed.event.id)
+            state.addAudit(AuditRecord(parsed.event.id, status: "record_only", reason: "corporate_author"))
+            let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)
+            processed++
+            continue
+        }
         let result = processRuntimeEvent(config, state, parsed.event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: false)
         duplicates += result.duplicateEvents
         if (result.failedEvents > 0) {
@@ -233,6 +242,10 @@ public func webhookStatusPayload(
         case Some(value) => value.duplicateAuditSuppressedCount
         case None => 0
     }
+    let auditCounters = match (state) {
+        case Some(value) => webhookAuditCountersJson(value)
+        case None => "\"recordOnly\":0,\"accepted\":0,\"degraded\":0,\"maintainerDegraded\":0"
+    }
     let processorDetails = match (processorSnapshot) {
         case Some(snapshot) =>
             "\"lastBatchAtMs\":${snapshot.lastBatchAtMs},\"lastBatchClaimed\":${snapshot.lastBatchClaimed},\"lastBatchProcessed\":${snapshot.lastBatchProcessed},\"lastBatchDuplicates\":${snapshot.lastBatchDuplicates},\"lastBatchIgnored\":${snapshot.lastBatchIgnored},\"lastBatchRetried\":${snapshot.lastBatchRetried},\"lastBatchDeadLettered\":${snapshot.lastBatchDeadLettered},\"emptyTickCount\":${snapshot.emptyTickCount},\"stateSaveStatus\":\"${jsonEscape(snapshot.lastStateSaveStatus)}\",\"stateSaveSkipped\":${snapshot.lastStateSaveSkipped},\"stateSaveDurationMs\":${snapshot.lastStateSaveDurationMs},\"stateSaveBytes\":${snapshot.lastStateSaveBytes},"
@@ -250,7 +263,21 @@ public func webhookStatusPayload(
     let processed = queue.countByStatus("processed")
     let deadLetter = queue.countByStatus("dead-letter")
     let cancelled = queue.countByStatus("cancelled")
-    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${listenerDetails}${processorDetails}\"receiverHealth\":{${listenerDetails}\"stateSaveStatus\":\"${jsonEscape(receiver.processorStatus)}\"},\"processor\":{${processorDetails}\"status\":\"${jsonEscape(receiver.processorStatus)}\"},\"stateSave\":{\"status\":\"${jsonEscape(match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveStatus case None => "not_started" })}\",\"skipped\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveSkipped case None => false }},\"durationMs\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveDurationMs case None => 0 }},\"bytes\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveBytes case None => 0 }}},\"queue\":{\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled}},\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled},\"auditCount\":${auditCount},\"auditMax\":${DEFAULT_MAX_AUDIT_RECORDS},\"duplicateSuppressed\":${duplicateSuppressed},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
+    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${listenerDetails}${processorDetails}\"receiverHealth\":{${listenerDetails}\"stateSaveStatus\":\"${jsonEscape(receiver.processorStatus)}\"},\"processor\":{${processorDetails}\"status\":\"${jsonEscape(receiver.processorStatus)}\"},\"stateSave\":{\"status\":\"${jsonEscape(match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveStatus case None => "not_started" })}\",\"skipped\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveSkipped case None => false }},\"durationMs\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveDurationMs case None => 0 }},\"bytes\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveBytes case None => 0 }}},\"queue\":{\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled}},\"diagnostics\":{${auditCounters}},\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled},\"auditCount\":${auditCount},\"auditMax\":${DEFAULT_MAX_AUDIT_RECORDS},\"duplicateSuppressed\":${duplicateSuppressed},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
+}
+
+func webhookAuditCountersJson(state: MonitorState): String {
+    var recordOnly: Int64 = 0
+    var accepted: Int64 = 0
+    var degraded: Int64 = 0
+    var maintainerDegraded: Int64 = 0
+    for (record in state.audit) {
+        if (record.status == "record_only") { recordOnly++ }
+        if (record.status == "accepted") { accepted++ }
+        if (record.status.contains("degraded") || record.status.contains("error")) { degraded++ }
+        if (record.reason.contains("maintainer") || record.reason.contains("teamLeader") || record.reason.contains("codeowner")) { maintainerDegraded++ }
+    }
+    "\"recordOnly\":${recordOnly},\"accepted\":${accepted},\"degraded\":${degraded},\"maintainerDegraded\":${maintainerDegraded}"
 }
 
 public func deadLetterListPayload(queue: WebhookQueue): String {
