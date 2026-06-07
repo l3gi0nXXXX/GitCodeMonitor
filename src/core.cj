@@ -948,7 +948,7 @@ public class GitCodeApiClient {
 
     public func postCommentRequest(event: GitCodeEvent, body: String): HttpRequestSpec {
         let kind = if (event.itemKind == "pr") { "pulls" } else { "issues" }
-        let json = "{\"body\":\"${jsonEscape(body + "\n\n" + SELF_MARKER)}\"}"
+        let json = "{\"body\":\"${jsonEscape(body)}\"}"
         HttpRequestSpec("POST", withAuthQuery("${baseUrl}/repos/${urlPart(event.org)}/${urlPart(event.repo)}/${kind}/${urlPart(event.itemId)}/comments"), headers: authHeaders().concat([("Content-Type", "application/json")]), body: json)
     }
 
@@ -1669,10 +1669,15 @@ public func writebackGate(config: MonitorConfig, state: MonitorState, event: Git
 
 public class FakeCommentWriter {
     public let written = ArrayList<String>()
+    public var nextStatus: String = "ok"
     public init() {}
     public func write(event: GitCodeEvent, body: String, state: MonitorState): String {
-        let withMarker = body + "\n\n" + SELF_MARKER
-        written.add(withMarker)
+        if (nextStatus != "ok") {
+            let status = nextStatus
+            nextStatus = "ok"
+            return "error:${status}"
+        }
+        written.add(body)
         state.markReply(event.id)
         "https://gitcode.com/${event.org}/${event.repo}/comments/${written.size}"
     }
