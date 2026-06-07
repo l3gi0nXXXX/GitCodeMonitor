@@ -298,6 +298,9 @@ public class GcmWritebackRequest {
     public let safety: String
     public let needsHumanReview: Bool
     public let duplicate: Bool
+    public let parseStatus: String
+    public let teamLeaderMentions: Array<String>
+    public let codeownerMentions: Array<String>
 
     public init(
         eventId: String,
@@ -308,7 +311,10 @@ public class GcmWritebackRequest {
         draft: String,
         safety!: String = "approved",
         needsHumanReview!: Bool = false,
-        duplicate!: Bool = false
+        duplicate!: Bool = false,
+        parseStatus!: String = "ok",
+        teamLeaderMentions!: Array<String> = [],
+        codeownerMentions!: Array<String> = []
     ) {
         this.eventId = eventId.trimAscii()
         this.repo = repo.trimAscii()
@@ -319,6 +325,9 @@ public class GcmWritebackRequest {
         this.safety = safety.trimAscii()
         this.needsHumanReview = needsHumanReview
         this.duplicate = duplicate
+        this.parseStatus = parseStatus.trimAscii()
+        this.teamLeaderMentions = sanitizeMentionList(teamLeaderMentions)
+        this.codeownerMentions = sanitizeMentionList(codeownerMentions)
     }
 }
 
@@ -336,11 +345,31 @@ public class GcmWritebackApplyResult {
     public let decision: GcmWritebackDecision
     public let writerCalled: Bool
     public let replyUrl: String
-    public init(ok: Bool, decision: GcmWritebackDecision, writerCalled!: Bool = false, replyUrl!: String = "") {
+    public let maintainerMentionAppended: Bool
+    public let teamLeaderCount: Int64
+    public let codeownerCount: Int64
+    public let posted: Bool
+    public let retryable: Bool
+    public init(
+        ok: Bool,
+        decision: GcmWritebackDecision,
+        writerCalled!: Bool = false,
+        replyUrl!: String = "",
+        maintainerMentionAppended!: Bool = false,
+        teamLeaderCount!: Int64 = 0,
+        codeownerCount!: Int64 = 0,
+        posted!: Bool = false,
+        retryable!: Bool = false
+    ) {
         this.ok = ok
         this.decision = decision
         this.writerCalled = writerCalled
         this.replyUrl = replyUrl
+        this.maintainerMentionAppended = maintainerMentionAppended
+        this.teamLeaderCount = teamLeaderCount
+        this.codeownerCount = codeownerCount
+        this.posted = posted
+        this.retryable = retryable
     }
 }
 
@@ -572,7 +601,8 @@ public func buildGitCodeMonitorCapabilities(config: MonitorConfig): ArrayList<Se
 
 public func handleGcmStatusCapability(payload: String, runtime: GcmRuntime): GcmStatusResult {
     let secret = summarizeGcmSecretState(runtime.config)
-    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} gitCodeAuth=${secret.gitCodeAuth} legacyNotify=${secret.legacyNotificationAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()}")
+    let diagnostics = webhookDiagnosticCounters(runtime.state)
+    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} gitCodeAuth=${secret.gitCodeAuth} legacyNotify=${secret.legacyNotificationAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
 }
 
 public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): GcmScanOnceResult {
@@ -763,7 +793,7 @@ public func handleGcmPluginInputLineWithJobs(
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "accepted", eventReconcilePayload(config)))
         case "gitcode.writeback.apply_result" =>
             let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state))
-            GcmPluginFrameHandleResult(applied.ok, frame: gcmPluginResponseFrame(frame, applied.ok, applied.decision.reason, "{\"ok\":${applied.ok},\"status\":\"${applied.decision.reason}\",\"writerCalled\":${applied.writerCalled},\"replyUrl\":\"${jsonEscape(applied.replyUrl)}\"}"))
+            GcmPluginFrameHandleResult(applied.ok, frame: gcmPluginResponseFrame(frame, applied.ok, applied.decision.reason, gcmWritebackApplyResultPayload(applied)))
         case _ =>
             GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "capability_unsupported", "{\"ok\":false,\"status\":\"capability_unsupported\",\"capabilityId\":\"${jsonEscape(frame.capabilityId)}\"}"))
     }
@@ -800,14 +830,45 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
     let decision = evaluateGcmAutoReplyGate(request, runtime.config)
     if (!decision.allowed) {
         let _ = emitGcmWritebackAudit(buildGcmWritebackAudit(request, decision, replyUrl: ""), MetisHostClient())
-        return GcmWritebackApplyResult(true, decision)
+        recordGcmWritebackAuditState(runtime.state, request, decision, replyUrl: "", posted: false)
+        return GcmWritebackApplyResult(
+            request.parseStatus != "invalid_payload",
+            decision,
+            teamLeaderCount: request.teamLeaderMentions.size,
+            codeownerCount: request.codeownerMentions.size
+        )
     }
     let event = GitCodeEvent(request.eventId, request.repo.split("/", 2)[0], if (request.repo.contains("/")) { request.repo.split("/", 2)[1] } else { request.repo }, request.kind, request.number, "metis", "", request.url, request.draft)
-    let replyUrl = runtime.writer.write(event, appendGcmSelfMarker(request.draft), runtime.state)
-    GcmWritebackApplyResult(true, decision, writerCalled: true, replyUrl: replyUrl)
+    let mention = buildMaintainerMentionSentence(
+        request.eventId,
+        request.kind,
+        teamLeaderMentions: request.teamLeaderMentions,
+        codeownerMentions: request.codeownerMentions
+    )
+    let appended = appendMaintainerMentionSentence(request.draft, mention.sentence)
+    if (!appended.appended) {
+        runtime.state.addAudit(AuditRecord(request.eventId, status: "maintainer_mention_skipped", reason: pluginJoin(appended.diagnostics, ",")))
+    }
+    let replyUrl = runtime.writer.write(event, appended.body, runtime.state)
+    let writeStatus = if (replyUrl.startsWith("error:")) { replyUrl.split(":", 2)[1] } else { "posted" }
+    let finalDecision = GcmWritebackDecision(writeStatus == "posted", writeStatus)
+    recordGcmWritebackAuditState(runtime.state, request, finalDecision, replyUrl: if (writeStatus == "posted") { replyUrl } else { "" }, posted: writeStatus == "posted")
+    GcmWritebackApplyResult(
+        true,
+        finalDecision,
+        writerCalled: true,
+        replyUrl: if (writeStatus == "posted") { replyUrl } else { "" },
+        maintainerMentionAppended: appended.appended,
+        teamLeaderCount: request.teamLeaderMentions.size,
+        codeownerCount: request.codeownerMentions.size,
+        posted: writeStatus == "posted",
+        retryable: isRetryableGcmWritebackStatus(writeStatus)
+    )
 }
 
 public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: MonitorConfig): GcmWritebackDecision {
+    if (request.parseStatus != "ok") { return GcmWritebackDecision(false, request.parseStatus) }
+    if (request.draft.trimAscii().isEmpty()) { return GcmWritebackDecision(false, "draft_empty") }
     if (!config.autoReply) { return GcmWritebackDecision(false, "auto_reply_disabled") }
     if (config.dryRun) { return GcmWritebackDecision(false, "dry_run") }
     if (!pluginRepoAllowlisted(config.repoAllowlist, request.repo)) { return GcmWritebackDecision(false, "repo_not_allowlisted") }
@@ -815,7 +876,6 @@ public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: Monit
     if (safety != "approved" && safety != "safe") { return GcmWritebackDecision(false, "safety_rejected") }
     if (request.needsHumanReview) { return GcmWritebackDecision(false, "needs_human_review") }
     if (request.duplicate) { return GcmWritebackDecision(false, "duplicate") }
-    if (hasGcmSelfMarker(request.draft)) { return GcmWritebackDecision(false, "self_marker") }
     if (containsSecret(request.draft)) { return GcmWritebackDecision(false, "secret_detected") }
     if (containsLocalPath(request.draft)) { return GcmWritebackDecision(false, "local_path_detected") }
     GcmWritebackDecision(true, "allow_write")
@@ -827,7 +887,8 @@ public func emitGcmWritebackAudit(audit: GcmWritebackAudit, host: MetisHostClien
 }
 
 public func buildGitCodeCommentWriteRequest(request: GcmWritebackRequest): GitCodeCommentWriteRequest {
-    GitCodeCommentWriteRequest(request.repo, request.kind, request.number, appendGcmSelfMarker(request.draft))
+    let mention = buildMaintainerMentionSentence(request.eventId, request.kind, teamLeaderMentions: request.teamLeaderMentions, codeownerMentions: request.codeownerMentions)
+    GitCodeCommentWriteRequest(request.repo, request.kind, request.number, appendMaintainerMentionSentence(request.draft, mention.sentence).body)
 }
 
 public func appendGcmSelfMarker(body: String): String {
@@ -841,6 +902,32 @@ public func hasGcmSelfMarker(body: String): Bool {
 
 public func buildGcmWritebackAudit(request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = ""): GcmWritebackAudit {
     GcmWritebackAudit(request.eventId, decision.reason, hashRawPayload(request.draft), replyUrl: replyUrl)
+}
+
+private func recordGcmWritebackAuditState(state: MonitorState, request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = "", posted!: Bool = false): Unit {
+    let status = if (posted) { "writeback_posted" } else { "writeback_skipped" }
+    let record = AuditRecord(if (request.eventId.isEmpty()) { "writeback" } else { request.eventId }, status: status, reason: decision.reason)
+    record.replyUrl = replyUrl
+    record.writeDecision = decision.reason
+    record.safety = request.safety
+    state.addAudit(record)
+}
+
+private func isRetryableGcmWritebackStatus(status: String): Bool {
+    status == "gitcode_api_unavailable" || status == "gitcode_api_timeout" || status == "rate_limited" || status == "server_error"
+}
+
+private func gcmWritebackApplyResultPayload(result: GcmWritebackApplyResult): String {
+    "{\"ok\":${result.ok}," +
+        "\"status\":\"${jsonEscape(result.decision.reason)}\"," +
+        "\"writerCalled\":${result.writerCalled}," +
+        "\"posted\":${result.posted}," +
+        "\"retryable\":${result.retryable}," +
+        "\"replyUrl\":\"${jsonEscape(result.replyUrl)}\"," +
+        "\"maintainerMentionAppended\":${result.maintainerMentionAppended}," +
+        "\"teamLeaderCount\":${result.teamLeaderCount}," +
+        "\"codeownerCount\":${result.codeownerCount}" +
+    "}"
 }
 
 public func classifyGcmLegacyNotificationConfig(config: MonitorConfig): LegacyNotificationConfigSummary {
@@ -952,23 +1039,30 @@ private func eventPayload(event: GitCodeEvent, jobId!: String = ""): String {
     "{\"eventId\":\"${jsonEscape(event.id)}\",${jobPart}\"repo\":\"${jsonEscape(event.org)}/${jsonEscape(event.repo)}\",\"kind\":\"${jsonEscape(event.itemKind)}\",\"number\":\"${jsonEscape(event.itemId)}\",\"author\":\"${jsonEscape(event.actor)}\",\"url\":\"${jsonEscape(event.url)}\",\"title\":\"${jsonEscape(compactSummary(redactSecrets(scanEventTitle(event)), limit: 160))}\",\"content\":\"${jsonEscape(compactSummary(redactSecrets(event.content), limit: 500))}\"}"
 }
 
+const GCM_WRITEBACK_DRAFT_MAX_BYTES: Int64 = 32768
+
 private func parseWritebackRequest(payload: String): GcmWritebackRequest {
-    let parsed = parsePluginPayloadObject(payload)
+    let parsed = parsePluginPayloadObject(payload, maxBytes: 65536)
     if (!parsed.ok) {
-        return GcmWritebackRequest("", "", "", "", "", "", safety: "invalid_payload")
+        return GcmWritebackRequest("", "", "", "", "", "", parseStatus: "invalid_payload")
     }
-    let eventId = pluginPayloadStringField(parsed.payloadObject, "eventId")
-    let repo = pluginPayloadStringField(parsed.payloadObject, "repo")
-    let kind = pluginPayloadStringField(parsed.payloadObject, "kind")
-    let number = pluginPayloadStringField(parsed.payloadObject, "number")
-    let url = pluginPayloadStringField(parsed.payloadObject, "url")
-    let draft = pluginPayloadStringField(parsed.payloadObject, "draft", maxBytes: 32768)
-    let safety = pluginPayloadStringField(parsed.payloadObject, "safety", defaultValue: "approved")
-    let needsHumanReview = pluginPayloadBoolField(parsed.payloadObject, "needsHumanReview", defaultValue: false)
-    let duplicate = pluginPayloadBoolField(parsed.payloadObject, "duplicate", defaultValue: false)
+    let root = generatedReplyObjectForWriteback(parsed.payloadObject)
+    let eventId = pluginPayloadStringField(root, "eventId")
+    let repo = pluginPayloadStringField(root, "repo")
+    let kind = pluginPayloadStringField(root, "kind")
+    let number = pluginPayloadStringField(root, "number")
+    let url = pluginPayloadStringField(root, "url")
+    let draft = pluginPayloadStringField(root, "draft", maxBytes: 65536)
+    let safety = pluginPayloadStringField(root, "safety", defaultValue: "approved")
+    let needsHumanReview = pluginPayloadBoolField(root, "needsHumanReview", defaultValue: false)
+    let duplicate = pluginPayloadBoolField(root, "duplicate", defaultValue: false)
     if (!eventId.ok || !repo.ok || !kind.ok || !number.ok || !url.ok || !draft.ok || !safety.ok || !needsHumanReview.ok || !duplicate.ok) {
-        return GcmWritebackRequest("", "", "", "", "", "", safety: "invalid_payload")
+        return GcmWritebackRequest("", "", "", "", "", "", parseStatus: "invalid_payload")
     }
+    if (draft.value.size > GCM_WRITEBACK_DRAFT_MAX_BYTES) {
+        return GcmWritebackRequest(eventId.value, repo.value, kind.value, number.value, url.value, "", parseStatus: "draft_too_large")
+    }
+    let maintainers = writebackMaintainerContext(parsed.payloadObject, root)
     GcmWritebackRequest(
         eventId.value,
         repo.value,
@@ -978,8 +1072,84 @@ private func parseWritebackRequest(payload: String): GcmWritebackRequest {
         draft.value,
         safety: safety.value,
         needsHumanReview: needsHumanReview.value,
-        duplicate: duplicate.value
+        duplicate: duplicate.value,
+        teamLeaderMentions: maintainers.teamLeaderMentions,
+        codeownerMentions: maintainers.codeownerMentions
     )
+}
+
+class WritebackMaintainerContext {
+    public let teamLeaderMentions: Array<String>
+    public let codeownerMentions: Array<String>
+    public init(teamLeaderMentions!: Array<String> = [], codeownerMentions!: Array<String> = []) {
+        this.teamLeaderMentions = teamLeaderMentions
+        this.codeownerMentions = codeownerMentions
+    }
+}
+
+private func generatedReplyObjectForWriteback(root: JsonObject): JsonObject {
+    match (root.get("generatedReply")) {
+        case Some(value) =>
+            try { return value.asObject() } catch (_: Exception) { () }
+        case None => ()
+    }
+    root
+}
+
+private func writebackMaintainerContext(payloadRoot: JsonObject, replyRoot: JsonObject): WritebackMaintainerContext {
+    let team = ArrayList<String>()
+    let owners = ArrayList<String>()
+    addJsonStringArray(team, replyRoot, "teamLeaders")
+    addJsonStringArray(owners, replyRoot, "codeowners")
+    addJsonStringArray(team, payloadRoot, "teamLeaders")
+    addJsonStringArray(owners, payloadRoot, "codeowners")
+    addMaintainersObject(team, owners, replyRoot)
+    addMaintainersObject(team, owners, payloadRoot)
+    match (payloadRoot.get("reviewRequest")) {
+        case Some(value) =>
+            try {
+                let review = value.asObject()
+                addMaintainersObject(team, owners, review)
+            } catch (_: Exception) { () }
+        case None => ()
+    }
+    WritebackMaintainerContext(teamLeaderMentions: sanitizeMentionList(team.toArray()), codeownerMentions: sanitizeMentionList(owners.toArray()))
+}
+
+private func addMaintainersObject(team: ArrayList<String>, owners: ArrayList<String>, root: JsonObject): Unit {
+    match (root.get("maintainers")) {
+        case Some(value) =>
+            try {
+                let obj = value.asObject()
+                addJsonStringArray(team, obj, "teamLeaders")
+                addJsonStringArray(team, obj, "teamLeaderMentions")
+                addJsonStringArray(owners, obj, "codeowners")
+                addJsonStringArray(owners, obj, "codeownerMentions")
+            } catch (_: Exception) { () }
+        case None => ()
+    }
+}
+
+private func addJsonStringArray(out: ArrayList<String>, root: JsonObject, key: String): Unit {
+    match (root.get(key)) {
+        case Some(value) =>
+            try {
+                let text = value.asString().getValue()
+                out.add(text)
+                return
+            } catch (_: Exception) { () }
+            try {
+                for (item in value.asArray().getItems()) {
+                    try { out.add(item.asString().getValue()) } catch (_: Exception) { () }
+                    try {
+                        let obj = item.asObject()
+                        let mention = firstJsonString(obj, ["mention", "login", "username", "name"])
+                        if (!mention.isEmpty()) { out.add(mention) }
+                    } catch (_: Exception) { () }
+                }
+            } catch (_: Exception) { () }
+        case None => ()
+    }
 }
 
 public func parsePluginPayloadObject(payload: String, maxBytes!: Int64 = 16384): PluginPayloadParseResult {

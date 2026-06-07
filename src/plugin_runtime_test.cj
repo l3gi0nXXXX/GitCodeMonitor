@@ -382,9 +382,10 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", safety: "rejected"), config).reason, "safety_rejected")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", needsHumanReview: true), config).reason, "needs_human_review")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", duplicate: true), config).reason, "duplicate")
-        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, appendGcmSelfMarker("safe")), config).reason, "self_marker")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "token=secret"), config).reason, "secret_detected")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "/Users/name/file"), config).reason, "local_path_detected")
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, ""), config).reason, "draft_empty")
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", parseStatus: "draft_too_large"), config).reason, "draft_too_large")
         @Expect(evaluateGcmAutoReplyGate(request, config).reason, "allow_write")
     }
 
@@ -400,8 +401,9 @@ public class GitCodeMonitorPluginRuntimeTest {
         let applied = handleGcmWritebackApplyResult(payload, runtime)
         @Expect(applied.ok, true)
         @Expect(applied.writerCalled, true)
+        @Expect(applied.posted, true)
         @Expect(runtime.writer.written.size, 1)
-        @Expect(runtime.writer.written[0].contains(SELF_MARKER), true)
+        @Expect(runtime.writer.written[0].contains(SELF_MARKER), false)
 
         let blocked = handleGcmWritebackApplyResult(payload.replace("\"approved\"", "\"rejected\""), runtime)
         @Expect(blocked.writerCalled, false)
@@ -410,12 +412,12 @@ public class GitCodeMonitorPluginRuntimeTest {
 
     @TestCase
     public func writebackHelpersBuildRequestsMarkerAndAuditsWithoutSecrets(): Unit {
-        let request = GcmWritebackRequest("e2", "Cangjie/stdx", "pr", "2", "https://gitcode.com/Cangjie/stdx/pulls/2", "draft")
+        let request = GcmWritebackRequest("e2", "Cangjie/stdx", "pr", "2", "https://gitcode.com/Cangjie/stdx/pulls/2", "draft", teamLeaderMentions: ["@alice"], codeownerMentions: ["@bob"])
         let write = buildGitCodeCommentWriteRequest(request)
         @Expect(write.credentialScope, "gcm-internal")
-        @Expect(write.body.contains(SELF_MARKER), true)
-        @Expect(hasGcmSelfMarker(write.body), true)
-        @Expect(appendGcmSelfMarker(write.body), write.body)
+        @Expect(write.body.contains(SELF_MARKER), false)
+        @Expect(hasGcmSelfMarker(write.body), false)
+        @Expect(write.body.contains("@alice，@bob"), true)
         let audit = buildGcmWritebackAudit(request, GcmWritebackDecision(false, "dry_run"))
         @Expect(audit.bodyHash.startsWith("payload-"), true)
         let host = MetisHostClient()
@@ -423,6 +425,177 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(emitted.ok, true)
         @Expect(emitted.frame.capabilityId, "gitcode.writeback.audit")
         @Expect(emitted.frame.payload.contains("draft"), false)
+
+        let client = GitCodeApiClient(baseUrl: "https://gitcode.example/api/v5")
+        let prPost = client.postCommentRequest(GitCodeEvent("e-pr", "Cangjie", "stdx", "pr", "2", "", "", "", ""), write.body)
+        @Expect(prPost.url, "https://gitcode.example/api/v5/repos/Cangjie/stdx/pulls/2/comments")
+        @Expect(prPost.body.contains(SELF_MARKER), false)
+        let issuePost = client.postCommentRequest(GitCodeEvent("e-issue", "Cangjie", "stdx", "issue", "3", "", "", "", ""), "body")
+        @Expect(issuePost.url, "https://gitcode.example/api/v5/repos/Cangjie/stdx/issues/3/comments")
+        @Expect(issuePost.body.contains(SELF_MARKER), false)
+    }
+
+    @TestCase
+    public func maintainerMentionBuildersCoverNaturalFooterAndNotificationPlan(): Unit {
+        let sanitized = sanitizeMentionList(["alice", "@Bob", "@alice", "@bad:name", "", "@carol.dev"])
+        @Expect(sanitized.size, 3)
+        @Expect(sanitized[0], "@alice")
+        @Expect(sanitized[1], "@Bob")
+        @Expect(sanitized[2], "@carol.dev")
+
+        let teamOnly = buildMaintainerMentionSentence("T-WRITEBACK-001", "issue", teamLeaderMentions: ["@alice", "@bob"])
+        @Expect(teamOnly.sentence.contains("@alice，@bob"), true)
+        @Expect(teamOnly.sentence.endsWith("。"), true)
+        @Expect(teamOnly.sentence.contains("---"), false)
+        @Expect(teamOnly.sentence.contains("@Team Leader:"), false)
+        @Expect(teamOnly.sentence.contains("@Codeowner:"), false)
+        @Expect(teamOnly.sentence.contains("auto-reply"), false)
+        @Expect(teamOnly.sentence.contains("gitcodemonitor"), false)
+        @Expect(teamOnly.sentence.contains("<!--"), false)
+
+        let mixed = buildMaintainerMentionSentence("T-WRITEBACK-002", "pr", teamLeaderMentions: ["@alice"], codeownerMentions: ["@carol", "@dave", "@alice"])
+        @Expect(mixed.mentions.size, 3)
+        @Expect(mixed.sentence.contains("@alice，@carol，@dave"), true)
+
+        let invalid = buildMaintainerMentionSentence("T-WRITEBACK-003", "issue", teamLeaderMentions: ["bad:name"], codeownerMentions: ["@bad/name"])
+        @Expect(invalid.sentence, "")
+        @Expect(invalid.diagnostics[0], "maintainer_mention_unavailable")
+
+        let appended = appendMaintainerMentionSentence("分析结果  \n", teamOnly.sentence)
+        @Expect(appended.appended, true)
+        @Expect(appended.body.contains("\n\n"), false)
+        @Expect(appended.body.endsWith(teamOnly.sentence), true)
+        let dedup = appendMaintainerMentionSentence(appended.body, teamOnly.sentence)
+        @Expect(dedup.appended, false)
+        @Expect(dedup.diagnostics[0], "maintainer_mention_already_present")
+
+        let mentionOnly = buildMaintainerNotificationPlan(["@alice"], emails: [], emailNotificationEnabled: false)
+        @Expect(mentionOnly.mentionPlan.size, 1)
+        @Expect(mentionOnly.emailPlan.size, 0)
+        @Expect(mentionOnly.emailNotificationStatus, "email_disabled")
+        let emailReady = buildMaintainerNotificationPlan(["@alice"], emails: ["alice@example.com"], emailNotificationEnabled: true)
+        @Expect(emailReady.emailPlan.size, 1)
+        @Expect(emailReady.emailNotificationStatus, "ready")
+        let emailInvalid = buildMaintainerNotificationPlan(["@alice"], emails: ["bad email"], emailNotificationEnabled: true)
+        @Expect(emailInvalid.emailPlan.size, 0)
+        @Expect(emailInvalid.emailNotificationStatus, "email_unavailable")
+        @Expect(emailInvalid.diagnostics[0], "invalid_email")
+    }
+
+    @TestCase
+    public func writebackApplyResultCoversGeneratedReplyV1GatesAndStructuredResponse(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.repoAllowlist = ["Cangjie/community"]
+        let runtime = GcmRuntime(config)
+        let payload = "{" +
+            "\"contractVersion\":\"gcm-metis-gitcode-review-v1\"," +
+            "\"generatedReply\":{\"eventId\":\"e-generated\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"初步看没有发现阻塞问题。\",\"safety\":\"approved\",\"needsHumanReview\":false}," +
+            "\"reviewRequest\":{\"maintainers\":{\"teamLeaders\":[\"@alice\"],\"codeowners\":[{\"mention\":\"@carol\"},{\"mention\":\"@alice\"}]}}" +
+            "}"
+        let applied = handleGcmWritebackApplyResult(payload, runtime)
+        @Expect(applied.ok, true)
+        @Expect(applied.writerCalled, true)
+        @Expect(applied.posted, true)
+        @Expect(applied.maintainerMentionAppended, true)
+        @Expect(applied.teamLeaderCount, 1)
+        @Expect(applied.codeownerCount, 2)
+        @Expect(runtime.writer.written[0].contains("@alice，@carol"), true)
+        @Expect(runtime.writer.written[0].contains("auto-reply"), false)
+        @Expect(runtime.writer.written[0].contains("gitcodemonitor"), false)
+        @Expect(runtime.writer.written[0].contains("<!--"), false)
+
+        let human = handleGcmWritebackApplyResult(payload.replace("\"needsHumanReview\":false", "\"needsHumanReview\":true"), GcmRuntime(config))
+        @Expect(human.writerCalled, false)
+        @Expect(human.decision.reason, "needs_human_review")
+        let rejected = handleGcmWritebackApplyResult(payload.replace("\"approved\"", "\"rejected\""), GcmRuntime(config))
+        @Expect(rejected.writerCalled, false)
+        @Expect(rejected.decision.reason, "safety_rejected")
+        let secret = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", "token=secret"), GcmRuntime(config))
+        @Expect(secret.writerCalled, false)
+        @Expect(secret.decision.reason, "secret_detected")
+        let localPath = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", "/Users/alice/project/file.cj"), GcmRuntime(config))
+        @Expect(localPath.writerCalled, false)
+        @Expect(localPath.decision.reason, "local_path_detected")
+        let empty = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", ""), GcmRuntime(config))
+        @Expect(empty.writerCalled, false)
+        @Expect(empty.decision.reason, "draft_empty")
+
+        let dry = defaultConfig()
+        dry.fullScanIntervalMinutes = 10
+        dry.autoReply = true
+        dry.dryRun = true
+        dry.repoAllowlist = ["Cangjie/community"]
+        @Expect(handleGcmWritebackApplyResult(payload, GcmRuntime(dry)).decision.reason, "dry_run")
+        let disabled = defaultConfig()
+        disabled.fullScanIntervalMinutes = 10
+        disabled.autoReply = false
+        disabled.dryRun = false
+        disabled.repoAllowlist = ["Cangjie/community"]
+        @Expect(handleGcmWritebackApplyResult(payload, GcmRuntime(disabled)).decision.reason, "auto_reply_disabled")
+
+        let apiRuntime = GcmRuntime(config)
+        apiRuntime.writer.nextStatus = "gitcode_api_forbidden"
+        let forbidden = handleGcmWritebackApplyResult(payload, apiRuntime)
+        @Expect(forbidden.writerCalled, true)
+        @Expect(forbidden.posted, false)
+        @Expect(forbidden.decision.reason, "gitcode_api_forbidden")
+        @Expect(forbidden.retryable, false)
+
+        let big = StringBuilder()
+        for (_ in 0..33000) { big.append("x") }
+        let tooLarge = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", big.toString()), GcmRuntime(config))
+        @Expect(tooLarge.writerCalled, false)
+        @Expect(tooLarge.decision.reason, "draft_too_large")
+        let malformed = handleGcmWritebackApplyResult("{not-json", GcmRuntime(config))
+        @Expect(malformed.ok, false)
+        @Expect(malformed.writerCalled, false)
+        @Expect(malformed.decision.reason, "invalid_payload")
+    }
+
+    @TestCase
+    public func writebackResponseFrameAndWebhookDiagnosticsExposeNewCounters(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.repoAllowlist = ["Cangjie/community"]
+        let runtime = RuntimeContainer(config)
+        let state = MonitorState()
+        state.addAudit(AuditRecord("corp", status: "record_only", reason: "corporate_author"))
+        state.addAudit(AuditRecord("accepted", status: "accepted"))
+        state.addAudit(AuditRecord("posted", status: "writeback_posted"))
+        state.addAudit(AuditRecord("skipped", status: "writeback_skipped", reason: "dry_run"))
+        state.addAudit(AuditRecord("mention", status: "maintainer_mention_skipped", reason: "maintainer_mention_unavailable"))
+        let status = handleGcmStatusCapability("{}", GcmRuntime(config, state: state))
+        @Expect(status.summary.contains("recordOnly=1"), true)
+        @Expect(status.summary.contains("accepted=1"), true)
+        @Expect(status.summary.contains("writebackPosted=1"), true)
+        @Expect(status.summary.contains("maintainerMentionSkipped=1"), true)
+
+        let payload = webhookStatusPayload(config, WebhookQueue(config.webhook.queueDir), state: Some<MonitorState>(state))
+        @Expect(payload.contains("\"recordOnlyCount\":1"), true)
+        @Expect(payload.contains("\"acceptedCount\":1"), true)
+        @Expect(payload.contains("\"writebackPostedCount\":1"), true)
+        @Expect(payload.contains("\"writebackSkippedCount\":1"), true)
+        @Expect(payload.contains("\"maintainerMentionSkippedCount\":1"), true)
+        @Expect(payload.contains("token="), false)
+
+        let frame = ServiceFrame(
+            "request",
+            "writeback-frame",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.writeback.apply_result",
+            correlationId: "corr-writeback",
+            payload: "{\"eventId\":\"e-frame\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe\",\"safety\":\"approved\",\"teamLeaders\":[\"@alice\"]}"
+        )
+        let handled = handleGcmPluginInputLine(encodeServiceFrame(frame).trimAscii(), config, runtime, state)
+        @Expect(handled.frame.payload.contains("\"writerCalled\":true"), true)
+        @Expect(handled.frame.payload.contains("\"maintainerMentionAppended\":true"), true)
+        @Expect(handled.frame.payload.contains("\"teamLeaderCount\":1"), true)
     }
 
     @TestCase
