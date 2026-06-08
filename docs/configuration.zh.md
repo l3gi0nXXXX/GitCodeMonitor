@@ -71,6 +71,175 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 - PR 评论：`GET /repos/{owner}/{repo}/pulls/{number}/comments?...`
 - 自动回复写回：`POST /repos/{owner}/{repo}/issues/{number}/comments` 或 `POST /repos/{owner}/{repo}/pulls/{number}/comments`
 
+## GitCode Author Policy 配置
+
+`gitcode.authorPolicy` 用于配置哪些作者只记录、不进入 Metis/LLM/IM/writeback 链路。这个策略属于 GCM 的 GitCode 事件过滤边界；Metis 不应该根据原始 webhook payload 再做企业作者过滤。
+
+默认值必须是空列表：不配置 `gitcode.authorPolicy`、不配置 `recordOnlyEmailDomains`、或显式配置 `recordOnlyEmailDomains: []` 时，GCM 不过滤任何作者。也就是说，默认情况下 `@huawei.com`、`@h-partners.com` 或任何其他域名都不会被自动 record-only。
+
+不启用任何作者过滤时，可以不写该段配置，也可以显式写成：
+
+```json
+{
+  "gitcode": {
+    "authorPolicy": {
+      "recordOnlyEmailDomains": []
+    }
+  }
+}
+```
+
+如果你希望某些企业邮箱作者只记录事件、不触发后续处理，需要显式配置域名：
+
+```json
+{
+  "gitcode": {
+    "authorPolicy": {
+      "recordOnlyEnabled": true,
+      "recordOnlyEmailDomains": [
+        "@huawei.com",
+        "@h-partners.com"
+      ],
+      "unknownEmailDecision": "process"
+    }
+  }
+}
+```
+
+| 字段 | 默认值 | 应该填什么 |
+| --- | --- | --- |
+| `gitcode.authorPolicy.recordOnlyEnabled` | `true` | 可选开关。只有当该值为 `true` 且 `recordOnlyEmailDomains` 非空时，record-only 过滤才会实际生效。设为 `false` 时，即使配置了域名也不会过滤作者。 |
+| `gitcode.authorPolicy.recordOnlyEmailDomains` | `[]` | 需要 record-only 的 email 后缀列表。默认空数组，不过滤任何作者。可写 `huawei.com` 或 `@huawei.com`，解析时统一为 `@huawei.com`。 |
+| `gitcode.authorPolicy.unknownEmailDecision` | `process` | email 解析失败或没有 email 时的处理方式。当前只允许 `process`，避免把未知作者误判为需要 record-only 的作者。 |
+
+匹配规则：
+
+- 只做大小写不敏感的 email 后缀匹配，不支持正则、通配符或 URL。
+- `dev@huawei.com` 会命中 `@huawei.com`。
+- `dev@sub.huawei.com` 不会命中 `@huawei.com`；如果需要过滤子域名，必须显式配置 `@sub.huawei.com`。
+- 无 email、email 获取失败或 email 格式不合法时，按 `unknownEmailDecision=process` 继续处理事件。
+
+record-only 命中后的运行行为：
+
+1. GCM 标记该事件已见过，避免重复处理。
+2. GCM 写入审计记录，原因是 `record_only/corporate_author`。
+3. GCM 标记 webhook delivery 已处理。
+4. GCM 不发送 `gitcode.event.accepted` 给 Metis。
+5. GCM 不调用 LLM、不通知 TG/Feishu bot、不执行 GitCode 写回。
+
+## GitCode Webhook 配置
+
+GitCodeMonitor 可以作为 GitCode webhook receiver 接收 GitCode 官方推送的 Issue、PR 和评论事件。这个能力由 GCM 消费，Metis 不直接读取 GitCode 原始 webhook payload；Metis 只接收 GCM 解析、过滤和契约化后的 service plugin event。
+
+配置位置是 `gitcode.webhook`。本地 macOS 调试时，通常把 GCM listener 绑定到 `127.0.0.1:18080`，再用 cloudflared 或 ngrok 把临时公网 HTTPS URL 转发到这个本地端口。
+
+```json
+{
+  "gitcode": {
+    "baseUrl": "https://api.gitcode.com/api/v5",
+    "authMode": "PRIVATE-TOKEN",
+    "token": "<GitCode API access token>",
+    "webhook": {
+      "enabled": true,
+      "bindHost": "127.0.0.1",
+      "port": 18080,
+      "publicBaseUrl": "https://<cloudflared-or-ngrok-domain>",
+      "queueDir": ".gitcodemonitor/webhook-queue",
+      "ackMode": "fast",
+      "endpoints": [
+        {
+          "id": "main",
+          "path": "/webhooks/gitcode/main",
+          "token": "<GCM webhook endpoint token>",
+          "allowedEvents": [
+            "Issue Hook",
+            "Merge Request Hook",
+            "Note Hook"
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+| 字段 | 是否建议填写 | 应该填什么 |
+| --- | --- | --- |
+| `gitcode.webhook.enabled` | 需要 webhook-first 模式时必填 | `true` 表示启动 GCM webhook listener。 |
+| `gitcode.webhook.bindHost` | 本地调试建议填写 | 本地 cloudflared/ngrok 转发场景建议 `127.0.0.1`。如果直接部署到公网服务器，可按部署边界选择监听地址。 |
+| `gitcode.webhook.port` | 必填或使用默认值 | GCM webhook listener 端口。本地联调建议 `18080`。 |
+| `gitcode.webhook.publicBaseUrl` | GitCode 真实投递时必填 | GitCode 后台能访问到的公网 HTTPS 根地址，不包含 endpoint path，例如 `https://example.trycloudflare.com`。 |
+| `gitcode.webhook.queueDir` | 建议填写 | webhook 持久化队列目录。建议使用被 `.gitignore` 忽略的 `.gitcodemonitor/webhook-queue`。 |
+| `gitcode.webhook.ackMode` | 通常填写 `fast` | 当前实现只接受 `fast`。GCM 收到合法请求后快速返回 `202`，后续由 processor 异步处理。 |
+| `gitcode.webhook.endpoints[].id` | 必填 | endpoint 标识，例如 `main`。 |
+| `gitcode.webhook.endpoints[].path` | 必填 | GitCode webhook URL path，例如 `/webhooks/gitcode/main`。GitCode 后台最终 URL 应为 `publicBaseUrl + path`。 |
+| `gitcode.webhook.endpoints[].token` | 必填，除非使用签名密钥 | GCM endpoint token。它不是 GitCode API token，也不是 Metis token。GitCode 后台 webhook 密码/Secret Token 必须填写同一个值。 |
+| `gitcode.webhook.endpoints[].signatureSecret` | 可选 | 预留签名密钥字段。当前常用配置是填写 `token`。 |
+| `gitcode.webhook.endpoints[].allowedEvents` | 建议显式填写 | GCM 接收事件白名单，当前只能填写 `Issue Hook`、`Merge Request Hook`、`Note Hook`。 |
+| `gitcode.webhook.endpoints[].enabled` | 可选 | 不填时默认为 `true`。 |
+
+`allowedEvents` 是大小写敏感的精确字符串，必须按 GitCode webhook 请求头 `X-GitCode-Event` 的事件名填写。当前实现只接受以下三个值：
+
+| 事件名 | 含义 |
+| --- | --- |
+| `Issue Hook` | Issue 新建、更新等事件。GCM 后续只对需要回复的新 Issue 动作继续处理。 |
+| `Merge Request Hook` | PR 新建、更新等事件。GCM 后续只对需要回复的新 PR 动作继续处理。 |
+| `Note Hook` | 评论事件。GCM 后续只处理 Issue/PR 评论，忽略 commit note 等非目标评论。 |
+
+不要写成小写或下划线形式，例如 `issue_hook`、`merge_request_hook`、`note_hook`。这些值不会通过当前 GCM 配置校验或 webhook 接收白名单校验。
+
+字段名也可以写成 `events`，GCM 会按同样规则解析；但用户配置建议统一使用 `allowedEvents`，避免和 GitCode 后台页面里的事件勾选项混淆。
+
+GCM 对这个字段的消费路径如下：
+
+1. 启动时从 `gitcode.webhook.endpoints[]` 读取 `allowedEvents`。
+2. 配置校验阶段确认事件名只包含 `Issue Hook`、`Merge Request Hook`、`Note Hook`。
+3. HTTP webhook 请求进入 GCM listener 后，读取请求头 `X-GitCode-Event`。
+4. 如果请求头事件名不在 endpoint 的 `allowedEvents` 中，GCM 返回 `400 rejected unknown event`。
+5. 事件通过白名单、token、content-type、body size、JSON 校验后写入 GCM webhook queue。
+
+配置后可以用以下命令验证原始配置是否显式包含事件白名单：
+
+```bash
+jq '.gitcode.webhook | {
+  enabled,
+  bindHost,
+  port,
+  publicBaseUrl,
+  queueDir,
+  endpointCount: (.endpoints | length),
+  endpoints: [.endpoints[] | {id, path, allowedEvents}]
+}' .gitcodemonitor/gcm-live.json
+```
+
+预期 `endpoints[0].allowedEvents` 输出为：
+
+```json
+[
+  "Issue Hook",
+  "Merge Request Hook",
+  "Note Hook"
+]
+```
+
+也可以用 GCM 自己的解析结果确认运行时生效配置：
+
+```bash
+cjpm run --skip-build --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.json config summary"
+```
+
+预期输出中包含：
+
+```text
+webhookEndpoints=main:/webhooks/gitcode/main:Issue Hook|Merge Request Hook|Note Hook
+```
+
+GitCode 后台 webhook 配置时：
+
+- URL 填 `publicBaseUrl + endpoints[0].path`，例如 `https://example.trycloudflare.com/webhooks/gitcode/main`。
+- 密码/Secret Token 填 `endpoints[0].token` 的值。
+- 事件只勾选 Issue、Pull Request/Merge Request、评论/Note 相关事件。
+
 ## Metis MCP 配置
 
 | 字段 | 是否建议填写 | 应该填什么 |

@@ -895,6 +895,24 @@ public class GitCodeWebhookETest {
         "}"
     }
 
+    private func reviewFactsIssuePayloadWithoutEmail(): String {
+        "{" +
+            "\"object_kind\":\"issue\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/cangjie_tools\"}," +
+            "\"object_attributes\":{\"iid\":71,\"action\":\"open\",\"title\":\"[Bug]: parser\",\"description\":\"details\",\"url\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/71\"}," +
+            "\"user\":{\"name\":\"Alice\",\"username\":\"alice\",\"html_url\":\"https://gitcode.com/alice\"}" +
+        "}"
+    }
+
+    private func auditContains(state: MonitorState, status: String, reason!: String = ""): Bool {
+        for (audit in state.audit) {
+            if (audit.status == status && (reason.isEmpty() || audit.reason == reason)) {
+                return true
+            }
+        }
+        false
+    }
+
     @TestCase
     public func reviewContractValidationCoversRequiredAndUnsafePayloads(): Unit {
         // T-CONTRACT-001, T-CONTRACT-002, T-CONTRACT-003, T-CONTRACT-004, T-CONTRACT-005, T-CONTRACT-009
@@ -1000,8 +1018,8 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
-    public func reviewWebhookEnvelopeAndCorporateProcessorRecordOnly(): Unit {
-        // T-CONTRACT-007, T-TEMPLATE-013, T-TEMPLATE-014, T-IDENTITY-009, T-E2E-001, T-DIAG-003
+    public func reviewWebhookEnvelopeAndDefaultCorporateAuthorProcessesNormally(): Unit {
+        // T-CONTRACT-007, T-TEMPLATE-013, T-TEMPLATE-014, T-IDENTITY-009, T-AP-PROCESSOR-001, T-AP-E2E-001
         let parsed = parseGitCodeWebhookPayload("Note Hook", "{" +
             "\"project\":{\"path_with_namespace\":\"cangjie/compiler\"}," +
             "\"issue\":{\"iid\":12,\"title\":\"question\",\"description\":\"issue body\"}," +
@@ -1028,14 +1046,57 @@ public class GitCodeWebhookETest {
         let result = processWebhookBatch(config, runtime, state, queue, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
         @Expect(result.processed, 1)
         @Expect(state.hasSeen("gitcode:cangjie/cangjie_tools:issue:71"), true)
-        @Expect(state.audit[state.audit.size - 1].status, "record_only")
-        @Expect(state.audit[state.audit.size - 1].reason, "corporate_author")
-        @Expect(sink.lines.size, 0)
+        @Expect(auditContains(state, "record_only", reason: "corporate_author"), false)
+        @Expect(sink.lines.size, 1)
+        @Expect(decodeServiceFrame(sink.lines[0]).frame.capabilityId, "gitcode.event.accepted")
         let statusPayload = webhookStatusPayload(config, queue, state: Some<MonitorState>(state))
-        @Expect(statusPayload.contains("\"recordOnly\":1"), true)
-        @Expect(statusPayload.contains("\"accepted\":0"), true)
+        @Expect(statusPayload.contains("\"recordOnly\":0"), true)
         @Expect(statusPayload.contains("token-secret"), false)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func authorPolicyConfiguredDomainsDriveWebhookRecordOnlyDecisions(): Unit {
+        // T-AP-PROCESSOR-002, T-AP-PROCESSOR-003, T-AP-PROCESSOR-004, T-AP-PROCESSOR-005, T-AP-PROCESSOR-006, T-AP-PROCESSOR-007, T-AP-DIAG-001, T-AP-DIAG-002, T-AP-DIAG-003, T-AP-E2E-002, T-AP-E2E-003
+        let cases = [
+            ("configured-huawei", ["@huawei.com", "@h-partners.com"], true, reviewFactsIssuePayload(email: "dev@huawei.com"), true),
+            ("configured-example", ["@example.com"], true, reviewFactsIssuePayload(email: "dev@example.com"), true),
+            ("disabled-huawei", ["@huawei.com"], false, reviewFactsIssuePayload(email: "dev@huawei.com"), false),
+            ("subdomain-not-matched", ["@huawei.com"], true, reviewFactsIssuePayload(email: "dev@sub.huawei.com"), false),
+            ("missing-email", ["@huawei.com"], true, reviewFactsIssuePayloadWithoutEmail(), false),
+            ("custom-does-not-imply-huawei", ["@example.com"], true, reviewFactsIssuePayload(email: "dev@huawei.com"), false)
+        ]
+        for ((name, domains, enabled, payload, expectRecordOnly) in cases) {
+            let dir = tempDir("gcm-author-policy-${name}")
+            let config = enabledConfig(dir.join("queue").toString())
+            config.authorPolicy.recordOnlyEnabled = enabled
+            config.authorPolicy.recordOnlyEmailDomains = domains
+            let queue = WebhookQueue(config.webhook.queueDir)
+            let delivery = GitCodeWebhookDelivery("delivery-${name}", "main", "Issue Hook", 1000, hashRawPayload(payload), "", "pending", 0, "", 0, "ip")
+            @Expect(queue.enqueue(delivery, payload.toArray()).ok, true)
+            let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+            let state = runtime.store.load()
+            let sink = GcmMemoryLineSink()
+            let writer = GcmPluginStdioWriter(sink)
+            let result = processWebhookBatch(config, runtime, state, queue, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+            @Expect(result.processed, 1)
+            @Expect(queue.countByStatus("processed"), 1)
+            if (expectRecordOnly) {
+                @Expect(auditContains(state, "record_only", reason: "corporate_author"), true)
+                @Expect(sink.lines.size, 0)
+            } else {
+                @Expect(auditContains(state, "record_only", reason: "corporate_author"), false)
+                @Expect(sink.lines.size, 1)
+                @Expect(decodeServiceFrame(sink.lines[0]).frame.capabilityId, "gitcode.event.accepted")
+            }
+            let statusPayload = webhookStatusPayload(config, queue, state: Some<MonitorState>(state))
+            @Expect(statusPayload.contains("\"recordOnlyEnabled\":${enabled}"), true)
+            @Expect(statusPayload.contains("\"recordOnlyDomainCount\":${domains.size}"), true)
+            @Expect(statusPayload.contains("\"recordOnlyEffective\":${enabled && domains.size > 0}"), true)
+            @Expect(statusPayload.contains("dev@"), false)
+            @Expect(statusPayload.contains("token-secret"), false)
+            try { remove(dir, recursive: true) } catch (_: Exception) { () }
+        }
     }
 
     @TestCase

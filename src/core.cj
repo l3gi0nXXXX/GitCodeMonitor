@@ -14,6 +14,22 @@ import stdx.net.tls.*
 public let SELF_MARKER = "<!-- gitcodemonitor:auto-reply:v1 -->"
 public const DEFAULT_MAX_AUDIT_RECORDS: Int64 = 1000
 
+public class AuthorPolicyConfig {
+    public var recordOnlyEnabled: Bool
+    public var recordOnlyEmailDomains: Array<String>
+    public var unknownEmailDecision: String
+
+    public init(
+        recordOnlyEnabled!: Bool = true,
+        recordOnlyEmailDomains!: Array<String> = [],
+        unknownEmailDecision!: String = "process"
+    ) {
+        this.recordOnlyEnabled = recordOnlyEnabled
+        this.recordOnlyEmailDomains = recordOnlyEmailDomains
+        this.unknownEmailDecision = unknownEmailDecision
+    }
+}
+
 public class MonitorConfig {
     public var orgs: Array<String>
     public var fullScanIntervalMinutes: Int64
@@ -36,6 +52,7 @@ public class MonitorConfig {
     public var mcpEndpoint: String
     public var mcpServiceToken: String
     public var statePath: String
+    public var authorPolicy: AuthorPolicyConfig
     public var webhook: WebhookReceiverConfig
     public var notifyNetworkEnabled: Bool
     public var feishuWebhook: String
@@ -64,6 +81,7 @@ public class MonitorConfig {
         this.mcpEndpoint = ""
         this.mcpServiceToken = ""
         this.statePath = "data/gitcodemonitor-state.json"
+        this.authorPolicy = AuthorPolicyConfig()
         this.webhook = defaultWebhookReceiverConfigForStatePath(this.statePath)
         this.notifyNetworkEnabled = false
         this.feishuWebhook = ""
@@ -108,6 +126,10 @@ public func validateConfig(config: MonitorConfig): String {
     if (!config.dryRun && config.autoReply && config.repoAllowlist.size == 0) {
         return "writeback enabled but repo allowlist missing"
     }
+    let authorPolicyValidation = validateAuthorPolicyConfig(config.authorPolicy)
+    if (authorPolicyValidation != "ok") {
+        return "authorPolicy ${authorPolicyValidation}"
+    }
     let webhookValidation = validateWebhookReceiverConfig(config.webhook)
     if (!webhookValidation.ok) {
         return "webhook ${webhookValidation.status}"
@@ -134,8 +156,15 @@ public func configSummary(config: MonitorConfig): String {
         "autoReply=${config.autoReply}\n" +
         "allowlist=${joinStrings(config.repoAllowlist, ",")}\n" +
         "notifyNetworkEnabled=${config.notifyNetworkEnabled}\n" +
+        "recordOnlyEnabled=${config.authorPolicy.recordOnlyEnabled}\n" +
+        "recordOnlyDomainCount=${config.authorPolicy.recordOnlyEmailDomains.size}\n" +
+        "recordOnlyEffective=${authorPolicyRecordOnlyEffective(config.authorPolicy)}\n" +
         "statePath=${config.statePath}\n" +
         webhookConfigSummary(config.webhook)
+}
+
+public func authorPolicyRecordOnlyEffective(policy: AuthorPolicyConfig): Bool {
+    policy.recordOnlyEnabled && policy.recordOnlyEmailDomains.size > 0
 }
 
 public class GitCodeEvent {
@@ -2221,10 +2250,60 @@ func applyGitCodeSection(config: MonitorConfig, obj: JsonObject): Unit {
     if (!username.isEmpty()) { config.gitCodeUsername = username }
     let password = firstJsonString(obj, ["password", "gitCodePassword"])
     if (!password.isEmpty()) { config.gitCodePassword = password }
+    match (obj.get("authorPolicy")) {
+        case Some(v) => try { applyAuthorPolicySection(config, v.asObject()) } catch (_: Exception) { () }
+        case None => ()
+    }
     match (obj.get("webhook")) {
         case Some(v) => try { applyWebhookSection(config, v.asObject()) } catch (_: Exception) { () }
         case None => ()
     }
+}
+
+func applyAuthorPolicySection(config: MonitorConfig, obj: JsonObject): Unit {
+    config.authorPolicy.recordOnlyEnabled = firstJsonBool(obj, ["recordOnlyEnabled"], config.authorPolicy.recordOnlyEnabled)
+    match (obj.get("recordOnlyEmailDomains")) {
+        case Some(value) =>
+            let domains = ArrayList<String>()
+            try {
+                for (item in value.asArray().getItems()) {
+                    let normalized = normalizeAuthorPolicyDomain(jsonValueToString(item))
+                    if (!domains.contains(normalized)) { domains.add(normalized) }
+                }
+                config.authorPolicy.recordOnlyEmailDomains = domains.toArray()
+            } catch (_: Exception) { () }
+        case None => ()
+    }
+    let unknown = firstJsonString(obj, ["unknownEmailDecision"])
+    if (!unknown.isEmpty()) { config.authorPolicy.unknownEmailDecision = unknown.trimAscii().toAsciiLower() }
+}
+
+public func normalizeAuthorPolicyDomain(raw: String): String {
+    let trimmed = raw.trimAscii().toAsciiLower()
+    if (trimmed.startsWith("@")) { trimmed } else { "@${trimmed}" }
+}
+
+public func validateAuthorPolicyConfig(policy: AuthorPolicyConfig): String {
+    if (policy.unknownEmailDecision.trimAscii().toAsciiLower() != "process") {
+        return "author_policy_unknown_email_decision"
+    }
+    for (domain in policy.recordOnlyEmailDomains) {
+        if (!authorPolicyDomainIsValid(domain)) {
+            return "author_policy_invalid_domain"
+        }
+    }
+    "ok"
+}
+
+func authorPolicyDomainIsValid(domain: String): Bool {
+    let value = domain.trimAscii().toAsciiLower()
+    if (value.isEmpty() || value == "@") { return false }
+    if (!value.startsWith("@")) { return false }
+    if (!value.contains(".")) { return false }
+    if (value.contains(" ") || value.contains("\t") || value.contains("\n") || value.contains("\r")) { return false }
+    if (value.contains("*") || value.contains("://") || value.contains("/") || value.contains("\\") || value.contains(",") || value.contains(";")) { return false }
+    if (value.startsWith("@.") || value.endsWith(".")) { return false }
+    true
 }
 
 func applyFeishuSection(config: MonitorConfig, obj: JsonObject): Unit {

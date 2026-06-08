@@ -38,7 +38,44 @@ public class GitCodeMonitorCoreTest {
         @Expect(config.acpEnabled, false)
         @Expect(config.gitCodeBaseUrl, "https://api.gitcode.com/api/v5")
         @Expect(configuredHttpTransport(config), "native")
+        @Expect(config.authorPolicy.recordOnlyEnabled, true)
+        @Expect(config.authorPolicy.recordOnlyEmailDomains.size, 0)
+        @Expect(config.authorPolicy.unknownEmailDecision, "process")
+        @Expect(configSummary(config).contains("recordOnlyEnabled=true"), true)
+        @Expect(configSummary(config).contains("recordOnlyDomainCount=0"), true)
+        @Expect(configSummary(config).contains("recordOnlyEffective=false"), true)
         @Expect(validateConfig(config), "ok")
+    }
+
+    @TestCase
+    public func authorPolicyConfigParsesNormalizesAndValidatesDomains(): Unit {
+        let dir = Path("/tmp/gcm-author-policy-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        Directory.create(dir, recursive: true)
+        let path = dir.join("metis.json")
+
+        File.writeTo(path, "{\"gitcode\":{\"authorPolicy\":{\"recordOnlyEmailDomains\":[\"example.com\",\"@HUAWEI.COM\",\" h-partners.com \",\"example.com\"]}}}".toArray())
+        let config = loadConfig(path: path.toString())
+        @Expect(config.authorPolicy.recordOnlyEnabled, true)
+        @Expect(config.authorPolicy.recordOnlyEmailDomains.size, 3)
+        @Expect(config.authorPolicy.recordOnlyEmailDomains[0], "@example.com")
+        @Expect(config.authorPolicy.recordOnlyEmailDomains[1], "@huawei.com")
+        @Expect(config.authorPolicy.recordOnlyEmailDomains[2], "@h-partners.com")
+        @Expect(config.authorPolicy.unknownEmailDecision, "process")
+        @Expect(validateConfig(config), "ok")
+
+        File.writeTo(path, "{\"gitcode\":{\"authorPolicy\":{\"recordOnlyEnabled\":false,\"recordOnlyEmailDomains\":[],\"unknownEmailDecision\":\"process\"}}}".toArray())
+        let disabled = loadConfig(path: path.toString())
+        @Expect(disabled.authorPolicy.recordOnlyEnabled, false)
+        @Expect(disabled.authorPolicy.recordOnlyEmailDomains.size, 0)
+        @Expect(validateConfig(disabled), "ok")
+
+        File.writeTo(path, "{\"gitcode\":{\"authorPolicy\":{\"recordOnlyEmailDomains\":[\"*huawei.com\"]}}}".toArray())
+        @Expect(validateConfig(loadConfig(path: path.toString())).contains("authorPolicy author_policy_invalid_domain"), true)
+        File.writeTo(path, "{\"gitcode\":{\"authorPolicy\":{\"recordOnlyEmailDomains\":[\"https://huawei.com\"]}}}".toArray())
+        @Expect(validateConfig(loadConfig(path: path.toString())).contains("authorPolicy author_policy_invalid_domain"), true)
+        File.writeTo(path, "{\"gitcode\":{\"authorPolicy\":{\"unknownEmailDecision\":\"record_only\"}}}".toArray())
+        @Expect(validateConfig(loadConfig(path: path.toString())).contains("authorPolicy author_policy_unknown_email_decision"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
     @TestCase

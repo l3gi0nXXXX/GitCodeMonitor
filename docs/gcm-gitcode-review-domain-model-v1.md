@@ -8,7 +8,7 @@ Fields: `login`, `displayName`, `url`, `id`, `emails`, `emailSources`, `emailRes
 
 Resolution order: webhook `user`, `author`, `object_attributes.author`, `merge_request.author`, `pull_request.author`, `issue.author`, `note.author`; email candidates include `email`, `mail`, `public_email`, `emails[]`, and commit author email fields. If email lookup fails or is absent, GCM continues with `decision=process`.
 
-Corporate policy: any email ending with `@huawei.com` or `@h-partners.com`, case-insensitive, yields `decision=record_only`.
+Corporate policy is driven by `gitcode.authorPolicy.recordOnlyEmailDomains`. The default domain list is empty, so no author is record-only unless the user explicitly configures one or more email suffixes. Matching is case-insensitive suffix matching after normalizing entries such as `huawei.com` to `@huawei.com`.
 
 ## RepoTeamLeaderV1
 

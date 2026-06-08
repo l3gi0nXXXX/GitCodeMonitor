@@ -9,7 +9,7 @@ This document fixes the contract boundary between GitCodeMonitor and Metis for G
 | Area | Owner | Rule |
 |---|---|---|
 | GitCode webhook receive, authentication, queue, dedupe, event state | GitCodeMonitor | Metis must not parse raw GitCode webhook payload as the source of truth. |
-| Author email classification and corporate record-only policy | GitCodeMonitor | Corporate author events are recorded only and must not call Metis. |
+| Author email classification and corporate record-only policy | GitCodeMonitor | Record-only author domains are configured by `gitcode.authorPolicy.recordOnlyEmailDomains`; default is empty, so no author is filtered unless configured. Matching events are recorded only and must not call Metis. |
 | Team leader, CODEOWNERS, issue template, PR template lookup | GitCodeMonitor | Lookup failures are diagnostics, not hard failures. |
 | LLM, CKB, source workspace, external PR review engine adapter, draft generation | Metis | GCM must not call LLM, CKB, or PR review engine for user-facing reply generation. Metis owns only the adapter boundary for the external PR review engine. |
 | GitCode official API writeback | GitCodeMonitor | Metis returns a generated reply; GCM owns gate, natural maintainer mention sentence, internal writeback audit state, and API call. |
@@ -58,7 +58,9 @@ Secrets, authorization headers, cookies, tokens, passwords, bot tokens, and loca
 
 ## Corporate Record-Only
 
-If author email resolution finds any email ending with `@huawei.com` or `@h-partners.com`, GCM records the event as `record_only`, marks it seen, marks the webhook delivery processed, and does not emit `gitcode.event.accepted`.
+If author email resolution finds any email ending with a suffix explicitly configured in `gitcode.authorPolicy.recordOnlyEmailDomains`, GCM records the event as `record_only`, marks it seen, marks the webhook delivery processed, and does not emit `gitcode.event.accepted`.
+
+The default `recordOnlyEmailDomains` value is `[]`. Missing `gitcode.authorPolicy`, missing `recordOnlyEmailDomains`, or an empty list means no corporate record-only filtering is applied.
 
 If author email resolution fails, GCM records `emailResolveStatus=email_unavailable` and treats the author as external/unknown so the event can still be reviewed.
 
