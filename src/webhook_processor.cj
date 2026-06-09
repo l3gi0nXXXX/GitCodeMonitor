@@ -133,7 +133,8 @@ public func processWebhookBatch(
         if (recordOnly.decision == "record_only") {
             state.markSeen(parsed.event.id)
             let audit = AuditRecord(parsed.event.id, status: "record_only", reason: recordOnly.reason)
-            audit.requestId = "scope=${recordOnly.matchedScope};type=${recordOnly.matchedType};valueHash=${recordOnly.matchedValueHash}"
+            let missingPart = if (recordOnly.missingDiagnostics.size > 0) { ";missing=${joinStrings(recordOnly.missingDiagnostics, ",")}" } else { "" }
+            audit.requestId = "scope=${recordOnly.matchedScope};type=${recordOnly.matchedType};valueHash=${recordOnly.matchedValueHash}${missingPart}"
             state.addAudit(audit)
             let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)
             processed++

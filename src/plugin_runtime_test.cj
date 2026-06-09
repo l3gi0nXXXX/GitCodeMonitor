@@ -488,6 +488,15 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func p0NoProductionWriteHelperCanAppendSelfMarker(): Unit {
+        // T-P0-U-001 regression: only read-compatible marker helpers may remain.
+        let source = readFixture("src/plugin_runtime.cj")
+        @Expect(source.contains("func appendGcmSelfMarker"), false)
+        @Expect(source.contains("body + \"\\n\\n\" + SELF_MARKER"), false)
+        @Expect(source.contains("func hasGcmSelfMarker"), true)
+    }
+
+    @TestCase
     public func writebackApplyResultHonorsOrgScopeDeniedReposAndLegacyAllowlist(): Unit {
         let payload = "{\"eventId\":\"wb-scope-p4-e2e\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}"
 

@@ -942,6 +942,16 @@ public class GitCodeWebhookETest {
         "}"
     }
 
+    private func issue4NotePayloadMissingTarget(commentId!: String = "9010", note!: String = "natural comment"): String {
+        "{" +
+            "\"object_kind\":\"note\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"issue\":{\"iid\":4,\"title\":\"Issue 4\",\"description\":\"body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\"}," +
+            "\"object_attributes\":{\"id\":${commentId},\"author_id\":856442,\"note\":\"${note}\",\"noteable_type\":\"Issue\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_${commentId}\"}," +
+            "\"user\":{\"id\":856442,\"username\":\"l3gi0n\",\"email\":\"huxiaoming6@huawei.com\",\"web_url\":\"https://gitcode.com/l3gi0n\"}" +
+        "}"
+    }
+
     private func processOnePayload(config: MonitorConfig, payload: String, eventName: String): (MonitorState, GcmMemoryLineSink, WebhookBatchResult) {
         let queue = WebhookQueue(config.webhook.queueDir)
         @Expect(queue.enqueue(GitCodeWebhookDelivery("delivery-${hashRawPayload(payload)}", "main", eventName, 1000, hashRawPayload(payload), "", "pending", 0, "", 0, "ip"), payload.toArray()).ok, true)
@@ -994,6 +1004,18 @@ public class GitCodeWebhookETest {
         targetOnly.targetAuthorRule.ids = ["856442"]
         @Expect(classifyRecordOnlySubjects(noteSubjects, targetOnly).decision, "process")
         @Expect(classifyRecordOnlySubjects(noteSubjects, targetOnly).missingDiagnostics.contains("target_subject_missing"), false)
+
+        let missingTargetSubjects = extractWebhookSubjectSet(JsonValue.fromStr(issue4NotePayloadMissingTarget()).asObject())
+        @Expect(missingTargetSubjects.targetAuthor.isNone(), true)
+        @Expect(missingTargetSubjects.commentAuthor.isSome(), true)
+        let missingPolicy = AuthorPolicyConfig()
+        missingPolicy.recordOnlyEnabled = true
+        missingPolicy.commentAuthorRule.ids = ["856442"]
+        missingPolicy.targetAuthorRule.ids = ["707874"]
+        let missingDecision = classifyRecordOnlySubjects(missingTargetSubjects, missingPolicy)
+        @Expect(missingDecision.decision, "record_only")
+        @Expect(missingDecision.reason, "record_only_comment_author_id")
+        @Expect(missingDecision.missingDiagnostics.contains("target_subject_missing"), true)
     }
 
     @TestCase
@@ -1010,6 +1032,19 @@ public class GitCodeWebhookETest {
         @Expect(commentState.audit[0].reason.contains("huxiaoming6@huawei.com"), false)
         @Expect(webhookStatusPayload(commentIdConfig, WebhookQueue(commentIdConfig.webhook.queueDir), state: Some<MonitorState>(commentState)).contains("\"recordOnlyCommentAuthorCount\":1"), true)
         try { remove(commentIdConfigDir, recursive: true) } catch (_: Exception) { () }
+
+        let missingTargetDir = tempDir("gcm-p3-missing-target-record-only")
+        let missingTargetConfig = enabledConfig(missingTargetDir.join("queue").toString())
+        missingTargetConfig.authorPolicy.recordOnlyEnabled = true
+        missingTargetConfig.authorPolicy.commentAuthorRule.ids = ["856442"]
+        missingTargetConfig.authorPolicy.targetAuthorRule.ids = ["707874"]
+        let (missingTargetState, missingTargetSink, missingTargetResult) = processOnePayload(missingTargetConfig, issue4NotePayloadMissingTarget(), "Note Hook")
+        @Expect(missingTargetResult.processed, 1)
+        @Expect(missingTargetSink.lines.size, 0)
+        @Expect(auditContains(missingTargetState, "record_only", reason: "record_only_comment_author_id"), true)
+        @Expect(missingTargetState.audit[0].requestId.contains("target_subject_missing"), true)
+        @Expect(missingTargetState.audit[0].requestId.contains("huxiaoming6@huawei.com"), false)
+        try { remove(missingTargetDir, recursive: true) } catch (_: Exception) { () }
 
         let commentEmailDir = tempDir("gcm-p1-comment-email-record-only")
         let commentEmailConfig = enabledConfig(commentEmailDir.join("queue").toString())

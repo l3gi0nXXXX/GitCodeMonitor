@@ -908,11 +908,6 @@ public func buildGitCodeCommentWriteRequest(request: GcmWritebackRequest): GitCo
     GitCodeCommentWriteRequest(request.repo, request.kind, request.number, appendMaintainerMentionSentence(request.draft, mention.sentence).body)
 }
 
-public func appendGcmSelfMarker(body: String): String {
-    if (hasGcmSelfMarker(body)) { return body }
-    body + "\n\n" + SELF_MARKER
-}
-
 public func hasGcmSelfMarker(body: String): Bool {
     body.contains(SELF_MARKER)
 }
