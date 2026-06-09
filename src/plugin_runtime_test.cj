@@ -16,7 +16,7 @@ public class GitCodeMonitorPluginRuntimeTest {
         dir
     }
 
-    private func writeConfig(path: String, text!: String = "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"data/state.json\"},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\"}}"): Unit {
+    private func writeConfig(path: String, text!: String = "{\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\".gitcodemonitor/state.json\"},\"gitcode\":{\"baseUrl\":\"https://api.gitcode.com/api/v5\",\"token\":\"fake-token\"}}"): Unit {
         File.writeTo(Path(path), text.toArray())
     }
 
@@ -66,7 +66,11 @@ public class GitCodeMonitorPluginRuntimeTest {
         let initResult = initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: path, hostApis: ["host.agent.invoke"]))
         @Expect(initResult.ok, true)
         @Expect(initResult.serviceId, GCM_SERVICE_PLUGIN_ID)
-        @Expect(initResult.capabilities.size, 21)
+        @Expect(initResult.capabilities.size, 19)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.event.accepted"), true)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.writeback.apply_result"), true)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.agent.draft_request"), false)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.notification.generated_reply"), false)
         @Expect(initResult.diagnostic.contains("fake-token"), false)
         @Expect(initializeGcmPlugin(ServiceInitializeRequest("2.0", configRef: path)).status, "incompatible_protocol")
         @Expect(initializeGcmPlugin(ServiceInitializeRequest("1.0", configRef: "")).status, "missing_config_ref")
@@ -198,14 +202,14 @@ public class GitCodeMonitorPluginRuntimeTest {
         let config = defaultConfig()
         config.gitCodeToken = "fake-token"
         config.mcpServiceToken = "metis-token"
-        config.telegramChatId = "chat"
         config.fullScanIntervalMinutes = 10
         let secret = summarizeGcmSecretState(config)
         @Expect(secret.gitCodeAuth, "present")
         @Expect(secret.mcpAuth, "present")
-        @Expect(secret.legacyNotificationAuth, "legacy_present")
         let summary = summarizeGcmPluginModeConfig(config).text
         @Expect(summary.contains("fake-token"), false)
+        @Expect(summary.contains("legacyNotify"), false)
+        @Expect(summary.contains("telegram"), false)
         @Expect(validateGcmPluginModeConfig(config).ok, true)
         config.fullScanIntervalMinutes = 1
         @Expect(validateGcmPluginModeConfig(config).ok, false)
@@ -251,8 +255,9 @@ public class GitCodeMonitorPluginRuntimeTest {
         config.fullScanIntervalMinutes = 10
         config.autoReply = true
         config.dryRun = false
-        config.repoAllowlist = ["Cangjie/community"]
-        let runtime = GcmRuntime(config)
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer)
         let draft = "line one\nline two \"quoted\""
         let payload = "{" +
             "\"eventId\":\"e1\"," +
@@ -268,8 +273,8 @@ public class GitCodeMonitorPluginRuntimeTest {
         let applied = handleGcmWritebackApplyResult(payload, runtime)
         @Expect(applied.ok, true)
         @Expect(applied.writerCalled, true)
-        @Expect(runtime.writer.written.size, 1)
-        @Expect(runtime.writer.written[0].contains("line two \"quoted\""), true)
+        @Expect(writer.written.size, 1)
+        @Expect(writer.written[0].contains("line two \"quoted\""), true)
     }
 
     @TestCase
@@ -390,7 +395,7 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(evaluateGcmAutoReplyGate(request, config).reason, "dry_run")
         config.dryRun = false
         @Expect(evaluateGcmAutoReplyGate(request, config).reason, "repo_not_allowlisted")
-        config.repoAllowlist = ["Cangjie/community"]
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", safety: "rejected"), config).reason, "safety_rejected")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", needsHumanReview: true), config).reason, "needs_human_review")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", duplicate: true), config).reason, "duplicate")
@@ -430,15 +435,16 @@ public class GitCodeMonitorPluginRuntimeTest {
         config.fullScanIntervalMinutes = 10
         config.autoReply = true
         config.dryRun = false
-        config.repoAllowlist = ["Cangjie/community"]
-        let runtime = GcmRuntime(config)
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer)
         let payload = "{\"eventId\":\"e1\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}"
         let applied = handleGcmWritebackApplyResult(payload, runtime)
         @Expect(applied.ok, true)
         @Expect(applied.writerCalled, true)
         @Expect(applied.posted, true)
-        @Expect(runtime.writer.written.size, 1)
-        @Expect(runtime.writer.written[0].contains(SELF_MARKER), false)
+        @Expect(writer.written.size, 1)
+        @Expect(writer.written[0].contains(SELF_MARKER), false)
 
         let blocked = handleGcmWritebackApplyResult(payload.replace("\"approved\"", "\"rejected\""), runtime)
         @Expect(blocked.writerCalled, false)
@@ -454,11 +460,12 @@ public class GitCodeMonitorPluginRuntimeTest {
         orgConfig.autoReply = true
         orgConfig.dryRun = false
         orgConfig.writebackScope.allowedOrgs = ["cangjie"]
-        let orgRuntime = GcmRuntime(orgConfig)
+        let orgWriter = FakeCommentWriter()
+        let orgRuntime = GcmRuntime(orgConfig, writer: orgWriter)
         let orgApplied = handleGcmWritebackApplyResult(payload, orgRuntime)
         @Expect(orgApplied.writerCalled, true)
         @Expect(orgApplied.posted, true)
-        @Expect(orgRuntime.writer.written.size, 1)
+        @Expect(orgWriter.written.size, 1)
 
         let deniedConfig = defaultConfig()
         deniedConfig.fullScanIntervalMinutes = 10
@@ -466,18 +473,21 @@ public class GitCodeMonitorPluginRuntimeTest {
         deniedConfig.dryRun = false
         deniedConfig.writebackScope.allowedOrgs = ["cangjie"]
         deniedConfig.writebackScope.deniedRepos = ["Cangjie/community"]
-        let deniedRuntime = GcmRuntime(deniedConfig)
+        let deniedWriter = FakeCommentWriter()
+        let deniedRuntime = GcmRuntime(deniedConfig, writer: deniedWriter)
         let deniedApplied = handleGcmWritebackApplyResult(payload, deniedRuntime)
         @Expect(deniedApplied.writerCalled, false)
         @Expect(deniedApplied.decision.reason, "repo_denied_by_writeback_scope")
-        @Expect(deniedRuntime.writer.written.size, 0)
+        @Expect(deniedWriter.written.size, 0)
 
         let legacyConfig = defaultConfig()
         legacyConfig.fullScanIntervalMinutes = 10
         legacyConfig.autoReply = true
         legacyConfig.dryRun = false
         legacyConfig.repoAllowlist = ["Cangjie/community"]
-        @Expect(handleGcmWritebackApplyResult(payload, GcmRuntime(legacyConfig)).writerCalled, true)
+        let legacyApplied = handleGcmWritebackApplyResult(payload, GcmRuntime(legacyConfig))
+        @Expect(legacyApplied.writerCalled, false)
+        @Expect(legacyApplied.decision.reason, "repo_not_allowlisted")
 
         let otherOrgConfig = defaultConfig()
         otherOrgConfig.fullScanIntervalMinutes = 10
@@ -575,8 +585,9 @@ public class GitCodeMonitorPluginRuntimeTest {
         config.fullScanIntervalMinutes = 10
         config.autoReply = true
         config.dryRun = false
-        config.repoAllowlist = ["Cangjie/community"]
-        let runtime = GcmRuntime(config)
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer)
         let payload = "{" +
             "\"contractVersion\":\"gcm-metis-gitcode-review-v1\"," +
             "\"generatedReply\":{\"eventId\":\"e-generated\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"初步看没有发现阻塞问题。\",\"safety\":\"approved\",\"needsHumanReview\":false}," +
@@ -589,10 +600,10 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(applied.maintainerMentionAppended, true)
         @Expect(applied.teamLeaderCount, 1)
         @Expect(applied.codeownerCount, 2)
-        @Expect(runtime.writer.written[0].contains("@alice，@carol"), true)
-        @Expect(runtime.writer.written[0].contains("auto-reply"), false)
-        @Expect(runtime.writer.written[0].contains("gitcodemonitor"), false)
-        @Expect(runtime.writer.written[0].contains("<!--"), false)
+        @Expect(writer.written[0].contains("@alice，@carol"), true)
+        @Expect(writer.written[0].contains("auto-reply"), false)
+        @Expect(writer.written[0].contains("gitcodemonitor"), false)
+        @Expect(writer.written[0].contains("<!--"), false)
 
         let human = handleGcmWritebackApplyResult(payload.replace("\"needsHumanReview\":false", "\"needsHumanReview\":true"), GcmRuntime(config))
         @Expect(human.writerCalled, false)
@@ -614,17 +625,18 @@ public class GitCodeMonitorPluginRuntimeTest {
         dry.fullScanIntervalMinutes = 10
         dry.autoReply = true
         dry.dryRun = true
-        dry.repoAllowlist = ["Cangjie/community"]
+        dry.writebackScope.allowedRepos = ["Cangjie/community"]
         @Expect(handleGcmWritebackApplyResult(payload, GcmRuntime(dry)).decision.reason, "dry_run")
         let disabled = defaultConfig()
         disabled.fullScanIntervalMinutes = 10
         disabled.autoReply = false
         disabled.dryRun = false
-        disabled.repoAllowlist = ["Cangjie/community"]
+        disabled.writebackScope.allowedRepos = ["Cangjie/community"]
         @Expect(handleGcmWritebackApplyResult(payload, GcmRuntime(disabled)).decision.reason, "auto_reply_disabled")
 
-        let apiRuntime = GcmRuntime(config)
-        apiRuntime.writer.nextStatus = "gitcode_api_forbidden"
+        let apiWriter = FakeCommentWriter()
+        apiWriter.nextStatus = "gitcode_api_forbidden"
+        let apiRuntime = GcmRuntime(config, writer: apiWriter)
         let forbidden = handleGcmWritebackApplyResult(payload, apiRuntime)
         @Expect(forbidden.writerCalled, true)
         @Expect(forbidden.posted, false)
@@ -693,6 +705,45 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func writebackApplyResultUsesRuntimeWriterHttpSenderAndPersistsState(): Unit {
+        // T-ROOT-004, T-WRITER-006, T-WRITER-008
+        let dir = tempRuntimeDir("gcm-plugin-writeback-real-writer")
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.statePath = dir.join("state.json").toString()
+        config.gitCodeBaseUrl = "https://gitcode.example/api/v5"
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let sender = FakeHttpSender()
+        sender.nextResponse = HttpResponseSpec(201, body: "{\"html_url\":\"https://gitcode.com/Cangjie/community/issues/3#note_9\"}")
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = runtime.store.load()
+        let frame = ServiceFrame(
+            "request",
+            "writeback-real-writer",
+            GCM_SERVICE_PLUGIN_ID,
+            method: "invokeCapability",
+            capabilityId: "gitcode.writeback.apply_result",
+            correlationId: "corr-writeback-real-writer",
+            payload: "{\"eventId\":\"real-writer-e1\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"3\",\"url\":\"https://gitcode.com/Cangjie/community/issues/3\",\"draft\":\"safe draft\",\"safety\":\"approved\",\"needsHumanReview\":false}"
+        )
+
+        let handled = handleGcmPluginInputLineWithJobs(encodeServiceFrame(frame).trimAscii(), config, runtime, state, GcmScanJobStore(maxConcurrent: 1))
+
+        @Expect(handled.ok, true)
+        @Expect(handled.frame.payload.contains("\"posted\":true"), true)
+        @Expect(sender.requests.size, 1)
+        @Expect(sender.requests[0].method, "POST")
+        @Expect(sender.requests[0].url, "https://gitcode.example/api/v5/repos/Cangjie/community/issues/3/comments")
+        @Expect(sender.requests[0].body.contains("safe draft"), true)
+        @Expect(state.hasReply("real-writer-e1"), true)
+        @Expect(exists(Path(config.statePath)), true)
+        @Expect(String.fromUtf8(File.readFrom(Path(config.statePath))).contains("writeback_posted"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func writebackScopeSummaryAndPluginModeValidationUseScopeDiagnostics(): Unit {
         let config = defaultConfig()
         config.gitCodeToken = "token-secret"
@@ -729,14 +780,12 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
-    public func legacyNotificationAndMcpModesAreWarningsNotPrimaryPaths(): Unit {
+    public func deletedNotificationAndMcpDiagnosticModesStayOutOfPrimaryPath(): Unit {
         let config = defaultConfig()
-        @Expect(classifyGcmLegacyNotificationConfig(config).status, "absent")
-        config.feishuWebhook = "https://example.invalid/webhook"
-        config.telegramChatId = "chat"
-        let legacy = classifyGcmLegacyNotificationConfig(config)
-        @Expect(legacy.status, "legacy_present")
-        @Expect(renderLegacyNotificationWarning(legacy).contains("Metis Gateway"), true)
+        let summary = summarizeGcmPluginModeConfig(config).text
+        @Expect(summary.contains("legacyNotify"), false)
+        @Expect(summary.contains("feishu"), false)
+        @Expect(summary.contains("telegram"), false)
         @Expect(classifyGcmMcpClientMode(config).mode, "disabled")
         config.mcpEndpoint = "http://127.0.0.1:9000"
         let mcp = classifyGcmMcpClientMode(config)

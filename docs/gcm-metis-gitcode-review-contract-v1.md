@@ -116,7 +116,7 @@ Supported fields:
 | `monitor.writebackScope.allowedOrgs` | Organizations allowed for writeback | `owner`, case-insensitive exact match |
 | `monitor.writebackScope.allowedRepos` | Repositories allowed for writeback | `owner/repo`, case-insensitive exact match |
 | `monitor.writebackScope.deniedRepos` | Repositories excluded from writeback | `owner/repo`, case-insensitive exact match |
-| `monitor.repoAllowlist` | Legacy compatibility field | Equivalent to entries in `allowedRepos` |
+| `monitor.repoAllowlist` | Legacy diagnostic field | Parsed for validation and migration visibility only; it no longer authorizes writeback. Use `writebackScope.allowedRepos` instead. |
 
 Scope priority is:
 

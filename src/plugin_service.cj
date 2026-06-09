@@ -68,8 +68,6 @@ public func requiredGitCodeMonitorCapabilityIds(): Array<String> {
         "gitcode.monitor.scan_cancelled",
         "gitcode.event.accepted",
         "gitcode.event.ignored",
-        "gitcode.agent.draft_request",
-        "gitcode.notification.generated_reply",
         "gitcode.writeback.apply_result",
         "gitcode.writeback.audit"
     ]
@@ -205,20 +203,6 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         outputSchema: "schemas/gitcode.event.ignored.json"
     ))
     records.add(ServiceCapabilityRecord(
-        "gitcode.agent.draft_request",
-        "agentRequest",
-        direction: "gcm-to-metis",
-        description: "Request summary/draft/safety/citations from Metis Agent Runtime",
-        requiredHostApis: ["host.agent.invoke"]
-    ))
-    records.add(ServiceCapabilityRecord(
-        "gitcode.notification.generated_reply",
-        "notificationTopic",
-        direction: "metis-internal-delivery",
-        description: "Metis-delivered generated reply notification",
-        requiredHostApis: ["host.notification.publish"]
-    ))
-    records.add(ServiceCapabilityRecord(
         "gitcode.writeback.apply_result",
         "controlAction",
         direction: "metis-to-gcm",
@@ -250,20 +234,6 @@ public func validateGitCodeMonitorCapabilitySet(records: ArrayList<ServiceCapabi
     }
 
     let degraded = ArrayList<String>()
-    match (seen.get("gitcode.agent.draft_request")) {
-        case Some(record) =>
-            if (!arrayContains(record.requiredHostApis, "host.agent.invoke")) {
-                degraded.add("gitcode.agent.draft_request")
-            }
-        case None => ()
-    }
-    match (seen.get("gitcode.notification.generated_reply")) {
-        case Some(record) =>
-            if (!arrayContains(record.requiredHostApis, "host.notification.publish")) {
-                degraded.add("gitcode.notification.generated_reply")
-            }
-        case None => ()
-    }
 
     let diagnostics = ArrayList<String>()
     for (id in missing) { diagnostics.add("missing capability: ${id}") }

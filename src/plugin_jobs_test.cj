@@ -5,7 +5,7 @@ import std.fs.{File, Path, exists, remove}
 import std.time.*
 import std.unittest.testmacro.*
 
-private class ThrowingMcpCallSender <: HttpSender {
+private class ServicePluginOnlyScanSender <: HttpSender {
     public let requests = ArrayList<HttpRequestSpec>()
     public init() {}
 
@@ -26,57 +26,8 @@ private class ThrowingMcpCallSender <: HttpSender {
         if (request.url.contains("/pulls?")) {
             return HttpResponseSpec(200, body: "[]")
         }
-        if (request.body.contains("\"method\":\"tools/list\"")) {
-            return HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[{\"name\":\"gitcode_issue_summary\"},{\"name\":\"gitcode_issue_draft_reply\"},{\"name\":\"gitcode_pr_summary\"},{\"name\":\"gitcode_pr_draft_reply\"},{\"name\":\"gitcode_safety_review\"}]}}")
-        }
-        if (request.body.contains("\"method\":\"tools/call\"") && request.body.contains("gitcode:cangjie/compiler:issue:11")) {
-            throw Exception("MCP timeout Authorization: Bearer secret-token /Users/alice/.metis")
-        }
-        if (request.body.contains("\"method\":\"tools/call\"")) {
-            return HttpResponseSpec(200, body: "{\"jsonrpc\":\"2.0\",\"id\":\"call\",\"result\":{\"structuredContent\":{\"draft\":\"safe draft\",\"approved\":true,\"needsHumanReview\":false}}}")
-        }
         HttpResponseSpec(200, body: "{}")
     }
-}
-
-private class ContractMcpSender <: HttpSender {
-    public let requests = ArrayList<HttpRequestSpec>()
-    private let toolsBody: String
-    private let callBody: String
-
-    public init(toolNames: Array<String>, callBody!: String = "{\"jsonrpc\":\"2.0\",\"id\":\"call\",\"result\":{\"structuredContent\":{\"draft\":\"canonical draft\",\"approved\":true,\"needsHumanReview\":false}}}") {
-        this.toolsBody = mcpToolsListBody(toolNames)
-        this.callBody = callBody
-    }
-
-    public func send(request: HttpRequestSpec): HttpResponseSpec {
-        requests.add(request)
-        if (request.body.contains("\"method\":\"tools/list\"")) {
-            return HttpResponseSpec(200, body: toolsBody)
-        }
-        if (request.body.contains("\"method\":\"tools/call\"")) {
-            return HttpResponseSpec(200, body: callBody)
-        }
-        HttpResponseSpec(200, body: "{}")
-    }
-}
-
-private func mcpToolsListBody(names: Array<String>): String {
-    let items = ArrayList<String>()
-    for (name in names) {
-        items.add("{\"name\":\"${jsonEscape(name)}\"}")
-    }
-    "{\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[${joinStrings(items.toArray(), ",")}]}}"
-}
-
-private func metisCanonicalGitCodeTools(): Array<String> {
-    [
-        "gitcode_issue_summarize",
-        "gitcode_issue_draft_reply",
-        "gitcode_pr_summarize",
-        "gitcode_pr_draft_reply",
-        "gitcode_reply_safety_review"
-    ]
 }
 
 @Test
@@ -149,144 +100,6 @@ public class GitCodeMonitorPluginJobsTest {
             fakeSender.enqueue(HttpResponseSpec(200, body: "[]"))
         }
         fakeSender.enqueue(HttpResponseSpec(200, body: "[]"))
-    }
-
-    private func issueEventForMcpContract(): GitCodeEvent {
-        GitCodeEvent(
-            "gitcode:cangjie/compiler:issue:11",
-            "cangjie",
-            "compiler",
-            "issue",
-            "11",
-            "alice",
-            "https://gitcode.com/alice",
-            "https://gitcode.com/cangjie/compiler/issues/11",
-            "bug\nplease inspect"
-        )
-    }
-
-    @TestCase
-    public func a0McpUt002McpClientAcceptsMetisCanonicalGitCodeToolNames(): Unit {
-        // A0-MCP-UT-002
-        let sender: HttpSender = ContractMcpSender(metisCanonicalGitCodeTools())
-        let client = McpHttpClient("http://127.0.0.1:8787/mcp", sender: sender)
-
-        let schemas = client.toolsList()
-
-        @Expect(client.degradedReason == "mcp_required_tools_missing", false)
-        @Expect(schemas.size, 5)
-        @Expect(client.hasAnyGitCodeTool(["gitcode_issue_summarize"]), true)
-        @Expect(client.hasAnyGitCodeTool(["gitcode_pr_summarize"]), true)
-        @Expect(client.hasAnyGitCodeTool(["gitcode_reply_safety_review"]), true)
-    }
-
-    @TestCase
-    public func a2McpUt001HasAnyGitCodeToolAcceptsCanonicalAndLegacyAliases(): Unit {
-        // A2-MCP-UT-001
-        let canonicalClient = McpHttpClient("http://127.0.0.1:8787/mcp")
-        canonicalClient.schemaCache.add(ToolSchema("gitcode_issue_summarize"))
-        let aliasClient = McpHttpClient("http://127.0.0.1:8787/mcp")
-        aliasClient.schemaCache.add(ToolSchema("gitcode_issue_summary"))
-        let missingClient = McpHttpClient("http://127.0.0.1:8787/mcp")
-        missingClient.schemaCache.add(ToolSchema("gitcode_unknown"))
-
-        @Expect(canonicalClient.hasAnyGitCodeTool(["gitcode_issue_summary", "gitcode_issue_summarize"]), true)
-        @Expect(aliasClient.hasAnyGitCodeTool(["gitcode_issue_summary", "gitcode_issue_summarize"]), true)
-        @Expect(missingClient.hasAnyGitCodeTool(["gitcode_issue_summary", "gitcode_issue_summarize"]), false)
-    }
-
-    @TestCase
-    public func a2McpUt002MissingGitCodeToolGroupsReportsOnlyAbsentSafetyGroup(): Unit {
-        // A2-MCP-UT-002
-        let client = McpHttpClient("http://127.0.0.1:8787/mcp")
-        client.schemaCache.add(ToolSchema("gitcode_issue_summarize"))
-        client.schemaCache.add(ToolSchema("gitcode_issue_draft_reply"))
-        client.schemaCache.add(ToolSchema("gitcode_pr_summary"))
-        client.schemaCache.add(ToolSchema("gitcode_pr_draft_reply"))
-        let sender: HttpSender = ContractMcpSender([
-            "gitcode_issue_summarize",
-            "gitcode_issue_draft_reply",
-            "gitcode_pr_summary",
-            "gitcode_pr_draft_reply"
-        ])
-        let toolsListClient = McpHttpClient("http://127.0.0.1:8787/mcp", sender: sender)
-
-        let missing = joinStrings(client.missingGitCodeToolGroups(), ",")
-        let _ = toolsListClient.toolsList()
-
-        @Expect(missing.contains("safety_review|reply_safety_review"), true)
-        @Expect(missing.contains("issue_summary|issue_summarize"), false)
-        @Expect(missing.contains("pr_summary|pr_summarize"), false)
-        @Expect(missing.contains("issue_draft_reply"), false)
-        @Expect(missing.contains("pr_draft_reply"), false)
-        @Expect(toolsListClient.degradedReason, "mcp_required_tools_missing")
-        @Expect(toolsListClient.diagnostic.contains("missingGroups=safety_review|reply_safety_review"), true)
-    }
-
-    @TestCase
-    public func a2McpPos001IssueDraftCallSucceedsWithCanonicalRequiredTools(): Unit {
-        // A2-MCP-POS-001
-        let sender: HttpSender = ContractMcpSender(metisCanonicalGitCodeTools())
-        let client = McpHttpClient("http://127.0.0.1:8787/mcp", sender: sender)
-        let _ = client.toolsList()
-
-        let result = client.call(eventToToolInput(issueEventForMcpContract()))
-
-        @Expect(result.ok, true)
-        @Expect(result.errorKind.isEmpty(), true)
-        @Expect(result.draft.isEmpty(), false)
-        @Expect(result.errorKind == "tool_not_available", false)
-    }
-
-    @TestCase
-    public func a2McpNeg001ToolUnavailableIncludesRedactedDiagnostic(): Unit {
-        // A2-MCP-NEG-001
-        let tools = [
-            "gitcode_issue_summarize",
-            "gitcode_pr_summarize",
-            "gitcode_pr_draft_reply",
-            "gitcode_reply_safety_review"
-        ]
-        let sender: HttpSender = ContractMcpSender(tools)
-        let client = McpHttpClient("http://127.0.0.1:8787/mcp", serviceToken: "secret-token", sender: sender)
-        let _ = client.toolsList()
-
-        let result = client.call(eventToToolInput(issueEventForMcpContract()))
-
-        @Expect(result.ok, false)
-        @Expect(result.errorKind, "tool_not_available")
-        @Expect(result.reason.contains("requestedTool=gitcode_issue_draft_reply"), true)
-        @Expect(result.reason.contains("availableTools=4"), true)
-        @Expect(result.reason.contains("missingGroups=issue_draft_reply"), true)
-        @Expect(result.diagnostic.contains("requestedTool=gitcode_issue_draft_reply"), true)
-        @Expect(result.diagnostic.contains("missingGroups=issue_draft_reply"), true)
-        @Expect(result.reason.contains("Authorization"), false)
-        @Expect(result.reason.contains("secret-token"), false)
-        @Expect(result.reason.toAsciiLower().contains("token"), false)
-        @Expect(result.diagnostic.contains("Authorization"), false)
-        @Expect(result.diagnostic.contains("secret-token"), false)
-    }
-
-    @TestCase
-    public func a2McpBnd001LargeToolListStillAcceptsCanonicalContractAndCallsDraft(): Unit {
-        // A2-MCP-BND-001
-        let tools = ArrayList<String>()
-        for (i in 0..200) {
-            tools.add("unrelated_tool_${i}")
-        }
-        for (name in metisCanonicalGitCodeTools()) {
-            tools.add(name)
-        }
-        let sender: HttpSender = ContractMcpSender(tools.toArray())
-        let client = McpHttpClient("http://127.0.0.1:8787/mcp", sender: sender)
-
-        let schemas = client.toolsList()
-        let result = client.call(eventToToolInput(issueEventForMcpContract()))
-
-        @Expect(schemas.size, 205)
-        @Expect(client.degradedReason == "mcp_required_tools_missing", false)
-        @Expect(result.ok, true)
-        @Expect(result.draft.isEmpty(), false)
     }
 
     @TestCase
@@ -781,13 +594,13 @@ public class GitCodeMonitorPluginJobsTest {
     }
 
     @TestCase
-    public func boundedRuntimeIsolatesSingleEventExceptionAndContinues(): Unit {
+    public func boundedRuntimeAcceptsEventsWithoutLegacyMcpCall(): Unit {
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
         config.statePath = tempStatePath("runtime-event-isolation")
         config.orgs = ["cangjie"]
         config.mcpEndpoint = "http://127.0.0.1:8787/mcp"
-        let sender = ThrowingMcpCallSender()
+        let sender = ServicePluginOnlyScanSender()
         let httpSender: HttpSender = sender
         let runtime = RuntimeContainer(config, sender: Some<HttpSender>(httpSender))
         let state = runtime.store.load()
@@ -798,25 +611,19 @@ public class GitCodeMonitorPluginJobsTest {
 
         @Expect(result.stopReason, "completed")
         @Expect(result.checkedItems, 2)
-        @Expect(result.failedEvents, 1)
-        @Expect(result.newEvents, 1)
-        @Expect(result.samplesFailed.size, 1)
-        @Expect(result.samplesFailed[0].eventId, "gitcode:cangjie/compiler:issue:11")
-        @Expect(result.samplesFailed[0].reason, "timeout")
+        @Expect(result.failedEvents, 0)
+        @Expect(result.newEvents, 2)
+        @Expect(result.mcpCalls, 0)
+        @Expect(result.samplesNew.size, 2)
+        @Expect(state.hasSeen("gitcode:cangjie/compiler:issue:11"), true)
         @Expect(state.hasSeen("gitcode:cangjie/compiler:issue:12"), true)
-        var degradedAuditFound = false
-        for (record in state.audit) {
-            if (record.eventId == "gitcode:cangjie/compiler:issue:11" && record.status == "scan_degraded") {
-                degradedAuditFound = true
-                @Expect(record.reason, "timeout")
-                @Expect(record.deliveryStatus.contains("repo=cangjie/compiler"), true)
-                @Expect(record.deliveryStatus.contains("stage=event_runtime"), true)
-                @Expect(record.deliveryStatus.contains("hash=payload-"), true)
-                @Expect(record.deliveryStatus.contains("secret-token"), false)
-                @Expect(record.deliveryStatus.contains("/Users/alice"), false)
+        var mcpCallRequestFound = false
+        for (request in sender.requests) {
+            if (request.body.contains("\"method\":\"tools/call\"")) {
+                mcpCallRequestFound = true
             }
         }
-        @Expect(degradedAuditFound, true)
+        @Expect(mcpCallRequestFound, false)
 
         if (exists(Path(config.statePath))) { remove(Path(config.statePath)) }
     }

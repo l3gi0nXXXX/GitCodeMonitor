@@ -528,7 +528,7 @@ func scanOnceRuntimeBoundedForJob(
                     result.checkedItems++
                     let baselineMode = !job.backfill && !hadBaseline
                     try {
-                        let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: baselineMode)
+                        let processed = processRuntimeEvent(config, state, event, baselineMode: baselineMode)
                         if (processed.newEvents > 0) {
                             match (eventWriter) {
                                 case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)

@@ -141,7 +141,7 @@ public func processWebhookBatch(
             processed++
             continue
         }
-        let result = processRuntimeEvent(config, state, parsed.event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: false)
+        let result = processRuntimeEvent(config, state, parsed.event, baselineMode: false)
         duplicates += result.duplicateEvents
         if (result.failedEvents > 0) {
             let _ = queue.markRetry(delivery.deliveryId, "runtime_failed", nowMs + 60000)

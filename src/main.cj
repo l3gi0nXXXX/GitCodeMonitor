@@ -14,53 +14,16 @@ main(args: Array<String>): Int64 {
     }
     let config = loadConfig(path: configPath)
     if (commandArgs.size > 0 && commandArgs[0] == "scan-once") {
-        let runtime = RuntimeContainer(config)
-        let state = runtime.store.load()
-        let result = if (commandArgs.size > 1 && commandArgs[1] == "--offline-fixture") {
-            scanOnceOfflineFixture(config, state)
-        } else {
-            scanOnceRuntime(config, runtime, state)
-        }
-        let saved = runtime.store.save(state)
-        println("scan-once accepted=${result.accepted} ignored=${result.ignored} notified=${result.notified} mcpCalls=${result.mcpCalls} writes=${result.writes}")
-        if (!saved) { println("state=save_failed") }
-        return 0
+        println(servicePluginOnlyUnsupportedCommand("scan-once"))
+        return 2
     }
     if (commandArgs.size > 0 && commandArgs[0] == "webhook-http") {
-        if (!config.webhook.enabled) {
-            println("webhook-http status=disabled")
-            return 2
-        }
-        let queue = WebhookQueue(config.webhook.queueDir)
-        let runtime = RuntimeContainer(config)
-        let state = runtime.store.load()
-        let listener = WebhookHttpServerRuntime(config, queue)
-        let processorLoop = WebhookProcessorLoopRuntime(config, runtime, state, queue)
-        let started = listener.start()
-        processorLoop.start()
-        let receiver = evaluateWebhookReceiverRuntime(
-            config,
-            listenerSnapshot: Some<WebhookHttpServerSnapshot>(listener.snapshot()),
-            processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
-        )
-        println("webhook-http status=${receiver.status} listener=${receiver.listenerStatus} processor=${receiver.processorStatus} bind=${receiver.bind} diagnostic=${receiver.diagnostic}")
-        if (!started.ok && config.webhook.enabled) {
-            processorLoop.stop()
-            listener.stop()
-            return 2
-        }
-        while (true) {
-            sleep(Duration.second)
-        }
-        return 0
+        println(servicePluginOnlyUnsupportedCommand("webhook-http"))
+        return 2
     }
     if (commandArgs.size > 0 && commandArgs[0] == "serve") {
-        let runtime = RuntimeContainer(config)
-        let state = runtime.store.load()
-        let scheduler = FullScanScheduler(config, FakeClock())
-        let summary = runServiceScans(config, runtime, FakeClock(), scheduler, state, ServiceControl(maxScans: 1), tickMinutes: config.fullScanIntervalMinutes)
-        println("serve scans=${summary.scans} skipped=${summary.skipped} stopped=${summary.stopped} audit=${state.audit.size}")
-        return 0
+        println(servicePluginOnlyUnsupportedCommand("serve"))
+        return 2
     }
     if (commandArgs.size > 0 && commandArgs[0] == "probe-gitcode") {
         println(probeGitCode(config))
@@ -81,9 +44,7 @@ main(args: Array<String>): Int64 {
     if (commandArgs.size > 0 && commandArgs[0] == "doctor") {
         let runtime = RuntimeContainer(config)
         let state = runtime.store.load()
-        let mcp = FakeMcpClient()
-        mcp.initialize()
-        println(doctorReport(config, state, mcp))
+        println(doctorReport(config, state))
         return 0
     }
     println(cliHelp())

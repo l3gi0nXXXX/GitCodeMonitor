@@ -26,8 +26,6 @@
     {"capabilityId": "gitcode.monitor.scan_cancelled", "kind": "event", "direction": "gcm-to-metis"},
     {"capabilityId": "gitcode.event.accepted", "kind": "event", "direction": "gcm-to-metis"},
     {"capabilityId": "gitcode.event.ignored", "kind": "event", "direction": "gcm-to-metis"},
-    {"capabilityId": "gitcode.agent.draft_request", "kind": "agentRequest", "direction": "gcm-to-metis", "requiredHostApis": ["host.agent.invoke"]},
-    {"capabilityId": "gitcode.notification.generated_reply", "kind": "notificationTopic", "direction": "metis-internal-delivery", "requiredHostApis": ["host.notification.publish"]},
     {"capabilityId": "gitcode.writeback.apply_result", "kind": "controlAction", "direction": "metis-to-gcm"},
     {"capabilityId": "gitcode.writeback.audit", "kind": "event", "direction": "gcm-to-metis"}
   ],
