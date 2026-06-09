@@ -187,6 +187,10 @@ public func validateWritebackScopeConfig(scope: WritebackScopeConfig, legacyRepo
     diagnostics.toArray()
 }
 
+public func writebackScopeSummary(config: MonitorConfig): String {
+    "writebackScope=allowedOrgs=${config.writebackScope.allowedOrgs.size} allowedRepos=${config.writebackScope.allowedRepos.size} deniedRepos=${config.writebackScope.deniedRepos.size} legacyRepoAllowlist=${config.repoAllowlist.size}"
+}
+
 public func configSummary(config: MonitorConfig): String {
     let auth = if (gitCodeAuthPresent(config)) { "present" } else { "absent" }
     let mcpAuth = if (config.mcpServiceToken.isEmpty()) { "absent" } else { "present" }
@@ -201,6 +205,7 @@ public func configSummary(config: MonitorConfig): String {
         "notificationAuth=${notifyAuth}\n" +
         "dryRun=${config.dryRun}\n" +
         "autoReply=${config.autoReply}\n" +
+        "${writebackScopeSummary(config)}\n" +
         "allowlist=${joinStrings(config.repoAllowlist, ",")}\n" +
         "notifyNetworkEnabled=${config.notifyNetworkEnabled}\n" +
         "recordOnlyEnabled=${config.authorPolicy.recordOnlyEnabled}\n" +

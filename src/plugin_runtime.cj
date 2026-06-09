@@ -602,7 +602,7 @@ public func buildGitCodeMonitorCapabilities(config: MonitorConfig): ArrayList<Se
 public func handleGcmStatusCapability(payload: String, runtime: GcmRuntime): GcmStatusResult {
     let secret = summarizeGcmSecretState(runtime.config)
     let diagnostics = webhookDiagnosticCounters(runtime.state)
-    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} gitCodeAuth=${secret.gitCodeAuth} legacyNotify=${secret.legacyNotificationAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
+    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} legacyNotify=${secret.legacyNotificationAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
 }
 
 public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): GcmScanOnceResult {
@@ -871,7 +871,8 @@ public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: Monit
     if (request.draft.trimAscii().isEmpty()) { return GcmWritebackDecision(false, "draft_empty") }
     if (!config.autoReply) { return GcmWritebackDecision(false, "auto_reply_disabled") }
     if (config.dryRun) { return GcmWritebackDecision(false, "dry_run") }
-    if (!pluginRepoAllowlisted(config.repoAllowlist, request.repo)) { return GcmWritebackDecision(false, "repo_not_allowlisted") }
+    let scopeDecision = evaluateWritebackScope(config, request.repo)
+    if (!scopeDecision.allowed) { return GcmWritebackDecision(false, scopeDecision.reason) }
     let safety = request.safety.toAsciiLower()
     if (safety != "approved" && safety != "safe") { return GcmWritebackDecision(false, "safety_rejected") }
     if (request.needsHumanReview) { return GcmWritebackDecision(false, "needs_human_review") }
@@ -948,13 +949,16 @@ public func validateGcmPluginModeConfig(config: MonitorConfig): GcmConfigValidat
     if (config.gitCodeBaseUrl.trimAscii().isEmpty()) { diagnostics.add("gitcode.baseUrl missing") }
     if (config.statePath.trimAscii().isEmpty()) { diagnostics.add("statePath missing") }
     if (config.fullScanIntervalMinutes < 5) { diagnostics.add("fullScanIntervalMinutes below production minimum") }
-    if (!config.dryRun && config.autoReply && config.repoAllowlist.size == 0) { diagnostics.add("repoAllowlist required for live autoReply") }
+    for (diagnostic in validateWritebackScopeConfig(config.writebackScope, config.repoAllowlist)) {
+        diagnostics.add("writebackScope ${diagnostic}")
+    }
+    if (!config.dryRun && config.autoReply && !writebackScopeHasAllow(config)) { diagnostics.add("writebackScope has no allowed orgs or repos") }
     GcmConfigValidationResult(diagnostics.size == 0, diagnostics: diagnostics.toArray())
 }
 
 public func summarizeGcmPluginModeConfig(config: MonitorConfig): GcmConfigSummary {
     let secret = summarizeGcmSecretState(config)
-    GcmConfigSummary("orgs=${config.orgs.size} dryRun=${config.dryRun} autoReply=${config.autoReply} gitCodeAuth=${secret.gitCodeAuth} mcpAuth=${secret.mcpAuth} legacyNotify=${secret.legacyNotificationAuth} statePath=${redactServicePayload(config.statePath).text}")
+    GcmConfigSummary("orgs=${config.orgs.size} dryRun=${config.dryRun} autoReply=${config.autoReply} ${writebackScopeSummary(config)} gitCodeAuth=${secret.gitCodeAuth} mcpAuth=${secret.mcpAuth} legacyNotify=${secret.legacyNotificationAuth} statePath=${redactServicePayload(config.statePath).text}")
 }
 
 public func migrateLegacyAutoReply(config: MonitorConfig): MonitorConfig {
@@ -1230,16 +1234,6 @@ private func gcmPluginErrorFrame(frameId: String, correlationId: String, status:
 private func gcmScanOncePayload(result: GcmScanOnceResult, saved!: Bool = true): String {
     let status = if (saved) { result.status } else { "state_save_failed" }
     "{\"ok\":${result.ok && saved},\"status\":\"${status}\",\"accepted\":${result.accepted},\"ignored\":${result.ignored},\"emitted\":${result.emitted},\"stateSaved\":${saved}}"
-}
-
-private func pluginRepoAllowlisted(allowlist: Array<String>, repo: String): Bool {
-    let normalized = repo.trimAscii().toAsciiLower()
-    for (entry in allowlist) {
-        if (entry.trimAscii().toAsciiLower() == normalized) {
-            return true
-        }
-    }
-    false
 }
 
 private func gitCodeAuthPresentForPlugin(config: MonitorConfig): Bool {

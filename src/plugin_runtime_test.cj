@@ -24,6 +24,18 @@ public class GitCodeMonitorPluginRuntimeTest {
         String.fromUtf8(File.readFrom(Path(path))).trimAscii()
     }
 
+    private func joinDiagnostics(items: Array<String>): String {
+        var out = ""
+        for (item in items) {
+            if (out.isEmpty()) {
+                out = item
+            } else {
+                out += "," + item
+            }
+        }
+        out
+    }
+
     private func scanResponsePayloadFor(rawPayload: String): String {
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
@@ -390,6 +402,29 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func autoReplyGateUsesWritebackScopeForOrgAllowDenyAndUnsafeDrafts(): Unit {
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.writebackScope.allowedOrgs = ["cangjie"]
+        let request = GcmWritebackRequest("wb-scope-p2-pos-002", "Cangjie/community", "issue", "1", "https://gitcode.com/Cangjie/community/issues/1", "safe draft", safety: "approved")
+        @Expect(evaluateGcmAutoReplyGate(request, config).allowed, true)
+        @Expect(evaluateGcmAutoReplyGate(request, config).reason, "allow_write")
+
+        config.writebackScope.deniedRepos = ["Cangjie/community"]
+        let denied = evaluateGcmAutoReplyGate(request, config)
+        @Expect(denied.allowed, false)
+        @Expect(denied.reason, "repo_denied_by_writeback_scope")
+
+        config.writebackScope.deniedRepos = []
+        let otherOrg = GcmWritebackRequest("wb-scope-p4-bnd-001", "CangjieSig/community", "issue", "1", request.url, "safe draft", safety: "approved")
+        @Expect(evaluateGcmAutoReplyGate(otherOrg, config).reason, "repo_not_allowlisted")
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("wb-scope-p4-neg-001", "Cangjie/community", "issue", "1", request.url, "safe draft", safety: "rejected"), config).reason, "safety_rejected")
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("wb-scope-p4-neg-002", "Cangjie/community", "issue", "1", request.url, "Authorization: Bearer secret", safety: "approved"), config).reason, "secret_detected")
+    }
+
+    @TestCase
     public func writebackApplyUsesFakeWriterOnlyWhenGateAllows(): Unit {
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
@@ -408,6 +443,58 @@ public class GitCodeMonitorPluginRuntimeTest {
         let blocked = handleGcmWritebackApplyResult(payload.replace("\"approved\"", "\"rejected\""), runtime)
         @Expect(blocked.writerCalled, false)
         @Expect(blocked.decision.reason, "safety_rejected")
+    }
+
+    @TestCase
+    public func writebackApplyResultHonorsOrgScopeDeniedReposAndLegacyAllowlist(): Unit {
+        let payload = "{\"eventId\":\"wb-scope-p4-e2e\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}"
+
+        let orgConfig = defaultConfig()
+        orgConfig.fullScanIntervalMinutes = 10
+        orgConfig.autoReply = true
+        orgConfig.dryRun = false
+        orgConfig.writebackScope.allowedOrgs = ["cangjie"]
+        let orgRuntime = GcmRuntime(orgConfig)
+        let orgApplied = handleGcmWritebackApplyResult(payload, orgRuntime)
+        @Expect(orgApplied.writerCalled, true)
+        @Expect(orgApplied.posted, true)
+        @Expect(orgRuntime.writer.written.size, 1)
+
+        let deniedConfig = defaultConfig()
+        deniedConfig.fullScanIntervalMinutes = 10
+        deniedConfig.autoReply = true
+        deniedConfig.dryRun = false
+        deniedConfig.writebackScope.allowedOrgs = ["cangjie"]
+        deniedConfig.writebackScope.deniedRepos = ["Cangjie/community"]
+        let deniedRuntime = GcmRuntime(deniedConfig)
+        let deniedApplied = handleGcmWritebackApplyResult(payload, deniedRuntime)
+        @Expect(deniedApplied.writerCalled, false)
+        @Expect(deniedApplied.decision.reason, "repo_denied_by_writeback_scope")
+        @Expect(deniedRuntime.writer.written.size, 0)
+
+        let legacyConfig = defaultConfig()
+        legacyConfig.fullScanIntervalMinutes = 10
+        legacyConfig.autoReply = true
+        legacyConfig.dryRun = false
+        legacyConfig.repoAllowlist = ["Cangjie/community"]
+        @Expect(handleGcmWritebackApplyResult(payload, GcmRuntime(legacyConfig)).writerCalled, true)
+
+        let otherOrgConfig = defaultConfig()
+        otherOrgConfig.fullScanIntervalMinutes = 10
+        otherOrgConfig.autoReply = true
+        otherOrgConfig.dryRun = false
+        otherOrgConfig.writebackScope.allowedOrgs = ["cangjie-sig"]
+        let otherOrgApplied = handleGcmWritebackApplyResult(payload, GcmRuntime(otherOrgConfig))
+        @Expect(otherOrgApplied.writerCalled, false)
+        @Expect(otherOrgApplied.decision.reason, "repo_not_allowlisted")
+
+        let rejected = handleGcmWritebackApplyResult(payload.replace("\"approved\"", "\"rejected\""), GcmRuntime(orgConfig))
+        @Expect(rejected.writerCalled, false)
+        @Expect(rejected.decision.reason, "safety_rejected")
+
+        let secret = handleGcmWritebackApplyResult(payload.replace("safe draft", "Authorization: Bearer secret"), GcmRuntime(orgConfig))
+        @Expect(secret.writerCalled, false)
+        @Expect(secret.decision.reason, "secret_detected")
     }
 
     @TestCase
@@ -561,6 +648,9 @@ public class GitCodeMonitorPluginRuntimeTest {
         config.fullScanIntervalMinutes = 10
         config.autoReply = true
         config.dryRun = false
+        config.writebackScope.allowedOrgs = ["cangjie"]
+        config.writebackScope.allowedRepos = ["Cangjie/compiler"]
+        config.writebackScope.deniedRepos = ["Cangjie/experimental", "Cangjie/playground"]
         config.repoAllowlist = ["Cangjie/community"]
         let runtime = RuntimeContainer(config)
         let state = MonitorState()
@@ -574,6 +664,10 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(status.summary.contains("accepted=1"), true)
         @Expect(status.summary.contains("writebackPosted=1"), true)
         @Expect(status.summary.contains("maintainerMentionSkipped=1"), true)
+        @Expect(status.summary.contains("allowedOrgs=1"), true)
+        @Expect(status.summary.contains("allowedRepos=1"), true)
+        @Expect(status.summary.contains("deniedRepos=2"), true)
+        @Expect(status.summary.contains("legacyRepoAllowlist=1"), true)
 
         let payload = webhookStatusPayload(config, WebhookQueue(config.webhook.queueDir), state: Some<MonitorState>(state))
         @Expect(payload.contains("\"recordOnlyCount\":1"), true)
@@ -596,6 +690,42 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(handled.frame.payload.contains("\"writerCalled\":true"), true)
         @Expect(handled.frame.payload.contains("\"maintainerMentionAppended\":true"), true)
         @Expect(handled.frame.payload.contains("\"teamLeaderCount\":1"), true)
+    }
+
+    @TestCase
+    public func writebackScopeSummaryAndPluginModeValidationUseScopeDiagnostics(): Unit {
+        let config = defaultConfig()
+        config.gitCodeToken = "token-secret"
+        config.gitCodeCookie = "cookie-secret"
+        config.writebackScope.allowedOrgs = ["cangjie", "cangjie-sig", "cangjie-tpc"]
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        config.writebackScope.deniedRepos = ["Cangjie/experimental", "Cangjie/playground"]
+        let summary = writebackScopeSummary(config)
+        @Expect(summary.contains("allowedOrgs=3 allowedRepos=1 deniedRepos=2"), true)
+        @Expect(summary.contains("legacyRepoAllowlist=0"), true)
+        @Expect(summary.contains("token-secret"), false)
+        @Expect(summary.contains("cookie-secret"), false)
+
+        let liveNoAllow = defaultConfig()
+        liveNoAllow.fullScanIntervalMinutes = 10
+        liveNoAllow.autoReply = true
+        liveNoAllow.dryRun = false
+        let validation = validateGcmPluginModeConfig(liveNoAllow)
+        @Expect(validation.ok, false)
+        @Expect(joinDiagnostics(validation.diagnostics).contains("writebackScope has no allowed orgs or repos"), true)
+        @Expect(joinDiagnostics(validation.diagnostics).contains("repoAllowlist required"), false)
+
+        let denyOnly = defaultConfig()
+        denyOnly.fullScanIntervalMinutes = 10
+        denyOnly.autoReply = true
+        denyOnly.dryRun = false
+        denyOnly.writebackScope.deniedRepos = ["Cangjie/community"]
+        @Expect(joinDiagnostics(validateGcmPluginModeConfig(denyOnly).diagnostics).contains("writebackScope has no allowed orgs or repos"), true)
+
+        let invalid = defaultConfig()
+        invalid.fullScanIntervalMinutes = 10
+        invalid.writebackScope.allowedOrgs = ["Cangjie/community"]
+        @Expect(joinDiagnostics(validateGcmPluginModeConfig(invalid).diagnostics).contains("writebackScope invalid org scope: Cangjie/community"), true)
     }
 
     @TestCase
