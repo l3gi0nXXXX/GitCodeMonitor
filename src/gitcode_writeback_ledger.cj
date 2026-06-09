@@ -74,7 +74,8 @@ public func recordWriteback(
         for (entry in readWritebackLedgerEntries(ledgerPath)) {
             if (nowMs - entry.createdAtMs <= WRITEBACK_LEDGER_TTL_MS) { entries.add(entry) }
         }
-        entries.add(WritebackLedgerEntry(repo, kind, number, replyUrl, ledgerAnchorFromUrl(replyUrl), hashRawPayload(body), sourceEventId, nowMs))
+        let safeReplyUrl = sanitizeWritebackReplyUrlForStorage(replyUrl)
+        entries.add(WritebackLedgerEntry(repo, kind, number, safeReplyUrl, ledgerAnchorFromUrl(safeReplyUrl), hashRawPayload(body), sourceEventId, nowMs))
         writeWritebackLedgerEntries(ledgerPath, entries.toArray())
         WritebackLedgerResult(true, "recorded")
     } catch (_: Exception) {
@@ -100,12 +101,14 @@ public func matchWebhookComment(
     let bodyHash = hashRawPayload(body)
     for (entry in readWritebackLedgerEntries(ledgerPath)) {
         if (entry.repo != normalizedRepo || entry.kind != normalizedKind || entry.number != normalizedNumber) { continue }
+        if (nowMs - entry.createdAtMs > WRITEBACK_LEDGER_TTL_MS) { continue }
         if (!url.isEmpty() && !entry.replyUrl.isEmpty() && url == entry.replyUrl) {
             return WritebackLedgerMatchResult(true, status: "matched", sourceEventId: entry.sourceEventId, matchType: "url")
         }
     }
     for (entry in readWritebackLedgerEntries(ledgerPath)) {
         if (entry.repo != normalizedRepo || entry.kind != normalizedKind || entry.number != normalizedNumber) { continue }
+        if (nowMs - entry.createdAtMs > WRITEBACK_LEDGER_TTL_MS) { continue }
         if (!anchor.isEmpty() && !entry.replyAnchor.isEmpty() && anchor == entry.replyAnchor) {
             return WritebackLedgerMatchResult(true, status: "matched", sourceEventId: entry.sourceEventId, matchType: "anchor")
         }
@@ -113,7 +116,7 @@ public func matchWebhookComment(
     for (entry in readWritebackLedgerEntries(ledgerPath)) {
         if (entry.repo != normalizedRepo || entry.kind != normalizedKind || entry.number != normalizedNumber) { continue }
         if (nowMs - entry.createdAtMs <= WRITEBACK_LEDGER_TTL_MS && !bodyHash.isEmpty() && bodyHash == entry.bodyHash) {
-            return WritebackLedgerMatchResult(true, status: "matched", sourceEventId: entry.sourceEventId, matchType: "body_hash")
+            return WritebackLedgerMatchResult(false, status: "body_hash_untrusted", sourceEventId: entry.sourceEventId, matchType: "body_hash")
         }
     }
     WritebackLedgerMatchResult(false)
@@ -192,5 +195,15 @@ func ledgerAnchorFromUrl(url: String): String {
     if (!value.contains("#")) { return "" }
     let parts = value.split("#", 2)
     if (parts.size < 2) { return "" }
-    parts[1].trimAscii()
+    let anchor = parts[1].split("?", 2)[0].split("&", 2)[0]
+    anchor.trimAscii()
+}
+
+public func sanitizeWritebackReplyUrlForStorage(raw: String): String {
+    let value = raw.trimAscii()
+    if (value.isEmpty()) { return "" }
+    if (containsSecret(value) || containsLocalPath(value)) { return "" }
+    if (value.startsWith("/") || value.startsWith("file:")) { return "" }
+    let noQuery = value.split("?", 2)[0]
+    noQuery.trimAscii()
 }

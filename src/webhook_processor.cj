@@ -134,7 +134,8 @@ public func processWebhookBatch(
             state.markSeen(parsed.event.id)
             let audit = AuditRecord(parsed.event.id, status: "record_only", reason: recordOnly.reason)
             let missingPart = if (recordOnly.missingDiagnostics.size > 0) { ";missing=${joinStrings(recordOnly.missingDiagnostics, ",")}" } else { "" }
-            audit.requestId = "scope=${recordOnly.matchedScope};type=${recordOnly.matchedType};valueHash=${recordOnly.matchedValueHash}${missingPart}"
+            let legacyPart = if (recordOnly.matchedType == "email_domain" && config.authorPolicy.recordOnlyEmailDomains.size > 0) { ";legacy=corporate_author" } else { "" }
+            audit.requestId = "scope=${recordOnly.matchedScope};type=${recordOnly.matchedType};valueHash=${recordOnly.matchedValueHash}${missingPart}${legacyPart}"
             state.addAudit(audit)
             let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)
             processed++
@@ -153,7 +154,7 @@ public func processWebhookBatch(
         if (echo.matched) {
             state.markSeen(parsed.event.id)
             let audit = AuditRecord(parsed.event.id, status: "self_echo_ignored", reason: "self_echo_${echo.matchType}")
-            audit.replyUrl = parsed.event.url
+            audit.replyUrl = sanitizeWritebackReplyUrlForStorage(parsed.event.url)
             audit.writeDecision = echo.sourceEventId
             state.addAudit(audit)
             let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)

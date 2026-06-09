@@ -497,6 +497,31 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func p2WritebackLedgerAndAuditRedactSecretReplyUrls(): Unit {
+        // T-P2-U-001, T-P3-U-001
+        let dir = tempRuntimeDir("gcm-p2-secret-reply-url")
+        let config = defaultConfig()
+        config.statePath = dir.join("state.json").toString()
+        let secretUrl = "https://gitcode.com/Cangjie/community/issues/4#note_1?access_token=secret-token"
+        let ledgerPath = writebackLedgerPathForConfig(config)
+
+        @Expect(recordWriteback(ledgerPath, "Cangjie/community", "issue", "4", secretUrl, "safe body", "source-secret", nowMs: 1000).ok, true)
+        let ledgerText = String.fromUtf8(File.readFrom(Path(ledgerPath)))
+        @Expect(ledgerText.contains("secret-token"), false)
+        @Expect(ledgerText.contains("access_token"), false)
+        @Expect(ledgerText.contains(secretUrl), false)
+
+        let audit = buildGcmWritebackAudit(GcmWritebackRequest("source-secret", "Cangjie/community", "issue", "4", "https://gitcode.com/Cangjie/community/issues/4", "safe body"), GcmWritebackDecision(true, "posted"), replyUrl: secretUrl)
+        let host = MetisHostClient()
+        let emitted = emitGcmWritebackAudit(audit, host)
+        @Expect(emitted.ok, true)
+        @Expect(emitted.frame.payload.contains("secret-token"), false)
+        @Expect(emitted.frame.payload.contains("access_token"), false)
+        @Expect(emitted.frame.payload.contains(secretUrl), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func writebackApplyResultHonorsOrgScopeDeniedReposAndLegacyAllowlist(): Unit {
         let payload = "{\"eventId\":\"wb-scope-p4-e2e\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}"
 

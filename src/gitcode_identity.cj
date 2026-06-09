@@ -200,13 +200,7 @@ func classifySubjectForRule(subject: ?GitCodeAuthorIdentity, rule: AuthorPolicyI
                 }
                 for (domain in rule.emailDomains) {
                     if (!domain.trimAscii().isEmpty() && lower.endsWith(domain.trimAscii().toAsciiLower())) {
-                        return RecordOnlySubjectDecision(
-                            "record_only",
-                            matchedScope: scope,
-                            matchedType: "email_domain",
-                            matchedValueHash: hashRawPayload(domain),
-                            reason: "corporate_author"
-                        )
+                        return recordOnlyDecision(scope, "email_domain", domain)
                     }
                 }
             }
@@ -329,22 +323,11 @@ func firstNestedAuthorObject(root: JsonObject, parentKeys: Array<String>): (Json
             return (author, fallback)
         }
     }
-    (firstAuthorObject(root), "")
+    (JsonObject(), "")
 }
 
 func firstNestedAuthorObjectStrict(root: JsonObject, parentKeys: Array<String>): (JsonObject, String) {
-    for (parentKey in parentKeys) {
-        let parent = nestedObject(root, [parentKey])
-        let author = nestedObject(parent, ["author", "user"])
-        let fallback = firstJsonString(parent, ["author_id", "authorId", "user_id", "userId"])
-        if (identityIsPresent(identityFromObject(author, idFallback: fallback))) {
-            return (author, fallback)
-        }
-        if (!fallback.isEmpty()) {
-            return (author, fallback)
-        }
-    }
-    (JsonObject(), "")
+    firstNestedAuthorObject(root, parentKeys)
 }
 
 func firstAuthorObject(root: JsonObject): JsonObject {

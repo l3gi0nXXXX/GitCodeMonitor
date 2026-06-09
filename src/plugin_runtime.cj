@@ -899,7 +899,8 @@ public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: Monit
 }
 
 public func emitGcmWritebackAudit(audit: GcmWritebackAudit, host: MetisHostClient): HostEmitResult {
-    let frame = ServiceFrame("event", "writeback-${audit.eventId}", GCM_SERVICE_PLUGIN_ID, method: "emitCapabilityEvent", capabilityId: "gitcode.writeback.audit", payload: "{\"eventId\":\"${audit.eventId}\",\"decision\":\"${audit.decision}\",\"bodyHash\":\"${audit.bodyHash}\",\"replyUrl\":\"${audit.replyUrl}\"}")
+    let safeReplyUrl = sanitizeWritebackReplyUrlForStorage(audit.replyUrl)
+    let frame = ServiceFrame("event", "writeback-${audit.eventId}", GCM_SERVICE_PLUGIN_ID, method: "emitCapabilityEvent", capabilityId: "gitcode.writeback.audit", payload: "{\"eventId\":\"${jsonEscape(audit.eventId)}\",\"decision\":\"${jsonEscape(audit.decision)}\",\"bodyHash\":\"${jsonEscape(audit.bodyHash)}\",\"replyUrl\":\"${jsonEscape(safeReplyUrl)}\"}")
     host.emit(frame)
 }
 
@@ -913,13 +914,13 @@ public func hasGcmSelfMarker(body: String): Bool {
 }
 
 public func buildGcmWritebackAudit(request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = ""): GcmWritebackAudit {
-    GcmWritebackAudit(request.eventId, decision.reason, hashRawPayload(request.draft), replyUrl: replyUrl)
+    GcmWritebackAudit(request.eventId, decision.reason, hashRawPayload(request.draft), replyUrl: sanitizeWritebackReplyUrlForStorage(replyUrl))
 }
 
 private func recordGcmWritebackAuditState(state: MonitorState, request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = "", posted!: Bool = false): Unit {
     let status = if (posted) { "writeback_posted" } else { "writeback_skipped" }
     let record = AuditRecord(if (request.eventId.isEmpty()) { "writeback" } else { request.eventId }, status: status, reason: decision.reason)
-    record.replyUrl = replyUrl
+    record.replyUrl = sanitizeWritebackReplyUrlForStorage(replyUrl)
     record.writeDecision = decision.reason
     record.safety = request.safety
     state.addAudit(record)
