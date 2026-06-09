@@ -291,15 +291,52 @@ POST https://api.telegram.org/bot<telegram.botToken>/sendMessage
 
 | 字段 | 默认值 | 应该填什么 |
 | --- | --- | --- |
-| `monitor.orgs` | `["cangjie", "cangjie-sig", "cangjie-tpc"]` | 需要扫描的 GitCode 组织列表。当前目标就是这三个组织。 |
+| `monitor.orgs` | `["cangjie", "cangjie-sig", "cangjie-tpc"]` | 需要扫描的 GitCode 组织列表。当前目标就是这三个组织。这个字段只控制扫描范围，不控制自动写回范围。 |
 | `monitor.statePath` | `data/gitcodemonitor-state.json` | 扫描游标、通知审计、写回审计的本地状态文件。建议填 `.gitcodemonitor/state.json`。 |
 | `monitor.fullScanIntervalMinutes` | `10` | 全量扫描间隔，单位分钟。生产配置不能低于 5。当前方案建议 10 分钟。 |
 | `monitor.jitterSeconds` | `30` | 扫描抖动秒数，用于避免固定时间点集中请求。当前校验要求不超过 30。 |
 | `monitor.dryRun` | `true` | 是否禁止 GitCode 自动写回。`true` 表示不写回 GitCode；`false` 才允许进入写回门禁。 |
-| `monitor.autoReply` | `false` | 是否启用自动回复。即使设为 `true`，仍需 `dryRun=false`、MCP 安全通过、repo allowlist 命中、无重复写回、无敏感信息和本地路径，才会真正写回。 |
+| `monitor.autoReply` | `false` | 是否启用自动回复。即使设为 `true`，仍需 `dryRun=false`、MCP 安全通过、writebackScope 命中、无重复写回、无敏感信息和本地路径，才会真正写回。 |
 | `monitor.notifyNetworkEnabled` | `false` | 是否启用真实飞书/Telegram 发送。`false` 时只记录 dry-run audit，不发网络请求。 |
-| `monitor.repoAllowlist` | `[]` | 允许自动写回的仓库白名单，格式是 `owner/repo`，例如 `["Cangjie/community"]`。大小写按当前代码做兼容处理。 |
+| `monitor.writebackScope.allowedOrgs` | `[]` | 允许自动写回的组织列表，格式是 GitCode owner 名，例如 `["cangjie", "cangjie-sig", "cangjie-tpc"]`。只控制写回范围，不扩大或缩小 `monitor.orgs` 扫描范围。 |
+| `monitor.writebackScope.allowedRepos` | `[]` | 允许自动写回的仓库列表，格式是 `owner/repo`，例如 `["Cangjie/community"]`。用于补充组织外或少量精确仓库授权。 |
+| `monitor.writebackScope.deniedRepos` | `[]` | 禁止自动写回的仓库列表，格式是 `owner/repo`。优先级最高，即使命中 `allowedOrgs` 或 `allowedRepos` 也不会写回。 |
+| `monitor.repoAllowlist` | `[]` | 兼容字段，旧配置入口。格式是 `owner/repo`，语义等价于合并进 `monitor.writebackScope.allowedRepos`；新配置建议使用 `writebackScope`。 |
 | `monitor.transport` | `native` | HTTP 传输方式。默认 `native`。`curl` 只作为显式回退。 |
+
+### writebackScope 优先级与匹配示例
+
+写回 scope 只判断 GitCode 自动评论是否允许进入后续写回门禁；扫描范围仍由 `monitor.orgs` 决定。优先级公式是：
+
+```text
+deniedRepos > allowedRepos > allowedOrgs > 默认拒绝
+```
+
+完整示例：
+
+```json
+{
+  "monitor": {
+    "orgs": ["cangjie", "cangjie-sig", "cangjie-tpc"],
+    "dryRun": false,
+    "autoReply": true,
+    "writebackScope": {
+      "allowedOrgs": ["cangjie", "cangjie-sig", "cangjie-tpc"],
+      "allowedRepos": ["cangjie-sig/special-repo"],
+      "deniedRepos": ["cangjie/community", "cangjie-tpc/foo"]
+    }
+  }
+}
+```
+
+| repo | 匹配结果 | 原因 |
+| --- | --- | --- |
+| `cangjie/community` | 禁止写回 | 命中 `deniedRepos`，优先级最高。 |
+| `cangjie/compiler` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedOrgs=["cangjie", ...]`。 |
+| `cangjie-sig/special-repo` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedRepos`。 |
+| `cangjie-sig/other-repo` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedOrgs`。 |
+| `cangjie-tpc/foo` | 禁止写回 | 命中 `deniedRepos`，即使 owner 在 `allowedOrgs` 中也禁止写回。 |
+| `other-org/foo` | 禁止写回 | 未命中任何 allow scope，按默认拒绝处理。 |
 
 ## 分阶段配置示例
 
@@ -425,7 +462,11 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
     "dryRun": false,
     "autoReply": true,
     "notifyNetworkEnabled": true,
-    "repoAllowlist": ["Cangjie/community"],
+    "writebackScope": {
+      "allowedOrgs": ["cangjie", "cangjie-sig", "cangjie-tpc"],
+      "allowedRepos": [],
+      "deniedRepos": []
+    },
     "transport": "native"
   }
 }
@@ -433,7 +474,7 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 
 验收标准：
 
-- 只有 `repoAllowlist` 中的仓库允许自动写回。
+- 只有命中 `writebackScope` 的仓库允许自动写回；`monitor.orgs` 只控制扫描范围。
 - MCP 安全审查拒绝、检测到本地路径、检测到密钥、重复回复、人审要求时，都不会写回。
 - 写回评论包含 `<!-- gitcodemonitor:auto-reply:v1 -->` 标记，后续扫描会忽略自生成评论。
 
@@ -454,7 +495,8 @@ GitCodeMonitor -> Metis MCP -> Metis agent runtime/model
 - `telegram.chatId` 不是 bot token，需要通过 `getUpdates` 或 Telegram 管理工具查目标会话 id。
 - `monitor.dryRun=true` 只阻止 GitCode 写回，不阻止飞书/Telegram 真实通知；通知是否真实发送看 `monitor.notifyNetworkEnabled`。
 - `monitor.autoReply=true` 不等于一定写回，还需要满足所有写回门禁。
-- `repoAllowlist` 只控制自动写回范围，不控制扫描范围。扫描范围由 `monitor.orgs` 和 GitCode 公开仓库发现逻辑控制。
+- `monitor.orgs` 是扫描范围，`monitor.writebackScope` 是写回范围，两者不是同一个开关。
+- `repoAllowlist` 只是旧配置兼容字段，不推荐作为几百仓库的生产配置主路径。新配置应使用 `writebackScope.allowedOrgs`、`writebackScope.allowedRepos` 和 `writebackScope.deniedRepos`。
 
 ## 依据
 

@@ -13,6 +13,7 @@ This document fixes the contract boundary between GitCodeMonitor and Metis for G
 | Team leader, CODEOWNERS, issue template, PR template lookup | GitCodeMonitor | Lookup failures are diagnostics, not hard failures. |
 | LLM, CKB, source workspace, external PR review engine adapter, draft generation | Metis | GCM must not call LLM, CKB, or PR review engine for user-facing reply generation. Metis owns only the adapter boundary for the external PR review engine. |
 | GitCode official API writeback | GitCodeMonitor | Metis returns a generated reply; GCM owns gate, natural maintainer mention sentence, internal writeback audit state, and API call. |
+| GitCode writeback scope | GitCodeMonitor | GCM owns writeback scope evaluation. Metis does not directly decide whether a GitCode repo or org is allowed to receive writeback. |
 
 ## Referenced Domain Documents
 
@@ -103,6 +104,27 @@ GCM must not call the GitCode writer when any of these conditions holds:
 - duplicate reply
 - draft contains secrets
 - draft contains local machine paths
+
+## Writeback Scope
+
+`monitor.writebackScope` is the contract field for GitCode writeback scope. GCM owns this gate and evaluates it before calling the GitCode official API writer. Metis only returns generated reply content and safety metadata through `gitcode.writeback.apply_result`; Metis must not directly judge whether a GitCode repo or org is allowed to receive writeback.
+
+Supported fields:
+
+| Field | Meaning | Match target |
+|---|---|---|
+| `monitor.writebackScope.allowedOrgs` | Organizations allowed for writeback | `owner`, case-insensitive exact match |
+| `monitor.writebackScope.allowedRepos` | Repositories allowed for writeback | `owner/repo`, case-insensitive exact match |
+| `monitor.writebackScope.deniedRepos` | Repositories excluded from writeback | `owner/repo`, case-insensitive exact match |
+| `monitor.repoAllowlist` | Legacy compatibility field | Equivalent to entries in `allowedRepos` |
+
+Scope priority is:
+
+```text
+deniedRepos > allowedRepos > allowedOrgs > default deny
+```
+
+`deniedRepos` has the highest priority. A repository listed in `deniedRepos` must not be written back even if its owner is present in `allowedOrgs` or the repository is present in `allowedRepos`.
 
 ## Writeback Response
 

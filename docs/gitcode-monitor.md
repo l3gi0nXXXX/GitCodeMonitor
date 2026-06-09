@@ -21,7 +21,8 @@ writeback rollout, see [configuration.zh.md](configuration.zh.md).
 - `dryRun` defaults to `true`.
 - `autoReply` defaults to `false`.
 - Feishu and Telegram HTTP sending is disabled unless `notifyNetworkEnabled=true`.
-- Writeback requires `dryRun=false`, `autoReply=true`, a repo allowlist match, MCP safety approval, no human review flag, no detected secret or local path, and no duplicate reply audit.
+- Writeback is disabled by default because `dryRun=true` and `autoReply=false`.
+- Writeback requires `dryRun=false`, `autoReply=true`, a writeback scope match, MCP safety approval, no human review flag, no detected secret or local path, and no duplicate reply audit.
 - GitCode comments written by the monitor include `<!-- gitcodemonitor:auto-reply:v1 -->` so later scans can ignore self-generated comments.
 
 ## CLI
@@ -70,7 +71,11 @@ Pass `--config <path>` before the command to load an injected config path for te
     "dryRun": true,
     "autoReply": false,
     "notifyNetworkEnabled": false,
-    "repoAllowlist": ["cangjie/compiler"],
+    "writebackScope": {
+      "allowedOrgs": ["cangjie", "cangjie-sig", "cangjie-tpc"],
+      "allowedRepos": [],
+      "deniedRepos": []
+    },
     "statePath": ".gitcodemonitor/state.json",
     "transport": "native"
   }
