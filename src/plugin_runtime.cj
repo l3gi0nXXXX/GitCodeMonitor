@@ -611,7 +611,7 @@ public func buildGitCodeMonitorCapabilities(config: MonitorConfig): ArrayList<Se
 public func handleGcmStatusCapability(payload: String, runtime: GcmRuntime): GcmStatusResult {
     let secret = summarizeGcmSecretState(runtime.config)
     let diagnostics = webhookDiagnosticCounters(runtime.state)
-    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
+    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} recordOnlyTargetAuthor=${diagnostics.recordOnlyTargetAuthorCount} recordOnlyCommentAuthor=${diagnostics.recordOnlyCommentAuthorCount} recordOnlyEventActor=${diagnostics.recordOnlyEventActorCount} selfEchoIgnored=${diagnostics.selfEchoIgnoredCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
 }
 
 public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): GcmScanOnceResult {
@@ -865,6 +865,9 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
     let replyUrl = runtime.writer.write(event, appended.body, runtime.state)
     let writeStatus = if (replyUrl.startsWith("error:")) { replyUrl.split(":", 2)[1] } else { "posted" }
     let finalDecision = GcmWritebackDecision(writeStatus == "posted", writeStatus)
+    if (writeStatus == "posted") {
+        let _ = recordWriteback(writebackLedgerPathForConfig(runtime.config), request.repo, request.kind, request.number, replyUrl, appended.body, request.eventId)
+    }
     recordGcmWritebackAuditState(runtime.state, request, finalDecision, replyUrl: if (writeStatus == "posted") { replyUrl } else { "" }, posted: writeStatus == "posted")
     GcmWritebackApplyResult(
         true,
@@ -896,7 +899,8 @@ public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: Monit
 }
 
 public func emitGcmWritebackAudit(audit: GcmWritebackAudit, host: MetisHostClient): HostEmitResult {
-    let frame = ServiceFrame("event", "writeback-${audit.eventId}", GCM_SERVICE_PLUGIN_ID, method: "emitCapabilityEvent", capabilityId: "gitcode.writeback.audit", payload: "{\"eventId\":\"${audit.eventId}\",\"decision\":\"${audit.decision}\",\"bodyHash\":\"${audit.bodyHash}\",\"replyUrl\":\"${audit.replyUrl}\"}")
+    let safeReplyUrl = sanitizeWritebackReplyUrlForStorage(audit.replyUrl)
+    let frame = ServiceFrame("event", "writeback-${audit.eventId}", GCM_SERVICE_PLUGIN_ID, method: "emitCapabilityEvent", capabilityId: "gitcode.writeback.audit", payload: "{\"eventId\":\"${jsonEscape(audit.eventId)}\",\"decision\":\"${jsonEscape(audit.decision)}\",\"bodyHash\":\"${jsonEscape(audit.bodyHash)}\",\"replyUrl\":\"${jsonEscape(safeReplyUrl)}\"}")
     host.emit(frame)
 }
 
@@ -905,23 +909,18 @@ public func buildGitCodeCommentWriteRequest(request: GcmWritebackRequest): GitCo
     GitCodeCommentWriteRequest(request.repo, request.kind, request.number, appendMaintainerMentionSentence(request.draft, mention.sentence).body)
 }
 
-public func appendGcmSelfMarker(body: String): String {
-    if (hasGcmSelfMarker(body)) { return body }
-    body + "\n\n" + SELF_MARKER
-}
-
 public func hasGcmSelfMarker(body: String): Bool {
     body.contains(SELF_MARKER)
 }
 
 public func buildGcmWritebackAudit(request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = ""): GcmWritebackAudit {
-    GcmWritebackAudit(request.eventId, decision.reason, hashRawPayload(request.draft), replyUrl: replyUrl)
+    GcmWritebackAudit(request.eventId, decision.reason, hashRawPayload(request.draft), replyUrl: sanitizeWritebackReplyUrlForStorage(replyUrl))
 }
 
 private func recordGcmWritebackAuditState(state: MonitorState, request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = "", posted!: Bool = false): Unit {
     let status = if (posted) { "writeback_posted" } else { "writeback_skipped" }
     let record = AuditRecord(if (request.eventId.isEmpty()) { "writeback" } else { request.eventId }, status: status, reason: decision.reason)
-    record.replyUrl = replyUrl
+    record.replyUrl = sanitizeWritebackReplyUrlForStorage(replyUrl)
     record.writeDecision = decision.reason
     record.safety = request.safety
     state.addAudit(record)

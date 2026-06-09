@@ -913,6 +913,317 @@ public class GitCodeWebhookETest {
         false
     }
 
+    private func scopedIssuePayload(authorId: String, authorUsername: String, authorEmail: String, actorId!: String = "900000", actorUsername!: String = "reviewer", actorEmail!: String = "reviewer@example.com"): String {
+        "{" +
+            "\"object_kind\":\"issue\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"object_attributes\":{\"iid\":4,\"action\":\"open\",\"title\":\"Need help\",\"description\":\"please check\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\",\"author\":{\"id\":${authorId},\"username\":\"${authorUsername}\",\"email\":\"${authorEmail}\",\"web_url\":\"https://gitcode.com/${authorUsername}\"}}," +
+            "\"user\":{\"id\":${actorId},\"username\":\"${actorUsername}\",\"email\":\"${actorEmail}\",\"web_url\":\"https://gitcode.com/${actorUsername}\"}" +
+        "}"
+    }
+
+    private func scopedPrPayload(targetId: String, targetUsername: String, targetEmail: String, actorId!: String = "856442", actorUsername!: String = "l3gi0n", actorEmail!: String = "huxiaoming6@huawei.com"): String {
+        "{" +
+            "\"object_kind\":\"merge_request\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"merge_request\":{\"iid\":8,\"author_id\":${targetId},\"author\":{\"id\":${targetId},\"username\":\"${targetUsername}\",\"email\":\"${targetEmail}\"},\"title\":\"PR title\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\"}," +
+            "\"object_attributes\":{\"iid\":8,\"action\":\"open\",\"author_id\":${targetId},\"author\":{\"id\":${targetId},\"username\":\"${targetUsername}\",\"email\":\"${targetEmail}\"},\"title\":\"PR title\",\"description\":\"body\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\"}," +
+            "\"user\":{\"id\":${actorId},\"username\":\"${actorUsername}\",\"email\":\"${actorEmail}\"}" +
+        "}"
+    }
+
+    private func scopedIssuePayloadMissingTarget(actorId!: String = "856442", actorUsername!: String = "l3gi0n", actorEmail!: String = "huxiaoming6@huawei.com"): String {
+        "{" +
+            "\"object_kind\":\"issue\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"object_attributes\":{\"iid\":5,\"action\":\"open\",\"title\":\"Need help\",\"description\":\"please check\",\"url\":\"https://gitcode.com/Cangjie/community/issues/5\"}," +
+            "\"user\":{\"id\":${actorId},\"username\":\"${actorUsername}\",\"email\":\"${actorEmail}\",\"web_url\":\"https://gitcode.com/${actorUsername}\"}" +
+        "}"
+    }
+
+    private func scopedPrPayloadMissingTarget(actorId!: String = "856442", actorUsername!: String = "l3gi0n", actorEmail!: String = "huxiaoming6@huawei.com"): String {
+        "{" +
+            "\"object_kind\":\"merge_request\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"merge_request\":{\"iid\":9,\"title\":\"PR title\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/9\"}," +
+            "\"object_attributes\":{\"iid\":9,\"action\":\"open\",\"title\":\"PR title\",\"description\":\"body\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/9\"}," +
+            "\"user\":{\"id\":${actorId},\"username\":\"${actorUsername}\",\"email\":\"${actorEmail}\"}" +
+        "}"
+    }
+
+    private func issue4NotePayload(commentId!: String = "9001", note!: String = "natural comment"): String {
+        "{" +
+            "\"object_kind\":\"note\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"issue\":{\"iid\":4,\"author_id\":707874,\"author\":{\"id\":707874,\"username\":\"Leporide\",\"email\":\"leporide@example.com\"},\"title\":\"Issue 4\",\"description\":\"body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\"}," +
+            "\"object_attributes\":{\"id\":${commentId},\"author_id\":856442,\"note\":\"${note}\",\"noteable_type\":\"Issue\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_${commentId}\"}," +
+            "\"user\":{\"id\":856442,\"username\":\"l3gi0n\",\"email\":\"huxiaoming6@huawei.com\",\"web_url\":\"https://gitcode.com/l3gi0n\"}" +
+        "}"
+    }
+
+    private func issue4NotePayloadMissingTarget(commentId!: String = "9010", note!: String = "natural comment"): String {
+        "{" +
+            "\"object_kind\":\"note\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"issue\":{\"iid\":4,\"title\":\"Issue 4\",\"description\":\"body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\"}," +
+            "\"object_attributes\":{\"id\":${commentId},\"author_id\":856442,\"note\":\"${note}\",\"noteable_type\":\"Issue\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_${commentId}\"}," +
+            "\"user\":{\"id\":856442,\"username\":\"l3gi0n\",\"email\":\"huxiaoming6@huawei.com\",\"web_url\":\"https://gitcode.com/l3gi0n\"}" +
+        "}"
+    }
+
+    private func issue4NotePayloadWithoutUrl(commentId!: String = "9020", note!: String = "natural comment"): String {
+        "{" +
+            "\"object_kind\":\"note\"," +
+            "\"project\":{\"path_with_namespace\":\"Cangjie/community\"}," +
+            "\"issue\":{\"iid\":4,\"author_id\":707874,\"author\":{\"id\":707874,\"username\":\"Leporide\",\"email\":\"leporide@example.com\"},\"title\":\"Issue 4\",\"description\":\"body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\"}," +
+            "\"object_attributes\":{\"id\":${commentId},\"author_id\":999999,\"note\":\"${note}\",\"noteable_type\":\"Issue\"}," +
+            "\"user\":{\"id\":999999,\"username\":\"external\",\"email\":\"external@example.com\",\"web_url\":\"https://gitcode.com/external\"}" +
+        "}"
+    }
+
+    private func processOnePayload(config: MonitorConfig, payload: String, eventName: String): (MonitorState, GcmMemoryLineSink, WebhookBatchResult) {
+        let queue = WebhookQueue(config.webhook.queueDir)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("delivery-${hashRawPayload(payload)}", "main", eventName, 1000, hashRawPayload(payload), "", "pending", 0, "", 0, "ip"), payload.toArray()).ok, true)
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(FakeHttpSender()))
+        let state = runtime.store.load()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+        (state, sink, result)
+    }
+
+    @TestCase
+    public func p1SubjectsExtractByScopeAndClassifyWithoutScopeBleed(): Unit {
+        // T-P1-P-001, T-P1-P-002, T-P1-N-001, T-P3-B-001
+        let issueSubjects = extractWebhookSubjectSet(JsonValue.fromStr(scopedIssuePayload("856442", "l3gi0n", "huxiaoming6@huawei.com")).asObject())
+        @Expect(issueSubjects.targetAuthor.isSome(), true)
+        @Expect(issueSubjects.eventActor.isSome(), true)
+        @Expect(issueSubjects.commentAuthor.isNone(), true)
+        match (issueSubjects.targetAuthor) {
+            case Some(author) =>
+                @Expect(author.id, "856442")
+                @Expect(author.login, "l3gi0n")
+                @Expect(author.emails[0], "huxiaoming6@huawei.com")
+            case None => @Expect(true, false)
+        }
+
+        let prSubjects = extractWebhookSubjectSet(JsonValue.fromStr(scopedPrPayload("707874", "target", "target@example.com")).asObject())
+        let prPolicy = AuthorPolicyConfig()
+        prPolicy.recordOnlyEnabled = true
+        prPolicy.targetAuthorRule.emails = ["target@example.com"]
+        let prDecision = classifyRecordOnlySubjects(prSubjects, prPolicy)
+        @Expect(prDecision.decision, "record_only")
+        @Expect(prDecision.reason, "record_only_target_author_email")
+
+        let noteSubjects = extractWebhookSubjectSet(JsonValue.fromStr(issue4NotePayload()).asObject())
+        match (noteSubjects.commentAuthor) {
+            case Some(author) =>
+                @Expect(author.id, "856442")
+                @Expect(author.login, "l3gi0n")
+            case None => @Expect(true, false)
+        }
+        match (noteSubjects.targetAuthor) {
+            case Some(author) =>
+                @Expect(author.id, "707874")
+                @Expect(author.login.toAsciiLower(), "leporide")
+            case None => @Expect(true, false)
+        }
+        let targetOnly = AuthorPolicyConfig()
+        targetOnly.recordOnlyEnabled = true
+        targetOnly.targetAuthorRule.ids = ["856442"]
+        @Expect(classifyRecordOnlySubjects(noteSubjects, targetOnly).decision, "process")
+        @Expect(classifyRecordOnlySubjects(noteSubjects, targetOnly).missingDiagnostics.contains("target_subject_missing"), false)
+
+        let missingTargetSubjects = extractWebhookSubjectSet(JsonValue.fromStr(issue4NotePayloadMissingTarget()).asObject())
+        @Expect(missingTargetSubjects.targetAuthor.isNone(), true)
+        @Expect(missingTargetSubjects.commentAuthor.isSome(), true)
+        let missingPolicy = AuthorPolicyConfig()
+        missingPolicy.recordOnlyEnabled = true
+        missingPolicy.commentAuthorRule.ids = ["856442"]
+        missingPolicy.targetAuthorRule.ids = ["707874"]
+        let missingDecision = classifyRecordOnlySubjects(missingTargetSubjects, missingPolicy)
+        @Expect(missingDecision.decision, "record_only")
+        @Expect(missingDecision.reason, "record_only_comment_author_id")
+        @Expect(missingDecision.missingDiagnostics.contains("target_subject_missing"), true)
+
+        let missingIssueSubjects = extractWebhookSubjectSet(JsonValue.fromStr(scopedIssuePayloadMissingTarget()).asObject())
+        @Expect(missingIssueSubjects.targetAuthor.isNone(), true)
+        @Expect(missingIssueSubjects.eventActor.isSome(), true)
+        let issueTargetPolicy = AuthorPolicyConfig()
+        issueTargetPolicy.recordOnlyEnabled = true
+        issueTargetPolicy.targetAuthorRule.ids = ["856442"]
+        let missingIssueDecision = classifyRecordOnlySubjects(missingIssueSubjects, issueTargetPolicy)
+        @Expect(missingIssueDecision.decision, "process")
+        @Expect(missingIssueDecision.missingDiagnostics.contains("target_subject_missing"), true)
+
+        let missingPrSubjects = extractWebhookSubjectSet(JsonValue.fromStr(scopedPrPayloadMissingTarget()).asObject())
+        @Expect(missingPrSubjects.targetAuthor.isNone(), true)
+        @Expect(missingPrSubjects.eventActor.isSome(), true)
+        let missingPrDecision = classifyRecordOnlySubjects(missingPrSubjects, issueTargetPolicy)
+        @Expect(missingPrDecision.decision, "process")
+        @Expect(missingPrDecision.missingDiagnostics.contains("target_subject_missing"), true)
+    }
+
+    @TestCase
+    public func p0p1p3p7ScopedRecordOnlyProcessorAcceptsOnlyWhenRulesDoNotMatch(): Unit {
+        // T-P0-P-001, T-P0-N-001, T-P1-P-003, T-P1-P-004, T-P1-N-002, T-P3-U-001, T-P3-N-001, T-P7-E2E-001, T-P7-E2E-002, T-P7-E2E-005
+        let commentIdConfigDir = tempDir("gcm-p1-comment-id-record-only")
+        let commentIdConfig = enabledConfig(commentIdConfigDir.join("queue").toString())
+        commentIdConfig.authorPolicy.recordOnlyEnabled = true
+        commentIdConfig.authorPolicy.commentAuthorRule.ids = ["856442"]
+        let (commentState, commentSink, commentResult) = processOnePayload(commentIdConfig, issue4NotePayload(), "Note Hook")
+        @Expect(commentResult.processed, 1)
+        @Expect(commentSink.lines.size, 0)
+        @Expect(auditContains(commentState, "record_only", reason: "record_only_comment_author_id"), true)
+        @Expect(commentState.audit[0].reason.contains("huxiaoming6@huawei.com"), false)
+        @Expect(webhookStatusPayload(commentIdConfig, WebhookQueue(commentIdConfig.webhook.queueDir), state: Some<MonitorState>(commentState)).contains("\"recordOnlyCommentAuthorCount\":1"), true)
+        try { remove(commentIdConfigDir, recursive: true) } catch (_: Exception) { () }
+
+        let issueMissingDir = tempDir("gcm-p1-issue-target-missing")
+        let issueMissingConfig = enabledConfig(issueMissingDir.join("queue").toString())
+        issueMissingConfig.authorPolicy.recordOnlyEnabled = true
+        issueMissingConfig.authorPolicy.targetAuthorRule.ids = ["856442"]
+        let (issueMissingState, issueMissingSink, _) = processOnePayload(issueMissingConfig, scopedIssuePayloadMissingTarget(), "Issue Hook")
+        @Expect(issueMissingSink.lines.size, 1)
+        @Expect(auditContains(issueMissingState, "record_only"), false)
+        try { remove(issueMissingDir, recursive: true) } catch (_: Exception) { () }
+
+        let legacyNoteDir = tempDir("gcm-legacy-domain-note-comment")
+        let legacyNoteConfig = enabledConfig(legacyNoteDir.join("queue").toString())
+        legacyNoteConfig.authorPolicy.recordOnlyEnabled = true
+        legacyNoteConfig.authorPolicy.recordOnlyEmailDomains = ["@huawei.com"]
+        legacyNoteConfig.authorPolicy.targetAuthorRule.emailDomains = ["@huawei.com"]
+        let (legacyNoteState, legacyNoteSink, _) = processOnePayload(legacyNoteConfig, issue4NotePayload(commentId: "9011"), "Note Hook")
+        @Expect(legacyNoteSink.lines.size, 1)
+        @Expect(auditContains(legacyNoteState, "record_only"), false)
+        try { remove(legacyNoteDir, recursive: true) } catch (_: Exception) { () }
+
+        let missingTargetDir = tempDir("gcm-p3-missing-target-record-only")
+        let missingTargetConfig = enabledConfig(missingTargetDir.join("queue").toString())
+        missingTargetConfig.authorPolicy.recordOnlyEnabled = true
+        missingTargetConfig.authorPolicy.commentAuthorRule.ids = ["856442"]
+        missingTargetConfig.authorPolicy.targetAuthorRule.ids = ["707874"]
+        let (missingTargetState, missingTargetSink, missingTargetResult) = processOnePayload(missingTargetConfig, issue4NotePayloadMissingTarget(), "Note Hook")
+        @Expect(missingTargetResult.processed, 1)
+        @Expect(missingTargetSink.lines.size, 0)
+        @Expect(auditContains(missingTargetState, "record_only", reason: "record_only_comment_author_id"), true)
+        @Expect(missingTargetState.audit[0].requestId.contains("target_subject_missing"), true)
+        @Expect(missingTargetState.audit[0].requestId.contains("huxiaoming6@huawei.com"), false)
+        try { remove(missingTargetDir, recursive: true) } catch (_: Exception) { () }
+
+        let commentEmailDir = tempDir("gcm-p1-comment-email-record-only")
+        let commentEmailConfig = enabledConfig(commentEmailDir.join("queue").toString())
+        commentEmailConfig.authorPolicy.recordOnlyEnabled = true
+        commentEmailConfig.authorPolicy.commentAuthorRule.emails = ["huxiaoming6@huawei.com"]
+        let (emailState, emailSink, _) = processOnePayload(commentEmailConfig, issue4NotePayload(commentId: "9002"), "Note Hook")
+        @Expect(emailSink.lines.size, 0)
+        @Expect(auditContains(emailState, "record_only", reason: "record_only_comment_author_email"), true)
+        @Expect(emailState.audit[0].requestId.contains("huxiaoming6@huawei.com"), false)
+        try { remove(commentEmailDir, recursive: true) } catch (_: Exception) { () }
+
+        let targetEmailDir = tempDir("gcm-p1-target-email-record-only")
+        let targetEmailConfig = enabledConfig(targetEmailDir.join("queue").toString())
+        targetEmailConfig.authorPolicy.recordOnlyEnabled = true
+        targetEmailConfig.authorPolicy.targetAuthorRule.emails = ["target@example.com"]
+        let (targetState, targetSink, _) = processOnePayload(targetEmailConfig, scopedPrPayload("707874", "target", "target@example.com"), "Merge Request Hook")
+        @Expect(targetSink.lines.size, 0)
+        @Expect(auditContains(targetState, "record_only", reason: "record_only_target_author_email"), true)
+        try { remove(targetEmailDir, recursive: true) } catch (_: Exception) { () }
+
+        let domainCounterDir = tempDir("gcm-p3-domain-counters")
+        let targetDomainConfig = enabledConfig(domainCounterDir.join("target").toString())
+        targetDomainConfig.authorPolicy.recordOnlyEnabled = true
+        targetDomainConfig.authorPolicy.targetAuthorRule.emailDomains = ["@example.com"]
+        let (targetDomainState, _, _) = processOnePayload(targetDomainConfig, scopedPrPayload("707874", "target", "target@example.com"), "Merge Request Hook")
+        let targetDomainStatus = webhookStatusPayload(targetDomainConfig, WebhookQueue(targetDomainConfig.webhook.queueDir), state: Some<MonitorState>(targetDomainState))
+        @Expect(auditContains(targetDomainState, "record_only", reason: "record_only_target_author_email_domain"), true)
+        @Expect(targetDomainStatus.contains("\"recordOnlyTargetAuthorCount\":1"), true)
+
+        let commentDomainConfig = enabledConfig(domainCounterDir.join("comment").toString())
+        commentDomainConfig.authorPolicy.recordOnlyEnabled = true
+        commentDomainConfig.authorPolicy.commentAuthorRule.emailDomains = ["@huawei.com"]
+        let (commentDomainState, _, _) = processOnePayload(commentDomainConfig, issue4NotePayload(commentId: "9012"), "Note Hook")
+        let commentDomainStatus = webhookStatusPayload(commentDomainConfig, WebhookQueue(commentDomainConfig.webhook.queueDir), state: Some<MonitorState>(commentDomainState))
+        @Expect(auditContains(commentDomainState, "record_only", reason: "record_only_comment_author_email_domain"), true)
+        @Expect(commentDomainStatus.contains("\"recordOnlyCommentAuthorCount\":1"), true)
+        try { remove(domainCounterDir, recursive: true) } catch (_: Exception) { () }
+
+        let acceptedDir = tempDir("gcm-p1-accepted-no-match")
+        let acceptedConfig = enabledConfig(acceptedDir.join("queue").toString())
+        acceptedConfig.authorPolicy.recordOnlyEnabled = true
+        acceptedConfig.authorPolicy.commentAuthorRule.ids = ["999999"]
+        let (acceptedState, acceptedSink, acceptedResult) = processOnePayload(acceptedConfig, issue4NotePayload(commentId: "9003"), "Note Hook")
+        @Expect(acceptedResult.processed, 1)
+        @Expect(acceptedSink.lines.size, 1)
+        @Expect(decodeServiceFrame(acceptedSink.lines[0]).frame.capabilityId, "gitcode.event.accepted")
+        @Expect(auditContains(acceptedState, "record_only"), false)
+        @Expect(webhookStatusPayload(acceptedConfig, WebhookQueue(acceptedConfig.webhook.queueDir), state: Some<MonitorState>(acceptedState)).contains("\"selfEchoIgnoredCount\":0"), true)
+        try { remove(acceptedDir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p2p3p7WritebackLedgerSuppressesSelfEchoWithoutBodyLeakOrFalsePositive(): Unit {
+        // T-P2-U-001, T-P2-B-001, T-P2-P-001, T-P2-N-001, T-P3-P-001, T-P7-E2E-004
+        let dir = tempDir("gcm-p2-ledger")
+        let config = enabledConfig(dir.join("queue").toString())
+        let ledgerPath = writebackLedgerPathForConfig(config)
+        let body = "natural comment"
+        let recorded = recordWriteback(ledgerPath, "Cangjie/community", "issue", "4", "https://gitcode.com/Cangjie/community/issues/4#note_9004", body, "source-event-1", nowMs: 1000)
+        @Expect(recorded.ok, true)
+        let ledgerText = String.fromUtf8(File.readFrom(Path(ledgerPath)))
+        @Expect(ledgerText.contains(body), false)
+        @Expect(ledgerText.contains("token"), false)
+        @Expect(ledgerText.contains("note_9004"), true)
+
+        @Expect(recordWriteback(ledgerPath, "Cangjie/community", "issue", "4", "https://gitcode.com/Cangjie/community/issues/4#note_9010", body, "https://audit.local/events/1?token=gitcode-token", nowMs: 1000).ok, true)
+        @Expect(recordWriteback(ledgerPath, "Cangjie/community", "issue", "4", "https://gitcode.com/Cangjie/community/issues/4#note_9011", body, "/Users/alice/.metis/source-event", nowMs: 1000).ok, true)
+        let safeLedgerText = String.fromUtf8(File.readFrom(Path(ledgerPath)))
+        @Expect(safeLedgerText.contains("gitcode-token"), false)
+        @Expect(safeLedgerText.contains("token="), false)
+        @Expect(safeLedgerText.contains("/Users/alice"), false)
+        let safeSourceMatch = matchWebhookComment(ledgerPath, "Cangjie/community", "issue", "4", "", "note_9010", body, nowMs: 2000)
+        @Expect(safeSourceMatch.matched, true)
+        @Expect(safeSourceMatch.sourceEventId.contains("gitcode-token"), false)
+        @Expect(safeSourceMatch.sourceEventId.contains("token="), false)
+        let localPathSourceMatch = matchWebhookComment(ledgerPath, "Cangjie/community", "issue", "4", "", "note_9011", body, nowMs: 2000)
+        @Expect(localPathSourceMatch.matched, true)
+        @Expect(localPathSourceMatch.sourceEventId.contains("/Users/alice"), false)
+
+        let echo = issue4NotePayload(commentId: "9004", note: body)
+        let (state, sink, result) = processOnePayload(config, echo, "Note Hook")
+        @Expect(result.processed, 1)
+        @Expect(sink.lines.size, 0)
+        @Expect(auditContains(state, "self_echo_ignored"), true)
+        @Expect(webhookStatusPayload(config, WebhookQueue(config.webhook.queueDir), state: Some<MonitorState>(state)).contains("\"selfEchoIgnoredCount\":1"), true)
+
+        let mismatchDir = tempDir("gcm-p2-ledger-mismatch")
+        let mismatchConfig = enabledConfig(mismatchDir.join("queue").toString())
+        @Expect(recordWriteback(writebackLedgerPathForConfig(mismatchConfig), "Other/community", "issue", "4", "https://gitcode.com/Other/community/issues/4#note_9005", body, "source-event-2", nowMs: 1000).ok, true)
+        let (mismatchState, mismatchSink, _) = processOnePayload(mismatchConfig, issue4NotePayload(commentId: "9005", note: body), "Note Hook")
+        @Expect(mismatchSink.lines.size, 1)
+        @Expect(auditContains(mismatchState, "self_echo_ignored"), false)
+
+        let expired = matchWebhookComment(ledgerPath, "Cangjie/community", "issue", "4", "", "note_missing", body, nowMs: 1000 + WRITEBACK_LEDGER_TTL_MS + 1)
+        @Expect(expired.matched, false)
+        let expiredUrl = matchWebhookComment(ledgerPath, "Cangjie/community", "issue", "4", "https://gitcode.com/Cangjie/community/issues/4#note_9004", "", body, nowMs: 1000 + WRITEBACK_LEDGER_TTL_MS + 1)
+        @Expect(expiredUrl.matched, false)
+        let expiredAnchor = matchWebhookComment(ledgerPath, "Cangjie/community", "issue", "4", "", "note_9004", body, nowMs: 1000 + WRITEBACK_LEDGER_TTL_MS + 1)
+        @Expect(expiredAnchor.matched, false)
+
+        let bodyOnlyDir = tempDir("gcm-p2-ledger-bodyhash-untrusted")
+        let bodyOnlyConfig = enabledConfig(bodyOnlyDir.join("queue").toString())
+        @Expect(recordWriteback(writebackLedgerPathForConfig(bodyOnlyConfig), "Cangjie/community", "issue", "4", "", body, "source-event-body", nowMs: 1000).ok, true)
+        let bodyHashOnly = matchWebhookComment(writebackLedgerPathForConfig(bodyOnlyConfig), "Cangjie/community", "issue", "4", "", "", body, nowMs: 2000)
+        @Expect(bodyHashOnly.matched, false)
+        @Expect(bodyHashOnly.status, "body_hash_untrusted")
+        let (bodyOnlyState, bodyOnlySink, _) = processOnePayload(bodyOnlyConfig, issue4NotePayloadWithoutUrl(note: body), "Note Hook")
+        @Expect(bodyOnlySink.lines.size, 1)
+        @Expect(auditContains(bodyOnlyState, "self_echo_ignored"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+        try { remove(mismatchDir, recursive: true) } catch (_: Exception) { () }
+        try { remove(bodyOnlyDir, recursive: true) } catch (_: Exception) { () }
+    }
+
     @TestCase
     public func reviewContractValidationCoversRequiredAndUnsafePayloads(): Unit {
         // T-CONTRACT-001, T-CONTRACT-002, T-CONTRACT-003, T-CONTRACT-004, T-CONTRACT-005, T-CONTRACT-009
@@ -1059,12 +1370,12 @@ public class GitCodeWebhookETest {
     public func authorPolicyConfiguredDomainsDriveWebhookRecordOnlyDecisions(): Unit {
         // T-AP-PROCESSOR-002, T-AP-PROCESSOR-003, T-AP-PROCESSOR-004, T-AP-PROCESSOR-005, T-AP-PROCESSOR-006, T-AP-PROCESSOR-007, T-AP-DIAG-001, T-AP-DIAG-002, T-AP-DIAG-003, T-AP-E2E-002, T-AP-E2E-003
         let cases = [
-            ("configured-huawei", ["@huawei.com", "@h-partners.com"], true, reviewFactsIssuePayload(email: "dev@huawei.com"), true),
-            ("configured-example", ["@example.com"], true, reviewFactsIssuePayload(email: "dev@example.com"), true),
-            ("disabled-huawei", ["@huawei.com"], false, reviewFactsIssuePayload(email: "dev@huawei.com"), false),
-            ("subdomain-not-matched", ["@huawei.com"], true, reviewFactsIssuePayload(email: "dev@sub.huawei.com"), false),
+            ("configured-huawei", ["@huawei.com", "@h-partners.com"], true, scopedIssuePayload("707874", "dev", "dev@huawei.com"), true),
+            ("configured-example", ["@example.com"], true, scopedIssuePayload("707874", "dev", "dev@example.com"), true),
+            ("disabled-huawei", ["@huawei.com"], false, scopedIssuePayload("707874", "dev", "dev@huawei.com"), false),
+            ("subdomain-not-matched", ["@huawei.com"], true, scopedIssuePayload("707874", "dev", "dev@sub.huawei.com"), false),
             ("missing-email", ["@huawei.com"], true, reviewFactsIssuePayloadWithoutEmail(), false),
-            ("custom-does-not-imply-huawei", ["@example.com"], true, reviewFactsIssuePayload(email: "dev@huawei.com"), false)
+            ("custom-does-not-imply-huawei", ["@example.com"], true, scopedIssuePayload("707874", "dev", "dev@huawei.com"), false)
         ]
         for ((name, domains, enabled, payload, expectRecordOnly) in cases) {
             let dir = tempDir("gcm-author-policy-${name}")
@@ -1082,10 +1393,10 @@ public class GitCodeWebhookETest {
             @Expect(result.processed, 1)
             @Expect(queue.countByStatus("processed"), 1)
             if (expectRecordOnly) {
-                @Expect(auditContains(state, "record_only", reason: "corporate_author"), true)
+                @Expect(auditContains(state, "record_only", reason: "record_only_target_author_email_domain"), true)
                 @Expect(sink.lines.size, 0)
             } else {
-                @Expect(auditContains(state, "record_only", reason: "corporate_author"), false)
+                @Expect(auditContains(state, "record_only", reason: "record_only_target_author_email_domain"), false)
                 @Expect(sink.lines.size, 1)
                 @Expect(decodeServiceFrame(sink.lines[0]).frame.capabilityId, "gitcode.event.accepted")
             }

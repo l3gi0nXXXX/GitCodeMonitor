@@ -55,6 +55,50 @@ public class GitCodeAuthorIdentity {
     }
 }
 
+public class GitCodeWebhookSubjectSet {
+    public let targetAuthor: ?GitCodeAuthorIdentity
+    public let commentAuthor: ?GitCodeAuthorIdentity
+    public let eventActor: ?GitCodeAuthorIdentity
+    public let sourceKind: String
+
+    public init(
+        targetAuthor!: ?GitCodeAuthorIdentity = None<GitCodeAuthorIdentity>,
+        commentAuthor!: ?GitCodeAuthorIdentity = None<GitCodeAuthorIdentity>,
+        eventActor!: ?GitCodeAuthorIdentity = None<GitCodeAuthorIdentity>,
+        sourceKind!: String = ""
+    ) {
+        this.targetAuthor = targetAuthor
+        this.commentAuthor = commentAuthor
+        this.eventActor = eventActor
+        this.sourceKind = sourceKind.trimAscii()
+    }
+}
+
+public class RecordOnlySubjectDecision {
+    public let decision: String
+    public let matchedScope: String
+    public let matchedType: String
+    public let matchedValueHash: String
+    public let reason: String
+    public let missingDiagnostics: Array<String>
+
+    public init(
+        decision: String,
+        matchedScope!: String = "",
+        matchedType!: String = "",
+        matchedValueHash!: String = "",
+        reason!: String = "process",
+        missingDiagnostics!: Array<String> = []
+    ) {
+        this.decision = decision.trimAscii()
+        this.matchedScope = matchedScope.trimAscii()
+        this.matchedType = matchedType.trimAscii()
+        this.matchedValueHash = matchedValueHash.trimAscii()
+        this.reason = reason.trimAscii()
+        this.missingDiagnostics = missingDiagnostics
+    }
+}
+
 public func extractAuthorIdentityFromWebhook(root: JsonObject): GitCodeAuthorIdentity {
     let author = firstAuthorObject(root)
     let login = firstNonEmpty([
@@ -66,6 +110,116 @@ public func extractAuthorIdentityFromWebhook(root: JsonObject): GitCodeAuthorIde
         displayName: firstJsonString(author, ["name", "display_name", "displayName", "nickname"]),
         url: firstJsonString(author, ["html_url", "web_url", "url"]),
         id: firstJsonString(author, ["id"])
+    )
+}
+
+public func extractWebhookSubjectSet(root: JsonObject): GitCodeWebhookSubjectSet {
+    let kind = firstNonEmpty([firstJsonString(root, ["object_kind", "objectKind"]), firstJsonString(root, ["event_type", "eventType"])])
+        .toAsciiLower()
+    let actor = identityFromObject(nestedObject(root, ["user", "author"]), idFallback: "")
+    let actorSubject = if (identityIsPresent(actor)) { Some<GitCodeAuthorIdentity>(actor) } else { None<GitCodeAuthorIdentity> }
+    if (kind.contains("note")) {
+        let attrs = nestedObject(root, ["object_attributes"])
+        let comment = identityFromObject(nestedObject(root, ["user", "author"]), idFallback: firstJsonString(attrs, ["author_id", "authorId"]))
+        let commentSubject = if (identityIsPresent(comment)) { Some<GitCodeAuthorIdentity>(comment) } else { None<GitCodeAuthorIdentity> }
+        let noteableType = firstJsonString(attrs, ["noteable_type", "noteableType"]).toAsciiLower()
+        let targetObj = if (noteableType.contains("merge") || noteableType == "pullrequest" || rootHasObject(root, "merge_request")) {
+            firstNestedAuthorObjectStrict(root, ["merge_request", "pull_request"])
+        } else {
+            firstNestedAuthorObjectStrict(root, ["issue"])
+        }
+        let target = identityFromObject(targetObj[0], idFallback: targetObj[1])
+        return GitCodeWebhookSubjectSet(
+            targetAuthor: if (identityIsPresent(target)) { Some<GitCodeAuthorIdentity>(target) } else { None<GitCodeAuthorIdentity> },
+            commentAuthor: commentSubject,
+            eventActor: actorSubject,
+            sourceKind: "note"
+        )
+    }
+    if (kind.contains("merge") || rootHasObject(root, "merge_request")) {
+        let targetObj = firstNestedAuthorObject(root, ["merge_request", "object_attributes", "pull_request"])
+        let target = identityFromObject(targetObj[0], idFallback: targetObj[1])
+        return GitCodeWebhookSubjectSet(
+            targetAuthor: if (identityIsPresent(target)) { Some<GitCodeAuthorIdentity>(target) } else { None<GitCodeAuthorIdentity> },
+            eventActor: actorSubject,
+            sourceKind: "pr"
+        )
+    }
+    let targetObj = firstNestedAuthorObject(root, ["object_attributes", "issue"])
+    let target = identityFromObject(targetObj[0], idFallback: targetObj[1])
+    GitCodeWebhookSubjectSet(
+        targetAuthor: if (identityIsPresent(target)) { Some<GitCodeAuthorIdentity>(target) } else { None<GitCodeAuthorIdentity> },
+        eventActor: actorSubject,
+        sourceKind: "issue"
+    )
+}
+
+public func classifyRecordOnlySubjects(subjects: GitCodeWebhookSubjectSet, policy: AuthorPolicyConfig): RecordOnlySubjectDecision {
+    if (!authorPolicyRecordOnlyEffective(policy)) {
+        return RecordOnlySubjectDecision("process")
+    }
+    let missing = ArrayList<String>()
+    let commentDecision = classifySubjectForRule(subjects.commentAuthor, mergeAuthorPolicyIdentityRule(policy.commentAuthorRule), "comment_author")
+    if (subjects.commentAuthor.isNone() && authorPolicyIdentityRuleEffective(policy.commentAuthorRule)) { missing.add("comment_subject_missing") }
+
+    let targetDecision = classifySubjectForRule(subjects.targetAuthor, mergeAuthorPolicyIdentityRule(policy.targetAuthorRule, emailDomains: policy.recordOnlyEmailDomains), "target_author")
+    if (subjects.targetAuthor.isNone() && (authorPolicyIdentityRuleEffective(policy.targetAuthorRule) || policy.recordOnlyEmailDomains.size > 0)) { missing.add("target_subject_missing") }
+
+    let actorDecision = classifySubjectForRule(subjects.eventActor, mergeAuthorPolicyIdentityRule(policy.eventActorRule), "event_actor")
+    if (subjects.eventActor.isNone() && authorPolicyIdentityRuleEffective(policy.eventActorRule)) { missing.add("event_actor_missing") }
+
+    let missingDiagnostics = missing.toArray()
+    if (commentDecision.decision == "record_only") { return recordOnlyDecisionWithMissing(commentDecision, missingDiagnostics) }
+    if (targetDecision.decision == "record_only") { return recordOnlyDecisionWithMissing(targetDecision, missingDiagnostics) }
+    if (actorDecision.decision == "record_only") { return recordOnlyDecisionWithMissing(actorDecision, missingDiagnostics) }
+    RecordOnlySubjectDecision("process", missingDiagnostics: missing.toArray())
+}
+
+func recordOnlyDecisionWithMissing(decision: RecordOnlySubjectDecision, missingDiagnostics: Array<String>): RecordOnlySubjectDecision {
+    RecordOnlySubjectDecision(
+        decision.decision,
+        matchedScope: decision.matchedScope,
+        matchedType: decision.matchedType,
+        matchedValueHash: decision.matchedValueHash,
+        reason: decision.reason,
+        missingDiagnostics: missingDiagnostics
+    )
+}
+
+func classifySubjectForRule(subject: ?GitCodeAuthorIdentity, rule: AuthorPolicyIdentityRule, scope: String): RecordOnlySubjectDecision {
+    match (subject) {
+        case Some(identity) =>
+            let id = identity.id.trimAscii()
+            if (!id.isEmpty() && rule.ids.contains(id)) {
+                return recordOnlyDecision(scope, "id", id)
+            }
+            for (email in identity.emails) {
+                let lower = email.trimAscii().toAsciiLower()
+                if (!lower.isEmpty() && rule.emails.contains(lower)) {
+                    return recordOnlyDecision(scope, "email", lower)
+                }
+                for (domain in rule.emailDomains) {
+                    if (!domain.trimAscii().isEmpty() && lower.endsWith(domain.trimAscii().toAsciiLower())) {
+                        return recordOnlyDecision(scope, "email_domain", domain)
+                    }
+                }
+            }
+            let login = identity.login.trimAscii().toAsciiLower()
+            if (!login.isEmpty() && rule.usernames.contains(login)) {
+                return recordOnlyDecision(scope, "username", login)
+            }
+        case None => ()
+    }
+    RecordOnlySubjectDecision("process")
+}
+
+func recordOnlyDecision(scope: String, matchedType: String, matchedValue: String): RecordOnlySubjectDecision {
+    RecordOnlySubjectDecision(
+        "record_only",
+        matchedScope: scope,
+        matchedType: matchedType,
+        matchedValueHash: hashRawPayload(matchedValue),
+        reason: "record_only_${scope}_${matchedType}"
     )
 }
 
@@ -133,6 +287,47 @@ public func classifyCorporateAuthor(identity: GitCodeAuthorIdentity, domains: Ar
         decision: "process",
         diagnostics: identity.diagnostics
     )
+}
+
+func identityFromObject(obj: JsonObject, idFallback!: String = ""): GitCodeAuthorIdentity {
+    let emails = ArrayList<String>()
+    let sources = ArrayList<String>()
+    let diagnostics = ArrayList<GitCodeIdentityDiagnostic>()
+    collectEmailsFromObject(obj, "webhook", emails, sources, diagnostics)
+    let login = firstJsonString(obj, ["login", "username", "name"])
+    GitCodeAuthorIdentity(
+        if (login.isEmpty()) { "unknown" } else { login },
+        displayName: firstJsonString(obj, ["display_name", "displayName", "nickname", "name"]),
+        url: firstJsonString(obj, ["html_url", "web_url", "url"]),
+        id: firstNonEmpty([firstJsonString(obj, ["id", "user_id", "userId", "author_id", "authorId"]), idFallback]),
+        emails: dedupeStrings(emails.toArray()),
+        emailSources: dedupeStrings(sources.toArray()),
+        emailResolveStatus: if (emails.size > 0) { "resolved" } else { "email_unavailable" },
+        diagnostics: diagnostics.toArray()
+    )
+}
+
+func identityIsPresent(identity: GitCodeAuthorIdentity): Bool {
+    identity.id.trimAscii() != "" || identity.login.trimAscii().toAsciiLower() != "unknown" || identity.emails.size > 0
+}
+
+func firstNestedAuthorObject(root: JsonObject, parentKeys: Array<String>): (JsonObject, String) {
+    for (parentKey in parentKeys) {
+        let parent = nestedObject(root, [parentKey])
+        let author = nestedObject(parent, ["author", "user"])
+        let fallback = firstJsonString(parent, ["author_id", "authorId", "user_id", "userId"])
+        if (identityIsPresent(identityFromObject(author, idFallback: fallback))) {
+            return (author, fallback)
+        }
+        if (!fallback.isEmpty()) {
+            return (author, fallback)
+        }
+    }
+    (JsonObject(), "")
+}
+
+func firstNestedAuthorObjectStrict(root: JsonObject, parentKeys: Array<String>): (JsonObject, String) {
+    firstNestedAuthorObject(root, parentKeys)
 }
 
 func firstAuthorObject(root: JsonObject): JsonObject {

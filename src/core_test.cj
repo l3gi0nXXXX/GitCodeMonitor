@@ -67,6 +67,40 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
     }
 
     @TestCase
+    public func p0p1AuthorPolicyScopedRulesParseNormalizeValidateAndDriveEffective(): Unit {
+        // T-P0-B-001, T-P1-U-001, T-P1-U-002, T-P1-U-003, T-P1-U-004, T-P1-B-001, T-P1-B-002
+        let scoped = loadConfigJsonForTest("gcm-p1-author-policy-scoped", "{" +
+            "\"gitcode\":{\"authorPolicy\":{\"recordOnlyEnabled\":true,\"recordOnlyEmailDomains\":[\"@Huawei.com\"],\"recordOnly\":{" +
+            "\"commentAuthor\":{\"ids\":[\" 856442 \",856442],\"emails\":[\" HuXiaoMing6@Huawei.com \"],\"usernames\":[\" L3Gi0n \"],\"emailDomains\":[\"H-Partners.com\"]}," +
+            "\"targetAuthor\":{\"emails\":[\" Target@Example.com \"],\"emailDomains\":[\"corp.example\"]}," +
+            "\"eventActor\":{\"ids\":[\"707874\"],\"usernames\":[\" Actor \"]}" +
+            "}}}}"
+        )
+        @Expect(scoped.authorPolicy.commentAuthorRule.ids.size, 1)
+        @Expect(scoped.authorPolicy.commentAuthorRule.ids[0], "856442")
+        @Expect(scoped.authorPolicy.commentAuthorRule.emails[0], "huxiaoming6@huawei.com")
+        @Expect(scoped.authorPolicy.commentAuthorRule.usernames[0], "l3gi0n")
+        @Expect(scoped.authorPolicy.commentAuthorRule.emailDomains[0], "@h-partners.com")
+        @Expect(scoped.authorPolicy.recordOnlyEmailDomains[0], "@huawei.com")
+        @Expect(scoped.authorPolicy.targetAuthorRule.emailDomains.contains("@huawei.com"), true)
+        @Expect(scoped.authorPolicy.targetAuthorRule.emailDomains.contains("@corp.example"), true)
+        @Expect(scoped.authorPolicy.eventActorRule.ids[0], "707874")
+        @Expect(authorPolicyRecordOnlyEffective(scoped.authorPolicy), true)
+        @Expect(validateConfig(scoped), "ok")
+
+        let empty = loadConfigJsonForTest("gcm-p1-author-policy-empty", "{\"gitcode\":{\"authorPolicy\":{\"recordOnlyEnabled\":true,\"recordOnly\":{\"commentAuthor\":{},\"targetAuthor\":{},\"eventActor\":{}},\"recordOnlyEmailDomains\":[]}}}")
+        @Expect(authorPolicyRecordOnlyEffective(empty.authorPolicy), false)
+        let disabled = loadConfigJsonForTest("gcm-p0-author-policy-disabled", "{\"gitcode\":{\"authorPolicy\":{\"recordOnlyEnabled\":false,\"recordOnly\":{\"commentAuthor\":{\"ids\":[\"856442\"]}}}}}")
+        @Expect(authorPolicyRecordOnlyEffective(disabled.authorPolicy), false)
+
+        @Expect(validateConfig(loadConfigJsonForTest("gcm-p1-bad-id", "{\"gitcode\":{\"authorPolicy\":{\"recordOnly\":{\"commentAuthor\":{\"ids\":[\"\"]}}}}}")).contains("authorPolicy author_policy_invalid_id"), true)
+        @Expect(validateConfig(loadConfigJsonForTest("gcm-p1-bad-id-alpha", "{\"gitcode\":{\"authorPolicy\":{\"recordOnly\":{\"commentAuthor\":{\"ids\":[\"abc\"]}}}}}")).contains("authorPolicy author_policy_invalid_id"), true)
+        @Expect(validateConfig(loadConfigJsonForTest("gcm-p1-bad-email", "{\"gitcode\":{\"authorPolicy\":{\"recordOnly\":{\"commentAuthor\":{\"emails\":[\"localpart\"]}}}}}")).contains("authorPolicy author_policy_invalid_email"), true)
+        @Expect(validateConfig(loadConfigJsonForTest("gcm-p1-bad-username", "{\"gitcode\":{\"authorPolicy\":{\"recordOnly\":{\"commentAuthor\":{\"usernames\":[\"https://gitcode.com/l3gi0n\"]}}}}}")).contains("authorPolicy author_policy_invalid_username"), true)
+        @Expect(validateConfig(loadConfigJsonForTest("gcm-p1-bad-wildcard", "{\"gitcode\":{\"authorPolicy\":{\"recordOnly\":{\"commentAuthor\":{\"usernames\":[\"*\"]}}}}}")).contains("authorPolicy author_policy_invalid_username"), true)
+    }
+
+    @TestCase
     public func gitCodeCommentWriterPostsIssueAndPrWithJsonBody(): Unit {
         // T-ROOT-004, T-WRITER-001, T-WRITER-002, T-WRITER-005
         let sender = FakeHttpSender()

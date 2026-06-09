@@ -1,6 +1,6 @@
 package gitcodemonitor
 
-import std.fs.{Directory, Path, exists, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -118,6 +118,76 @@ public class GitCodeMonitorPluginLeaseTest {
         let reloaded = readGcmPluginLease(path).lease
         @Expect(reloaded.state, "orphan_detected")
         @Expect(reloaded.orphanReason, "parent_mismatch_unreachable")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p5p6GcmWatchdogAndRuntimeFailClosedDiagnostics(): Unit {
+        // T-P5-U-001, T-P5-B-001, T-P5-P-001, T-P5-N-001, T-P6-U-001, T-P6-B-001, T-P6-P-001, T-P6-N-001
+        let dir = tempDir("gcm-p5-p6-watchdog")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p5p6", 101, 202, "127.0.0.1", 19086, 1000, 1000, "running", "")
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+        let healthy = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, GcmPluginOwnerSnapshot(true, false, 0)), nowMs: 2000)
+        @Expect(healthy.orphanDetected, false)
+        @Expect(healthy.status, "heartbeat")
+
+        let badParent = dir.join("lease-parent-file")
+        File.writeTo(badParent, "not-a-directory".toArray())
+        let badLeasePath = badParent.join("lease.json").toString()
+        let writeFailed = gcmPluginWatchdogTick(GcmPluginWatchdogContext(badLeasePath, lease, GcmPluginOwnerSnapshot(true, false, 0)), nowMs: 2100)
+        @Expect(writeFailed.orphanDetected, false)
+        @Expect(writeFailed.status.contains("lease"), true)
+
+        let orphan = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, GcmPluginOwnerSnapshot(false, false, 0)), nowMs: 3000)
+        @Expect(orphan.orphanDetected, true)
+        @Expect(orphan.reason, "parent_lost")
+        let orphanedLease = readGcmPluginLease(path).lease
+        let frame = gcmPluginOrphanDetectedFrame(orphanedLease)
+        @Expect(frame.payload.contains("\"pluginId\":\"gitcode-monitor\""), true)
+        @Expect(frame.payload.contains("\"sessionId\":\"session-p5p6\""), true)
+        @Expect(frame.payload.contains("\"parentPid\":202"), true)
+        @Expect(frame.payload.contains("\"bindHost\":\"127.0.0.1\""), true)
+        @Expect(frame.payload.contains("\"port\":19086"), true)
+        @Expect(frame.payload.contains("token"), false)
+        @Expect(frame.payload.contains("/Users/"), false)
+
+        let config = defaultConfig()
+        config.webhook = WebhookReceiverConfig(enabled: false, queueDir: dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let loop = WebhookProcessorLoopRuntime(config, RuntimeContainer(config), MonitorState(), queue)
+        loop.start()
+        @Expect(loop.snapshot().processorStatus, "disabled")
+        loop.stop()
+        @Expect(loop.snapshot().processorStatus == "disabled" || loop.snapshot().processorStatus == "stopped", true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p6WatchdogOrphanHandlerEmitsFrameAndStopsRuntimesWithoutExit(): Unit {
+        // T-P6-U-001, T-P6-P-001
+        let dir = tempDir("gcm-p6-orphan-helper")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-helper", 101, 202, "127.0.0.1", 19087, 1000, 3000, "orphan_detected", "parent_lost")
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+        let config = defaultConfig()
+        config.webhook = WebhookReceiverConfig(enabled: true, bindHost: "127.0.0.1", port: 0, queueDir: dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let processor = WebhookProcessorLoopRuntime(config, RuntimeContainer(config), MonitorState(), queue)
+        processor.start()
+        let listener = WebhookHttpServerRuntime(config, queue)
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+
+        let handled = gcmPluginHandleOrphanForTest(path, writer, listener, processor)
+
+        @Expect(handled.orphanHandled, true)
+        @Expect(handled.frameEmitted, true)
+        @Expect(sink.lines.size, 1)
+        @Expect(decodeServiceFrame(sink.lines[0]).frame.capabilityId, "gitcode.monitor.orphan_detected")
+        @Expect(processor.snapshot().processorStatus, "stopped")
+        @Expect(handled.processorStopped, true)
+        @Expect(handled.listenerStopped, true)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 }

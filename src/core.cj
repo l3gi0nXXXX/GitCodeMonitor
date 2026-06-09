@@ -14,18 +14,46 @@ import stdx.net.tls.*
 public let SELF_MARKER = "<!-- gitcodemonitor:auto-reply:v1 -->"
 public const DEFAULT_MAX_AUDIT_RECORDS: Int64 = 1000
 
+public class AuthorPolicyIdentityRule {
+    public var ids: Array<String>
+    public var emails: Array<String>
+    public var usernames: Array<String>
+    public var emailDomains: Array<String>
+
+    public init(
+        ids!: Array<String> = [],
+        emails!: Array<String> = [],
+        usernames!: Array<String> = [],
+        emailDomains!: Array<String> = []
+    ) {
+        this.ids = ids
+        this.emails = emails
+        this.usernames = usernames
+        this.emailDomains = emailDomains
+    }
+}
+
 public class AuthorPolicyConfig {
     public var recordOnlyEnabled: Bool
     public var recordOnlyEmailDomains: Array<String>
+    public var targetAuthorRule: AuthorPolicyIdentityRule
+    public var commentAuthorRule: AuthorPolicyIdentityRule
+    public var eventActorRule: AuthorPolicyIdentityRule
     public var unknownEmailDecision: String
 
     public init(
         recordOnlyEnabled!: Bool = true,
         recordOnlyEmailDomains!: Array<String> = [],
+        targetAuthorRule!: AuthorPolicyIdentityRule = AuthorPolicyIdentityRule(),
+        commentAuthorRule!: AuthorPolicyIdentityRule = AuthorPolicyIdentityRule(),
+        eventActorRule!: AuthorPolicyIdentityRule = AuthorPolicyIdentityRule(),
         unknownEmailDecision!: String = "process"
     ) {
         this.recordOnlyEnabled = recordOnlyEnabled
         this.recordOnlyEmailDomains = recordOnlyEmailDomains
+        this.targetAuthorRule = targetAuthorRule
+        this.commentAuthorRule = commentAuthorRule
+        this.eventActorRule = eventActorRule
         this.unknownEmailDecision = unknownEmailDecision
     }
 }
@@ -199,7 +227,16 @@ public func configSummary(config: MonitorConfig): String {
 }
 
 public func authorPolicyRecordOnlyEffective(policy: AuthorPolicyConfig): Bool {
-    policy.recordOnlyEnabled && policy.recordOnlyEmailDomains.size > 0
+    policy.recordOnlyEnabled && (
+        policy.recordOnlyEmailDomains.size > 0 ||
+        authorPolicyIdentityRuleEffective(policy.targetAuthorRule) ||
+        authorPolicyIdentityRuleEffective(policy.commentAuthorRule) ||
+        authorPolicyIdentityRuleEffective(policy.eventActorRule)
+    )
+}
+
+public func authorPolicyIdentityRuleEffective(rule: AuthorPolicyIdentityRule): Bool {
+    rule.ids.size > 0 || rule.emails.size > 0 || rule.usernames.size > 0 || rule.emailDomains.size > 0
 }
 
 public class GitCodeEvent {
@@ -1894,8 +1931,89 @@ func applyAuthorPolicySection(config: MonitorConfig, obj: JsonObject): Unit {
             } catch (_: Exception) { () }
         case None => ()
     }
+    match (obj.get("recordOnly")) {
+        case Some(value) =>
+            try {
+                let recordOnly = value.asObject()
+                config.authorPolicy.targetAuthorRule = mergeAuthorPolicyIdentityRule(
+                    parseAuthorPolicyIdentityRule(nestedObject(recordOnly, ["targetAuthor", "target_author"])),
+                    emailDomains: config.authorPolicy.recordOnlyEmailDomains
+                )
+                config.authorPolicy.commentAuthorRule = parseAuthorPolicyIdentityRule(nestedObject(recordOnly, ["commentAuthor", "comment_author"]))
+                config.authorPolicy.eventActorRule = parseAuthorPolicyIdentityRule(nestedObject(recordOnly, ["eventActor", "event_actor"]))
+            } catch (_: Exception) { () }
+        case None =>
+            config.authorPolicy.targetAuthorRule = mergeAuthorPolicyIdentityRule(config.authorPolicy.targetAuthorRule, emailDomains: config.authorPolicy.recordOnlyEmailDomains)
+    }
     let unknown = firstJsonString(obj, ["unknownEmailDecision"])
     if (!unknown.isEmpty()) { config.authorPolicy.unknownEmailDecision = unknown.trimAscii().toAsciiLower() }
+}
+
+func parseAuthorPolicyIdentityRule(obj: JsonObject): AuthorPolicyIdentityRule {
+    AuthorPolicyIdentityRule(
+        ids: normalizeAuthorPolicyStringArray(obj, ["ids", "id"], "id"),
+        emails: normalizeAuthorPolicyStringArray(obj, ["emails", "email"], "email"),
+        usernames: normalizeAuthorPolicyStringArray(obj, ["usernames", "username", "logins", "login"], "username"),
+        emailDomains: normalizeAuthorPolicyStringArray(obj, ["emailDomains", "email_domains", "domains"], "domain")
+    )
+}
+
+func mergeAuthorPolicyIdentityRule(rule: AuthorPolicyIdentityRule, emailDomains!: Array<String> = []): AuthorPolicyIdentityRule {
+    let mergedDomains = ArrayList<String>()
+    for (domain in rule.emailDomains) { mergedDomains.add(domain) }
+    for (domain in emailDomains) { mergedDomains.add(domain) }
+    AuthorPolicyIdentityRule(
+        ids: rule.ids,
+        emails: rule.emails,
+        usernames: rule.usernames,
+        emailDomains: dedupePolicyValues(mergedDomains.toArray())
+    )
+}
+
+func normalizeAuthorPolicyStringArray(obj: JsonObject, keys: Array<String>, kind: String): Array<String> {
+    let out = ArrayList<String>()
+    for (key in keys) {
+        match (obj.get(key)) {
+            case Some(value) =>
+                try {
+                    for (item in value.asArray().getItems()) {
+                        let normalized = normalizeAuthorPolicyRuleValue(jsonValueToString(item), kind)
+                        if ((kind == "id" || kind == "email" || kind == "username") && normalized.isEmpty()) {
+                            if (!out.contains(normalized)) { out.add(normalized) }
+                        } else if (!normalized.isEmpty() && !out.contains(normalized)) {
+                            out.add(normalized)
+                        }
+                    }
+                } catch (_: Exception) {
+                    let normalized = normalizeAuthorPolicyRuleValue(jsonValueToString(value), kind)
+                    if ((kind == "id" || kind == "email" || kind == "username") && normalized.isEmpty()) {
+                        if (!out.contains(normalized)) { out.add(normalized) }
+                    } else if (!normalized.isEmpty() && !out.contains(normalized)) {
+                        out.add(normalized)
+                    }
+                }
+            case None => ()
+        }
+    }
+    out.toArray()
+}
+
+func normalizeAuthorPolicyRuleValue(raw: String, kind: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) { return "" }
+    if (kind == "email") { return trimmed.toAsciiLower() }
+    if (kind == "username") { return trimmed.toAsciiLower() }
+    if (kind == "domain") { return normalizeAuthorPolicyDomain(trimmed) }
+    trimmed
+}
+
+func dedupePolicyValues(items: Array<String>): Array<String> {
+    let out = ArrayList<String>()
+    for (item in items) {
+        let value = item.trimAscii()
+        if (!value.isEmpty() && !out.contains(value)) { out.add(value) }
+    }
+    out.toArray()
 }
 
 public func normalizeAuthorPolicyDomain(raw: String): String {
@@ -1912,7 +2030,51 @@ public func validateAuthorPolicyConfig(policy: AuthorPolicyConfig): String {
             return "author_policy_invalid_domain"
         }
     }
+    for (diagnostic in validateAuthorPolicyIdentityRule(policy.targetAuthorRule)) { return diagnostic }
+    for (diagnostic in validateAuthorPolicyIdentityRule(policy.commentAuthorRule)) { return diagnostic }
+    for (diagnostic in validateAuthorPolicyIdentityRule(policy.eventActorRule)) { return diagnostic }
     "ok"
+}
+
+func validateAuthorPolicyIdentityRule(rule: AuthorPolicyIdentityRule): Array<String> {
+    let diagnostics = ArrayList<String>()
+    for (id in rule.ids) {
+        if (!authorPolicyIdIsValid(id)) { diagnostics.add("author_policy_invalid_id") }
+    }
+    for (email in rule.emails) {
+        if (!authorPolicyEmailIsValid(email)) { diagnostics.add("author_policy_invalid_email") }
+    }
+    for (username in rule.usernames) {
+        if (!authorPolicyUsernameIsValid(username)) { diagnostics.add("author_policy_invalid_username") }
+    }
+    for (domain in rule.emailDomains) {
+        if (!authorPolicyDomainIsValid(domain)) { diagnostics.add("author_policy_invalid_domain") }
+    }
+    diagnostics.toArray()
+}
+
+func authorPolicyIdIsValid(id: String): Bool {
+    let value = id.trimAscii()
+    if (value.isEmpty()) { return false }
+    for (ch in value.runes()) {
+        if (ch < r'0' || ch > r'9') { return false }
+    }
+    true
+}
+
+func authorPolicyEmailIsValid(email: String): Bool {
+    let value = email.trimAscii().toAsciiLower()
+    if (value.contains(" ") || value.contains("\t") || value.contains("/") || value.contains("*")) { return false }
+    let parts = value.split("@")
+    parts.size == 2 && !parts[0].isEmpty() && parts[1].contains(".") && !parts[1].startsWith(".") && !parts[1].endsWith(".")
+}
+
+func authorPolicyUsernameIsValid(username: String): Bool {
+    let value = username.trimAscii()
+    if (value.isEmpty()) { return false }
+    if (value.contains("*") || value.contains("://") || value.contains("/") || value.contains("\\") || value.contains("@")) { return false }
+    if (value.contains(" ") || value.contains("\t") || value.contains("\n") || value.contains("\r")) { return false }
+    true
 }
 
 func authorPolicyDomainIsValid(domain: String): Bool {

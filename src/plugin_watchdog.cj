@@ -32,6 +32,22 @@ public class GcmPluginWatchdogTickResult {
     }
 }
 
+public class GcmPluginOrphanHandleResult {
+    public let orphanHandled: Bool
+    public let frameEmitted: Bool
+    public let processorStopped: Bool
+    public let listenerStopped: Bool
+    public let status: String
+
+    public init(orphanHandled: Bool, frameEmitted: Bool, processorStopped: Bool, listenerStopped: Bool, status: String) {
+        this.orphanHandled = orphanHandled
+        this.frameEmitted = frameEmitted
+        this.processorStopped = processorStopped
+        this.listenerStopped = listenerStopped
+        this.status = status.trimAscii()
+    }
+}
+
 public class GcmPluginWatchdogRuntime {
     private let leasePath: String
     private let baseLease: GcmPluginLease
@@ -91,12 +107,7 @@ public class GcmPluginWatchdogRuntime {
                 nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds()
             )
             if (ticked.orphanDetected) {
-                let loaded = readGcmPluginLease(this.leasePath)
-                if (loaded.ok) {
-                    this.writer.writeFrame(gcmPluginOrphanDetectedFrame(loaded.lease))
-                }
-                this.processorLoop.stop()
-                this.listener.stop()
+                let _ = gcmPluginHandleOrphan(this.leasePath, this.writer, this.listener, this.processorLoop)
                 exit(0)
             }
             sleep(Duration.millisecond * this.intervalMs)
@@ -123,6 +134,26 @@ public func gcmPluginWatchdogTick(context: GcmPluginWatchdogContext, nowMs!: Int
         return GcmPluginWatchdogTickResult(false, written.status)
     }
     GcmPluginWatchdogTickResult(false, "heartbeat")
+}
+
+public func gcmPluginHandleOrphanForTest(leasePath: String, writer: GcmPluginStdioWriter, listener: WebhookHttpServerRuntime, processorLoop: WebhookProcessorLoopRuntime): GcmPluginOrphanHandleResult {
+    gcmPluginHandleOrphan(leasePath, writer, listener, processorLoop)
+}
+
+func gcmPluginHandleOrphan(leasePath: String, writer: GcmPluginStdioWriter, listener: WebhookHttpServerRuntime, processorLoop: WebhookProcessorLoopRuntime): GcmPluginOrphanHandleResult {
+    let loaded = readGcmPluginLease(leasePath)
+    var frameEmitted = false
+    if (loaded.ok) {
+        writer.writeFrame(gcmPluginOrphanDetectedFrame(loaded.lease))
+        frameEmitted = true
+    }
+    processorLoop.stop()
+    listener.stop()
+    let processorStatus = processorLoop.snapshot().processorStatus
+    let listenerStatus = listener.snapshot().listenerStatus
+    let processorStopped = processorStatus == "stopped" || processorStatus == "disabled" || processorStatus == "not_started"
+    let listenerStopped = listenerStatus == "stopped" || listenerStatus == "disabled" || listenerStatus == "not_started"
+    GcmPluginOrphanHandleResult(true, frameEmitted, processorStopped, listenerStopped, if (loaded.ok) { "handled" } else { "lease_unavailable" })
 }
 
 public func gcmPluginOrphanDetectedFrame(lease: GcmPluginLease): ServiceFrame {

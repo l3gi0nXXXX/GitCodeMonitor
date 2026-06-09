@@ -453,6 +453,75 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func p0p2WritebackBodyIsNaturalAndPostedResultRecordsLedger(): Unit {
+        // T-P0-U-001, T-P2-U-001, T-P7-E2E-003
+        let dir = tempRuntimeDir("gcm-p2-writeback-runtime-ledger")
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = dir.join("state.json").toString()
+        config.autoReply = true
+        config.dryRun = false
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer)
+        let payload = "{\"eventId\":\"source-event-runtime\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"4\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\",\"draft\":\"natural reply body\",\"safety\":\"approved\"}"
+
+        let applied = handleGcmWritebackApplyResult(payload, runtime)
+
+        @Expect(applied.ok, true)
+        @Expect(applied.posted, true)
+        @Expect(writer.written.size, 1)
+        @Expect(writer.written[0].contains("auto-reply"), false)
+        @Expect(writer.written[0].contains("auto reply"), false)
+        @Expect(writer.written[0].contains("automatic reply"), false)
+        @Expect(writer.written[0].toAsciiLower().contains("gitcodemonitor"), false)
+        @Expect(writer.written[0].contains("generated-by"), false)
+        @Expect(writer.written[0].contains("bot attribution"), false)
+        @Expect(writer.written[0].contains("<!--"), false)
+        let ledgerPath = writebackLedgerPathForConfig(config)
+        @Expect(exists(Path(ledgerPath)), true)
+        let ledgerText = String.fromUtf8(File.readFrom(Path(ledgerPath)))
+        @Expect(ledgerText.contains("source-event-runtime"), true)
+        @Expect(ledgerText.contains("natural reply body"), false)
+        @Expect(ledgerText.contains("auto-reply"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p0NoProductionWriteHelperCanAppendSelfMarker(): Unit {
+        // T-P0-U-001 regression: only read-compatible marker helpers may remain.
+        let source = readFixture("src/plugin_runtime.cj")
+        @Expect(source.contains("func appendGcmSelfMarker"), false)
+        @Expect(source.contains("body + \"\\n\\n\" + SELF_MARKER"), false)
+        @Expect(source.contains("func hasGcmSelfMarker"), true)
+    }
+
+    @TestCase
+    public func p2WritebackLedgerAndAuditRedactSecretReplyUrls(): Unit {
+        // T-P2-U-001, T-P3-U-001
+        let dir = tempRuntimeDir("gcm-p2-secret-reply-url")
+        let config = defaultConfig()
+        config.statePath = dir.join("state.json").toString()
+        let secretUrl = "https://gitcode.com/Cangjie/community/issues/4#note_1?access_token=secret-token"
+        let ledgerPath = writebackLedgerPathForConfig(config)
+
+        @Expect(recordWriteback(ledgerPath, "Cangjie/community", "issue", "4", secretUrl, "safe body", "source-secret", nowMs: 1000).ok, true)
+        let ledgerText = String.fromUtf8(File.readFrom(Path(ledgerPath)))
+        @Expect(ledgerText.contains("secret-token"), false)
+        @Expect(ledgerText.contains("access_token"), false)
+        @Expect(ledgerText.contains(secretUrl), false)
+
+        let audit = buildGcmWritebackAudit(GcmWritebackRequest("source-secret", "Cangjie/community", "issue", "4", "https://gitcode.com/Cangjie/community/issues/4", "safe body"), GcmWritebackDecision(true, "posted"), replyUrl: secretUrl)
+        let host = MetisHostClient()
+        let emitted = emitGcmWritebackAudit(audit, host)
+        @Expect(emitted.ok, true)
+        @Expect(emitted.frame.payload.contains("secret-token"), false)
+        @Expect(emitted.frame.payload.contains("access_token"), false)
+        @Expect(emitted.frame.payload.contains(secretUrl), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func writebackApplyResultHonorsOrgScopeDeniedReposAndLegacyAllowlist(): Unit {
         let payload = "{\"eventId\":\"wb-scope-p4-e2e\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}"
 

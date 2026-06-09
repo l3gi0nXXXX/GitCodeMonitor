@@ -128,15 +128,35 @@ public func processWebhookBatch(
             ignored++
             continue
         }
-        let authorIdentity = resolveAuthorEmails(JsonValue.fromStr(payload.payload).asObject(), runtime.gitCode.client)
-        let identity = if (authorPolicyRecordOnlyEffective(config.authorPolicy)) {
-            classifyCorporateAuthor(authorIdentity, config.authorPolicy.recordOnlyEmailDomains)
-        } else {
-            authorIdentity
-        }
-        if (identity.decision == "record_only") {
+        let root = try { JsonValue.fromStr(payload.payload).asObject() } catch (_: Exception) { JsonValue.fromStr("{}").asObject() }
+        let recordOnly = classifyRecordOnlySubjects(extractWebhookSubjectSet(root), config.authorPolicy)
+        if (recordOnly.decision == "record_only") {
             state.markSeen(parsed.event.id)
-            state.addAudit(AuditRecord(parsed.event.id, status: "record_only", reason: "corporate_author"))
+            let audit = AuditRecord(parsed.event.id, status: "record_only", reason: recordOnly.reason)
+            let missingPart = if (recordOnly.missingDiagnostics.size > 0) { ";missing=${joinStrings(recordOnly.missingDiagnostics, ",")}" } else { "" }
+            let legacyPart = if (recordOnly.matchedType == "email_domain" && config.authorPolicy.recordOnlyEmailDomains.size > 0) { ";legacy=corporate_author" } else { "" }
+            audit.requestId = "scope=${recordOnly.matchedScope};type=${recordOnly.matchedType};valueHash=${recordOnly.matchedValueHash}${missingPart}${legacyPart}"
+            state.addAudit(audit)
+            let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)
+            processed++
+            continue
+        }
+        let echo = matchWebhookComment(
+            writebackLedgerPathForConfig(config),
+            "${parsed.event.org}/${parsed.event.repo}",
+            parsed.event.itemKind,
+            parsed.event.itemId,
+            parsed.event.url,
+            ledgerAnchorFromUrl(parsed.event.url),
+            parsed.event.content,
+            nowMs: nowMs
+        )
+        if (echo.matched) {
+            state.markSeen(parsed.event.id)
+            let audit = AuditRecord(parsed.event.id, status: "self_echo_ignored", reason: "self_echo_${echo.matchType}")
+            audit.replyUrl = sanitizeWritebackReplyUrlForStorage(parsed.event.url)
+            audit.writeDecision = echo.sourceEventId
+            state.addAudit(audit)
             let _ = queue.markProcessed(delivery.deliveryId, parsed.event.id)
             processed++
             continue
@@ -223,12 +243,13 @@ public func renderWebhookStatus(
     processorSnapshot!: ?WebhookProcessorLoopSnapshot = None<WebhookProcessorLoopSnapshot>
 ): String {
     let receiver = evaluateWebhookReceiverRuntime(config, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot)
+    let diagnostics = WebhookDiagnosticCounters()
     let errorPart = if (receiver.lastError.isEmpty()) { "" } else { " lastError=${receiver.lastError}" }
     let processorPart = match (processorSnapshot) {
         case Some(snapshot) => " lastClaimed=${snapshot.lastBatchClaimed} stateSave=${snapshot.lastStateSaveStatus} stateSaveDurationMs=${snapshot.lastStateSaveDurationMs}"
         case None => ""
     }
-    "GitCode Webhook receiver=${receiver.status} listener=${receiver.listenerStatus} processor=${receiver.processorStatus} pending=${queue.countByStatus("pending")} processing=${queue.countByStatus("processing")} processed=${queue.countByStatus("processed")} deadLetter=${queue.countByStatus("dead-letter")} cancelled=${queue.countByStatus("cancelled")} recordOnlyEnabled=${config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(config.authorPolicy)}${processorPart}${errorPart}"
+    "GitCode Webhook receiver=${receiver.status} listener=${receiver.listenerStatus} processor=${receiver.processorStatus} pending=${queue.countByStatus("pending")} processing=${queue.countByStatus("processing")} processed=${queue.countByStatus("processed")} deadLetter=${queue.countByStatus("dead-letter")} cancelled=${queue.countByStatus("cancelled")} recordOnlyEnabled=${config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(config.authorPolicy)} recordOnlyTargetAuthor=${diagnostics.recordOnlyTargetAuthorCount} recordOnlyCommentAuthor=${diagnostics.recordOnlyCommentAuthorCount} recordOnlyEventActor=${diagnostics.recordOnlyEventActorCount} selfEchoIgnored=${diagnostics.selfEchoIgnoredCount}${processorPart}${errorPart}"
 }
 
 public func webhookStatusPayload(
@@ -268,11 +289,15 @@ public func webhookStatusPayload(
     let processed = queue.countByStatus("processed")
     let deadLetter = queue.countByStatus("dead-letter")
     let cancelled = queue.countByStatus("cancelled")
-    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"recordOnlyEnabled\":${config.authorPolicy.recordOnlyEnabled},\"recordOnlyDomainCount\":${config.authorPolicy.recordOnlyEmailDomains.size},\"recordOnlyEffective\":${authorPolicyRecordOnlyEffective(config.authorPolicy)},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${listenerDetails}${processorDetails}\"receiverHealth\":{${listenerDetails}\"stateSaveStatus\":\"${jsonEscape(receiver.processorStatus)}\"},\"processor\":{${processorDetails}\"status\":\"${jsonEscape(receiver.processorStatus)}\"},\"stateSave\":{\"status\":\"${jsonEscape(match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveStatus case None => "not_started" })}\",\"skipped\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveSkipped case None => false }},\"durationMs\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveDurationMs case None => 0 }},\"bytes\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveBytes case None => 0 }}},\"queue\":{\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled}},\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled},\"auditCount\":${auditCount},\"auditMax\":${DEFAULT_MAX_AUDIT_RECORDS},\"duplicateSuppressed\":${duplicateSuppressed},\"recordOnlyCount\":${diagnostics.recordOnlyCount},\"acceptedCount\":${diagnostics.acceptedCount},\"degradedCount\":${diagnostics.degradedCount},\"maintainerDegradedCount\":${diagnostics.maintainerDegradedCount},\"writebackPostedCount\":${diagnostics.writebackPostedCount},\"writebackSkippedCount\":${diagnostics.writebackSkippedCount},\"maintainerMentionSkippedCount\":${diagnostics.maintainerMentionSkippedCount},\"mentionDegradedCount\":${diagnostics.mentionDegradedCount},\"adapterDegradedCount\":${diagnostics.adapterDegradedCount},\"diagnostics\":{\"recordOnly\":${diagnostics.recordOnlyCount},\"accepted\":${diagnostics.acceptedCount},\"degraded\":${diagnostics.degradedCount},\"maintainerDegraded\":${diagnostics.maintainerDegradedCount},\"writebackPosted\":${diagnostics.writebackPostedCount},\"writebackSkipped\":${diagnostics.writebackSkippedCount},\"maintainerMentionSkipped\":${diagnostics.maintainerMentionSkippedCount},\"mentionDegraded\":${diagnostics.mentionDegradedCount},\"adapterDegraded\":${diagnostics.adapterDegradedCount}},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
+    "{\"ok\":true,\"status\":\"ok\",\"receiver\":\"${jsonEscape(receiver.status)}\",\"webhookReceiverStatus\":\"${jsonEscape(receiver.status)}\",\"configStatus\":\"${jsonEscape(receiver.configStatus)}\",\"queueStatus\":\"${jsonEscape(receiver.queueStatus)}\",\"listenerStatus\":\"${jsonEscape(receiver.listenerStatus)}\",\"processorStatus\":\"${jsonEscape(receiver.processorStatus)}\",\"webhookBind\":\"${jsonEscape(receiver.bind)}\",\"webhookEndpointCount\":${receiver.endpointCount},\"webhookQueueDir\":\"${jsonEscape(redactServicePayload(receiver.queueDir).text)}\",\"publicBaseUrlConfigured\":${!config.webhook.publicBaseUrl.isEmpty()},\"recordOnlyEnabled\":${config.authorPolicy.recordOnlyEnabled},\"recordOnlyDomainCount\":${config.authorPolicy.recordOnlyEmailDomains.size},\"recordOnlyEffective\":${authorPolicyRecordOnlyEffective(config.authorPolicy)},\"diagnostic\":\"${jsonEscape(receiver.diagnostic)}\",\"lastError\":\"${jsonEscape(receiver.lastError)}\",${listenerDetails}${processorDetails}\"receiverHealth\":{${listenerDetails}\"stateSaveStatus\":\"${jsonEscape(receiver.processorStatus)}\"},\"processor\":{${processorDetails}\"status\":\"${jsonEscape(receiver.processorStatus)}\"},\"stateSave\":{\"status\":\"${jsonEscape(match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveStatus case None => "not_started" })}\",\"skipped\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveSkipped case None => false }},\"durationMs\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveDurationMs case None => 0 }},\"bytes\":${match (processorSnapshot) { case Some(snapshot) => snapshot.lastStateSaveBytes case None => 0 }}},\"queue\":{\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled}},\"pending\":${pending},\"processing\":${processing},\"processed\":${processed},\"deadLetter\":${deadLetter},\"cancelled\":${cancelled},\"auditCount\":${auditCount},\"auditMax\":${DEFAULT_MAX_AUDIT_RECORDS},\"duplicateSuppressed\":${duplicateSuppressed},\"recordOnlyCount\":${diagnostics.recordOnlyCount},\"recordOnlyTargetAuthorCount\":${diagnostics.recordOnlyTargetAuthorCount},\"recordOnlyCommentAuthorCount\":${diagnostics.recordOnlyCommentAuthorCount},\"recordOnlyEventActorCount\":${diagnostics.recordOnlyEventActorCount},\"selfEchoIgnoredCount\":${diagnostics.selfEchoIgnoredCount},\"acceptedCount\":${diagnostics.acceptedCount},\"degradedCount\":${diagnostics.degradedCount},\"maintainerDegradedCount\":${diagnostics.maintainerDegradedCount},\"writebackPostedCount\":${diagnostics.writebackPostedCount},\"writebackSkippedCount\":${diagnostics.writebackSkippedCount},\"maintainerMentionSkippedCount\":${diagnostics.maintainerMentionSkippedCount},\"mentionDegradedCount\":${diagnostics.mentionDegradedCount},\"adapterDegradedCount\":${diagnostics.adapterDegradedCount},\"diagnostics\":{\"recordOnly\":${diagnostics.recordOnlyCount},\"recordOnlyTargetAuthor\":${diagnostics.recordOnlyTargetAuthorCount},\"recordOnlyCommentAuthor\":${diagnostics.recordOnlyCommentAuthorCount},\"recordOnlyEventActor\":${diagnostics.recordOnlyEventActorCount},\"selfEchoIgnored\":${diagnostics.selfEchoIgnoredCount},\"accepted\":${diagnostics.acceptedCount},\"degraded\":${diagnostics.degradedCount},\"maintainerDegraded\":${diagnostics.maintainerDegradedCount},\"writebackPosted\":${diagnostics.writebackPostedCount},\"writebackSkipped\":${diagnostics.writebackSkippedCount},\"maintainerMentionSkipped\":${diagnostics.maintainerMentionSkippedCount},\"mentionDegraded\":${diagnostics.mentionDegradedCount},\"adapterDegraded\":${diagnostics.adapterDegradedCount}},\"summary\":\"${jsonEscape(renderWebhookStatus(config, queue, listenerSnapshot: listenerSnapshot, processorSnapshot: processorSnapshot))}\"}"
 }
 
 public class WebhookDiagnosticCounters {
     public var recordOnlyCount: Int64 = 0
+    public var recordOnlyTargetAuthorCount: Int64 = 0
+    public var recordOnlyCommentAuthorCount: Int64 = 0
+    public var recordOnlyEventActorCount: Int64 = 0
+    public var selfEchoIgnoredCount: Int64 = 0
     public var acceptedCount: Int64 = 0
     public var degradedCount: Int64 = 0
     public var maintainerDegradedCount: Int64 = 0
@@ -290,6 +315,10 @@ public func webhookDiagnosticCounters(state: MonitorState): WebhookDiagnosticCou
         let status = record.status.toAsciiLower()
         let reason = record.reason.toAsciiLower()
         if (status == "record_only" || reason == "corporate_author") { counters.recordOnlyCount++ }
+        if (status == "record_only" && reason.contains("target_author")) { counters.recordOnlyTargetAuthorCount++ }
+        if (status == "record_only" && reason.contains("comment_author")) { counters.recordOnlyCommentAuthorCount++ }
+        if (status == "record_only" && reason.contains("event_actor")) { counters.recordOnlyEventActorCount++ }
+        if (status == "self_echo_ignored") { counters.selfEchoIgnoredCount++ }
         if (status == "accepted") { counters.acceptedCount++ }
         if (status.contains("degraded") || status.contains("error")) { counters.degradedCount++ }
         if (reason.contains("maintainer") || reason.contains("teamleader") || reason.contains("codeowner")) { counters.maintainerDegradedCount++ }
