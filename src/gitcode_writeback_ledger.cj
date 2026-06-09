@@ -48,7 +48,7 @@ class WritebackLedgerEntry {
         this.replyUrl = replyUrl.trimAscii()
         this.replyAnchor = replyAnchor.trimAscii()
         this.bodyHash = bodyHash.trimAscii()
-        this.sourceEventId = sourceEventId.trimAscii()
+        this.sourceEventId = sanitizeWritebackSourceEventIdForStorage(sourceEventId)
         this.createdAtMs = createdAtMs
     }
 }
@@ -206,4 +206,12 @@ public func sanitizeWritebackReplyUrlForStorage(raw: String): String {
     if (value.startsWith("/") || value.startsWith("file:")) { return "" }
     let noQuery = value.split("?", 2)[0]
     noQuery.trimAscii()
+}
+
+public func sanitizeWritebackSourceEventIdForStorage(raw: String): String {
+    let value = raw.trimAscii()
+    if (value.isEmpty()) { return "" }
+    if (containsSecret(value) || containsLocalPath(value)) { return "" }
+    if (value.startsWith("/") || value.startsWith("file:")) { return "" }
+    compactSummary(redactSecrets(redactUrl(value.split("?", 2)[0])), limit: 160)
 }
