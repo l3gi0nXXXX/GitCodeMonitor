@@ -321,9 +321,9 @@ deniedRepos > allowedRepos > allowedOrgs > 默认拒绝
     "dryRun": false,
     "autoReply": true,
     "writebackScope": {
-      "allowedOrgs": ["cangjie", "cangjie-sig", "cangjie-tpc"],
+      "allowedOrgs": ["cangjie"],
       "allowedRepos": ["cangjie-sig/special-repo"],
-      "deniedRepos": ["cangjie/community", "cangjie-tpc/foo"]
+      "deniedRepos": ["cangjie/community"]
     }
   }
 }
@@ -332,10 +332,10 @@ deniedRepos > allowedRepos > allowedOrgs > 默认拒绝
 | repo | 匹配结果 | 原因 |
 | --- | --- | --- |
 | `cangjie/community` | 禁止写回 | 命中 `deniedRepos`，优先级最高。 |
-| `cangjie/compiler` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedOrgs=["cangjie", ...]`。 |
+| `cangjie/compiler` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedOrgs=["cangjie"]`。 |
 | `cangjie-sig/special-repo` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedRepos`。 |
-| `cangjie-sig/other-repo` | 允许写回 | 未命中 `deniedRepos`，命中 `allowedOrgs`。 |
-| `cangjie-tpc/foo` | 禁止写回 | 命中 `deniedRepos`，即使 owner 在 `allowedOrgs` 中也禁止写回。 |
+| `cangjie-sig/other-repo` | 禁止写回 | 未命中 `allowedRepos`，也未命中 `allowedOrgs`。 |
+| `cangjie-tpc/foo` | 禁止写回 | 未命中任何 allow scope。 |
 | `other-org/foo` | 禁止写回 | 未命中任何 allow scope，按默认拒绝处理。 |
 
 ## 分阶段配置示例
