@@ -71,10 +71,6 @@ public class MonitorConfig {
     public var statePath: String
     public var authorPolicy: AuthorPolicyConfig
     public var webhook: WebhookReceiverConfig
-    public var notifyNetworkEnabled: Bool
-    public var feishuWebhook: String
-    public var telegramBotToken: String
-    public var telegramChatId: String
 
     public init() {
         this.orgs = ["cangjie", "cangjie-sig", "cangjie-tpc"]
@@ -98,13 +94,9 @@ public class MonitorConfig {
         this.httpTransport = "native"
         this.mcpEndpoint = ""
         this.mcpServiceToken = ""
-        this.statePath = "data/gitcodemonitor-state.json"
+        this.statePath = ".gitcodemonitor/state.json"
         this.authorPolicy = AuthorPolicyConfig()
         this.webhook = defaultWebhookReceiverConfigForStatePath(this.statePath)
-        this.notifyNetworkEnabled = false
-        this.feishuWebhook = ""
-        this.telegramBotToken = ""
-        this.telegramChatId = ""
     }
 }
 
@@ -156,9 +148,6 @@ public func validateConfig(config: MonitorConfig): String {
     if (!webhookValidation.ok) {
         return "webhook ${webhookValidation.status}"
     }
-    if (!config.notifyNetworkEnabled && (!config.feishuWebhook.isEmpty() || !config.telegramBotToken.isEmpty())) {
-        return "ok"
-    }
     return "ok"
 }
 
@@ -193,21 +182,15 @@ public func writebackScopeSummary(config: MonitorConfig): String {
 
 public func configSummary(config: MonitorConfig): String {
     let auth = if (gitCodeAuthPresent(config)) { "present" } else { "absent" }
-    let mcpAuth = if (config.mcpServiceToken.isEmpty()) { "absent" } else { "present" }
-    let notifyAuth = if (!config.feishuWebhook.isEmpty() || (!config.telegramBotToken.isEmpty() && !config.telegramChatId.isEmpty())) { "present" } else { "absent" }
     "GitCodeMonitor config\n" +
         "orgs=${joinStrings(config.orgs, ",")}\n" +
         "gitCodeBaseUrl=${config.gitCodeBaseUrl}\n" +
         "transport=${configuredHttpTransport(config)}\n" +
         "gitCodeAuth=${config.gitCodeAuthMode}:${auth}\n" +
-        "mcpEndpoint=${config.mcpEndpoint}\n" +
-        "mcpAuth=${mcpAuth}\n" +
-        "notificationAuth=${notifyAuth}\n" +
         "dryRun=${config.dryRun}\n" +
         "autoReply=${config.autoReply}\n" +
         "${writebackScopeSummary(config)}\n" +
         "allowlist=${joinStrings(config.repoAllowlist, ",")}\n" +
-        "notifyNetworkEnabled=${config.notifyNetworkEnabled}\n" +
         "recordOnlyEnabled=${config.authorPolicy.recordOnlyEnabled}\n" +
         "recordOnlyDomainCount=${config.authorPolicy.recordOnlyEmailDomains.size}\n" +
         "recordOnlyEffective=${authorPolicyRecordOnlyEffective(config.authorPolicy)}\n" +
@@ -1116,9 +1099,6 @@ public class RuntimeContainer {
     public let store: StateStore
     public let sender: HttpSender
     public let gitCode: GitCodeHttpTransport
-    public let feishu: HttpNotifier
-    public let telegram: HttpNotifier
-    public let mcp: McpHttpClient
     public let writer: GitCodeCommentWriter
     public let httpTransportKind: String
 
@@ -1135,9 +1115,6 @@ public class RuntimeContainer {
         }
         let client = GitCodeApiClient(baseUrl: config.gitCodeBaseUrl, authMode: config.gitCodeAuthMode, token: config.gitCodeToken, cookie: config.gitCodeCookie)
         this.gitCode = GitCodeHttpTransport(client, sender: this.sender, pageSize: 100)
-        this.feishu = HttpNotifier("feishu", networkEnabled: config.notifyNetworkEnabled, webhookOrToken: config.feishuWebhook, sender: this.sender)
-        this.telegram = HttpNotifier("telegram", networkEnabled: config.notifyNetworkEnabled, webhookOrToken: config.telegramBotToken, chatId: config.telegramChatId, sender: this.sender)
-        this.mcp = McpHttpClient(config.mcpEndpoint, serviceToken: config.mcpServiceToken, sender: this.sender)
         this.writer = GitCodeCommentWriter(client, sender: this.sender)
     }
 }
@@ -1171,7 +1148,7 @@ public func scanOnceRuntime(config: MonitorConfig, runtime: RuntimeContainer, st
                 let baselineStart = result.baselineSeededEvents
                 for (event in collection.events) {
                     result.checkedItems++
-                    let processed = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: !hadBaseline)
+                    let processed = processRuntimeEvent(config, state, event, baselineMode: !hadBaseline)
                     result.absorb(processed)
                 }
                 if (!hadBaseline && collection.completed) {
@@ -1190,7 +1167,7 @@ public func scanOnceOfflineFixture(config: MonitorConfig, state: MonitorState): 
     let transport = FakeGitCodeTransport()
     transport.seedDefaultRepos()
     transport.events.add(GitCodeEvent("evt-1", "cangjie", "compiler", "issue", "1", "alice", "https://gitcode.com/alice", "https://gitcode.com/cangjie/compiler/issues/1", "Please check this issue."))
-    scanOnce(config, transport, state, FakeNotifier("feishu"), FakeNotifier("telegram"), FakeMcpClient(), FakeCommentWriter())
+    scanOnce(config, transport, state)
 }
 
 public class GitCodeCurlTransport {
@@ -1351,381 +1328,6 @@ public func collectRepoEventsHttpDetailed(repo: GitCodeRepo, transport: GitCodeH
     GitCodeRepoEventCollection(out.toArray(), completed: ok, errorKind: errorKind)
 }
 
-public class DeliveryAudit {
-    public let eventId: String
-    public let channel: String
-    public let status: String
-    public let error: String
-    public let httpStatus: Int64
-    public let errorKind: String
-    public let attempts: Int64
-    public init(eventId: String, channel: String, status: String, error!: String = "", httpStatus!: Int64 = 0, errorKind!: String = "", attempts!: Int64 = 1) {
-        this.eventId = eventId
-        this.channel = channel
-        this.status = status
-        this.error = error
-        this.httpStatus = httpStatus
-        this.errorKind = errorKind
-        this.attempts = attempts
-    }
-}
-
-public class NotifierPayload {
-    public let channel: String
-    public let request: HttpRequestSpec
-    public init(channel: String, request: HttpRequestSpec) {
-        this.channel = channel
-        this.request = request
-    }
-}
-
-public func buildFeishuPayload(webhook: String, event: GitCodeEvent): NotifierPayload {
-    let body = "{" +
-        "\"msg_type\":\"text\"," +
-        "\"content\":{\"text\":\"${jsonEscape(notificationText(event))}\"}" +
-        "}"
-    NotifierPayload("feishu", HttpRequestSpec("POST", webhook, headers: [("Content-Type", "application/json")], body: body))
-}
-
-public func buildTelegramPayload(botToken: String, chatId: String, event: GitCodeEvent): NotifierPayload {
-    let body = "{" +
-        "\"chat_id\":\"${jsonEscape(chatId)}\"," +
-        "\"text\":\"${jsonEscape(notificationText(event))}\"," +
-        "\"disable_web_page_preview\":true" +
-        "}"
-    NotifierPayload("telegram", HttpRequestSpec("POST", "https://api.telegram.org/bot${botToken}/sendMessage", headers: [("Content-Type", "application/json")], body: body))
-}
-
-public class HttpNotifier {
-    public let channel: String
-    public let networkEnabled: Bool
-    public let sender: HttpSender
-    private let webhookOrToken: String
-    private let chatId: String
-    public var backoffUntilMs: Int64 = 0
-    public let deliveries = ArrayList<DeliveryAudit>()
-
-    public init(channel: String, networkEnabled!: Bool = false, webhookOrToken!: String = "", chatId!: String = "", sender!: HttpSender = FakeHttpSender()) {
-        this.channel = channel
-        this.networkEnabled = networkEnabled
-        this.webhookOrToken = webhookOrToken
-        this.chatId = chatId
-        this.sender = sender
-    }
-
-    public func notify(event: GitCodeEvent): DeliveryAudit {
-        let payload = if (channel == "telegram") { buildTelegramPayload(webhookOrToken, chatId, event) } else { buildFeishuPayload(webhookOrToken, event) }
-        if (!networkEnabled) {
-            let audit = DeliveryAudit(event.id, channel, "dry_run")
-            deliveries.add(audit)
-            return audit
-        }
-        if (backoffUntilMs > 0) {
-            let audit = DeliveryAudit(event.id, channel, "backoff", error: "channel_backoff", errorKind: "backoff")
-            deliveries.add(audit)
-            return audit
-        }
-        let res = sender.send(payload.request)
-        let status = if (res.statusCode >= 200 && res.statusCode < 300) { "sent" } else { mapGitCodeError(res.statusCode) }
-        if (res.statusCode == 429 || res.statusCode >= 500) {
-            backoffUntilMs = retryAfterMs(res)
-        }
-        let audit = DeliveryAudit(event.id, channel, status, httpStatus: res.statusCode, errorKind: if (status == "sent") { "" } else { status })
-        deliveries.add(audit)
-        audit
-    }
-}
-
-public class CurlNotifier {
-    public let channel: String
-    public let networkEnabled: Bool
-    public let sender: CurlHttpSender
-    private let webhookOrToken: String
-    private let chatId: String
-    public let deliveries = ArrayList<DeliveryAudit>()
-
-    public init(channel: String, networkEnabled!: Bool = false, webhookOrToken!: String = "", chatId!: String = "", sender!: CurlHttpSender = CurlHttpSender()) {
-        this.channel = channel
-        this.networkEnabled = networkEnabled
-        this.webhookOrToken = webhookOrToken
-        this.chatId = chatId
-        this.sender = sender
-    }
-
-    public func notify(event: GitCodeEvent): DeliveryAudit {
-        let payload = if (channel == "telegram") { buildTelegramPayload(webhookOrToken, chatId, event) } else { buildFeishuPayload(webhookOrToken, event) }
-        if (!networkEnabled) {
-            let audit = DeliveryAudit(event.id, channel, "dry_run")
-            deliveries.add(audit)
-            return audit
-        }
-        let res = sender.send(payload.request)
-        let status = if (res.statusCode >= 200 && res.statusCode < 300) { "sent" } else { mapGitCodeError(res.statusCode) }
-        let audit = DeliveryAudit(event.id, channel, status)
-        deliveries.add(audit)
-        audit
-    }
-}
-
-public class FakeNotifier {
-    public let channel: String
-    public var failNext: Bool = false
-    public let deliveries = ArrayList<DeliveryAudit>()
-    public init(channel: String) { this.channel = channel }
-    public func notify(event: GitCodeEvent): DeliveryAudit {
-        if (failNext) {
-            failNext = false
-            let audit = DeliveryAudit(event.id, channel, "failed", error: "fake failure")
-            deliveries.add(audit)
-            return audit
-        }
-        let audit = DeliveryAudit(event.id, channel, "sent")
-        deliveries.add(audit)
-        return audit
-    }
-}
-
-public class ToolSchema {
-    public let name: String
-    public let version: String
-    public let schemaHash: String
-    public init(name: String, version!: String = "v1", schemaHash!: String = "hash") {
-        this.name = name
-        this.version = version
-        this.schemaHash = schemaHash
-    }
-}
-
-public class ToolInput {
-    public let toolName: String
-    public let eventId: String
-    public let repo: String
-    public let body: String
-    public let itemKind: String
-    public let itemId: String
-    public let actor: String
-    public let actorUrl: String
-    public let url: String
-    public let rawSummary: String
-    public init(toolName: String, eventId: String, repo: String, body: String, itemKind!: String = "", itemId!: String = "", actor!: String = "", actorUrl!: String = "", url!: String = "", rawSummary!: String = "") {
-        this.toolName = toolName
-        this.eventId = eventId
-        this.repo = repo
-        this.body = body
-        this.itemKind = itemKind
-        this.itemId = itemId
-        this.actor = actor
-        this.actorUrl = actorUrl
-        this.url = url
-        this.rawSummary = rawSummary
-    }
-}
-
-public class McpResult {
-    public let ok: Bool
-    public let summary: String
-    public let draft: String
-    public let approved: Bool
-    public let needsHumanReview: Bool
-    public let errorKind: String
-    public let reason: String
-    public let diagnostic: String
-    public let citations: Array<String>
-    public init(ok: Bool, summary!: String = "", draft!: String = "", approved!: Bool = true, needsHumanReview!: Bool = false, errorKind!: String = "", reason!: String = "", diagnostic!: String = "", citations!: Array<String> = []) {
-        this.ok = ok
-        this.summary = summary
-        this.draft = draft
-        this.approved = approved
-        this.needsHumanReview = needsHumanReview
-        this.errorKind = errorKind
-        this.reason = reason
-        this.diagnostic = if (diagnostic.isEmpty()) { reason } else { diagnostic }
-        this.citations = citations
-    }
-}
-
-public class McpHttpClient {
-    public let endpoint: String
-    private let serviceToken: String
-    public let sender: HttpSender
-    public var requestSeq: Int64 = 0
-    public var initialized: Bool = false
-    public var degradedReason: String = ""
-    public var diagnostic: String = ""
-    public let schemaCache = ArrayList<ToolSchema>()
-
-    public init(endpoint: String, serviceToken!: String = "", sender!: HttpSender = FakeHttpSender()) {
-        this.endpoint = endpoint
-        this.serviceToken = serviceToken
-        this.sender = sender
-    }
-
-    public func nextRequestId(prefix: String): String {
-        requestSeq++
-        "${prefix}-${requestSeq}"
-    }
-
-    public func buildInitializeRequest(): HttpRequestSpec {
-        jsonRpcRequest("initialize", "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"GitCodeMonitor\",\"version\":\"0.1.0\"}}", nextRequestId("mcp-init"))
-    }
-
-    public func buildToolsListRequest(): HttpRequestSpec {
-        jsonRpcRequest("tools/list", "{}", nextRequestId("mcp-tools"))
-    }
-
-    public func buildToolsCallRequest(input: ToolInput): HttpRequestSpec {
-        let args = "{" +
-            "\"eventId\":\"${jsonEscape(input.eventId)}\"," +
-            "\"repo\":\"${jsonEscape(input.repo)}\"," +
-            "\"kind\":\"${jsonEscape(input.itemKind)}\"," +
-            "\"number\":\"${jsonEscape(input.itemId)}\"," +
-            "\"body\":\"${jsonEscape(input.body)}\"," +
-            "\"author\":{\"login\":\"${jsonEscape(input.actor)}\",\"url\":\"${jsonEscape(input.actorUrl)}\"}," +
-            "\"url\":\"${jsonEscape(input.url)}\"," +
-            "\"rawSummary\":\"${jsonEscape(input.rawSummary)}\"" +
-            "}"
-        jsonRpcRequest("tools/call", "{\"name\":\"${jsonEscape(input.toolName)}\",\"arguments\":${args}}", nextRequestId("mcp-call"))
-    }
-
-    public func initialize(): Bool {
-        let res = sender.send(buildInitializeRequest())
-        initialized = res.statusCode >= 200 && res.statusCode < 300
-        if (!initialized) { degradedReason = mapGitCodeError(res.statusCode) }
-        initialized
-    }
-
-    public func toolsList(): Array<ToolSchema> {
-        let res = sender.send(buildToolsListRequest())
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-            degradedReason = mapGitCodeError(res.statusCode)
-            return schemaCache.toArray()
-        }
-        let parsed = parseMcpToolsResponse(res.body)
-        if (parsed.size == 0) {
-            degradedReason = "mcp_tools_parse_error"
-            return schemaCache.toArray()
-        }
-        while (!schemaCache.isEmpty()) { schemaCache.remove(at: 0) }
-        for (schema in parsed) { schemaCache.add(schema) }
-        let missing = missingGitCodeToolGroups()
-        if (missing.size > 0) {
-            degradedReason = "mcp_required_tools_missing"
-            diagnostic = requiredToolsDiagnostic("", missing)
-        } else {
-            degradedReason = ""
-            diagnostic = ""
-        }
-        schemaCache.toArray()
-    }
-
-    public func call(input: ToolInput): McpResult {
-        if (!hasGitCodeTool(input.toolName)) {
-            let message = requiredToolsDiagnostic(input.toolName, missingGitCodeToolGroups())
-            diagnostic = message
-            return McpResult(false, approved: false, needsHumanReview: true, errorKind: "tool_not_available", reason: message, diagnostic: message)
-        }
-        let res = sender.send(buildToolsCallRequest(input))
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-            degradedReason = mapGitCodeError(res.statusCode)
-            return McpResult(false, approved: false, needsHumanReview: true, errorKind: degradedReason)
-        }
-        let parsed = parseMcpCallResponse(res.body)
-        if (!parsed.ok) { degradedReason = parsed.errorKind }
-        parsed
-    }
-
-    private func jsonRpcRequest(method: String, params: String, id: String): HttpRequestSpec {
-        let headers = if (serviceToken.isEmpty()) {
-            [("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream"), ("MCP-Protocol-Version", "2025-03-26")]
-        } else {
-            [("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream"), ("MCP-Protocol-Version", "2025-03-26"), ("Authorization", "Bearer ${serviceToken}")]
-        }
-        HttpRequestSpec("POST", endpoint, headers: headers, body: "{\"jsonrpc\":\"2.0\",\"id\":\"${jsonEscape(id)}\",\"method\":\"${jsonEscape(method)}\",\"params\":${params}}")
-    }
-
-    private func hasGitCodeTool(name: String): Bool {
-        if (schemaCache.isEmpty()) { let _ = toolsList() }
-        for (schema in schemaCache) {
-            if (schema.name == name) { return true }
-        }
-        false
-    }
-
-    public func hasAnyGitCodeTool(names: Array<String>): Bool {
-        if (schemaCache.isEmpty()) { let _ = toolsList() }
-        for (schema in schemaCache) {
-            for (name in names) {
-                if (schema.name == name) { return true }
-            }
-        }
-        false
-    }
-
-    public func missingGitCodeToolGroups(): Array<String> {
-        let missing = ArrayList<String>()
-        if (!hasAnyGitCodeTool(["gitcode_issue_summary", "gitcode_issue_summarize"])) {
-            missing.add("issue_summary|issue_summarize")
-        }
-        if (!hasAnyGitCodeTool(["gitcode_pr_summary", "gitcode_pr_summarize"])) {
-            missing.add("pr_summary|pr_summarize")
-        }
-        if (!hasAnyGitCodeTool(["gitcode_safety_review", "gitcode_reply_safety_review"])) {
-            missing.add("safety_review|reply_safety_review")
-        }
-        if (!hasAnyGitCodeTool(["gitcode_issue_draft_reply"])) {
-            missing.add("issue_draft_reply")
-        }
-        if (!hasAnyGitCodeTool(["gitcode_pr_draft_reply"])) {
-            missing.add("pr_draft_reply")
-        }
-        missing.toArray()
-    }
-
-    private func hasRequiredGitCodeTools(): Bool {
-        missingGitCodeToolGroups().size == 0
-    }
-
-    private func requiredToolsDiagnostic(requestedTool: String, missingGroups: Array<String>): String {
-        var message = ""
-        if (!requestedTool.isEmpty()) {
-            message += "requestedTool=${requestedTool} "
-        }
-        message += "availableTools=${schemaCache.size} missingGroups=${joinStrings(missingGroups, "|")}"
-        redactSecrets(message)
-    }
-}
-
-public class FakeMcpClient {
-    public var available: Bool = true
-    public var initialized: Bool = false
-    public let schemas = ArrayList<ToolSchema>()
-
-    public init() {
-        schemas.add(ToolSchema("gitcode_issue_summary"))
-        schemas.add(ToolSchema("gitcode_issue_draft_reply"))
-        schemas.add(ToolSchema("gitcode_pr_summary"))
-        schemas.add(ToolSchema("gitcode_pr_draft_reply"))
-        schemas.add(ToolSchema("gitcode_safety_review"))
-    }
-
-    public func initialize(): Bool {
-        initialized = available
-        initialized
-    }
-
-    public func toolsList(): Array<ToolSchema> { schemas.toArray() }
-
-    public func call(input: ToolInput): McpResult {
-        if (!available) { return McpResult(false, errorKind: "mcp_down") }
-        McpResult(true, draft: "Draft reply for ${input.eventId}", approved: true, needsHumanReview: false)
-    }
-}
-
-public func eventToToolInput(event: GitCodeEvent): ToolInput {
-    let tool = if (event.itemKind == "pr") { "gitcode_pr_draft_reply" } else { "gitcode_issue_draft_reply" }
-    ToolInput(tool, event.id, "${event.org}/${event.repo}", event.content, itemKind: event.itemKind, itemId: event.itemId, actor: event.actor, actorUrl: event.actorUrl, url: event.url, rawSummary: compactSummary(redactSecrets(event.content), limit: 500))
-}
-
 public class WritebackScopeDecision {
     public let allowed: Bool
     public let reason: String
@@ -1755,10 +1357,6 @@ public func evaluateWritebackScope(config: MonitorConfig, repoFullName: String):
     if (!allowedRepo.isEmpty()) {
         return WritebackScopeDecision(true, "allowed", matchedBy: "allowed_repo", matchedValue: allowedRepo)
     }
-    let legacyRepo = findWritebackRepoScopeMatch(config.repoAllowlist, normalizedRepo)
-    if (!legacyRepo.isEmpty()) {
-        return WritebackScopeDecision(true, "allowed", matchedBy: "allowed_repo", matchedValue: legacyRepo)
-    }
     let owner = normalizedRepo.split("/")[0]
     let allowedOrg = findWritebackOrgScopeMatch(config.writebackScope.allowedOrgs, owner)
     if (!allowedOrg.isEmpty()) {
@@ -1767,28 +1365,11 @@ public func evaluateWritebackScope(config: MonitorConfig, repoFullName: String):
     WritebackScopeDecision(false, "repo_not_allowlisted")
 }
 
-public class WriteDecision {
-    public let allowed: Bool
-    public let reason: String
-    public init(allowed: Bool, reason: String) {
-        this.allowed = allowed
-        this.reason = reason
-    }
+public interface GitCodeWritebackWriter {
+    func write(event: GitCodeEvent, body: String, state: MonitorState): String
 }
 
-public func writebackGate(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, mcp: McpResult): WriteDecision {
-    let scopeDecision = evaluateWritebackScope(config, "${event.org}/${event.repo}")
-    if (!scopeDecision.allowed) { return WriteDecision(false, scopeDecision.reason) }
-    if (filterEvent(event).ignored) { return WriteDecision(false, "filtered_event") }
-    if (!mcp.ok || !mcp.approved || mcp.needsHumanReview) { return WriteDecision(false, "safety_rejected") }
-    if (state.hasReply(event.id)) { return WriteDecision(false, "duplicate") }
-    if (event.content.contains(SELF_MARKER)) { return WriteDecision(false, "self_marker") }
-    if (containsSecret(mcp.draft)) { return WriteDecision(false, "secret_detected") }
-    if (containsLocalPath(mcp.draft)) { return WriteDecision(false, "local_path_detected") }
-    return WriteDecision(true, "allowed")
-}
-
-public class FakeCommentWriter {
+public class FakeCommentWriter <: GitCodeWritebackWriter {
     public let written = ArrayList<String>()
     public var nextStatus: String = "ok"
     public init() {}
@@ -1804,24 +1385,43 @@ public class FakeCommentWriter {
     }
 }
 
-public class GitCodeCommentWriter {
+public class GitCodeCommentWriter <: GitCodeWritebackWriter {
     public let client: GitCodeApiClient
     public let sender: HttpSender
     public init(client: GitCodeApiClient, sender!: HttpSender = FakeHttpSender()) {
         this.client = client
         this.sender = sender
     }
-    public func writeIfAllowed(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, mcp: McpResult): WriteDecision {
-        let decision = writebackGate(config, state, event, mcp)
-        if (!decision.allowed) { return decision }
-        let res = sender.send(client.postCommentRequest(event, mcp.draft))
+    public func write(event: GitCodeEvent, body: String, state: MonitorState): String {
+        let res = sender.send(client.postCommentRequest(event, body))
         if (res.statusCode >= 200 && res.statusCode < 300) {
             state.markReply(event.id)
-            return WriteDecision(true, "posted")
+            return gitCodeCommentReplyUrl(res.body, event)
         }
-        state.setBackoff("${event.org}/${event.repo}", 60000)
-        WriteDecision(false, mapGitCodeError(res.statusCode))
+        "error:${mapGitCodeWritebackError(res.statusCode)}"
     }
+}
+
+func gitCodeCommentReplyUrl(body: String, event: GitCodeEvent): String {
+    try {
+        let obj = JsonValue.fromStr(body).asObject()
+        let html = firstJsonString(obj, ["html_url", "url", "web_url"])
+        if (!html.isEmpty()) { return html }
+    } catch (_: Exception) {
+        ()
+    }
+    if (!event.url.isEmpty()) { return event.url }
+    "https://gitcode.com/${event.org}/${event.repo}/${if (event.itemKind == "pr") { "pulls" } else { "issues" }}/${event.itemId}"
+}
+
+func mapGitCodeWritebackError(statusCode: Int64): String {
+    if (statusCode == 401) { return "gitcode_api_unauthorized" }
+    if (statusCode == 403) { return "gitcode_api_forbidden" }
+    if (statusCode == 404) { return "gitcode_api_not_found" }
+    if (statusCode == 429) { return "rate_limited" }
+    if (statusCode == 599) { return "gitcode_api_timeout" }
+    if (statusCode >= 500) { return "server_error" }
+    "gitcode_api_error"
 }
 
 public class AcpTaskRequest {
@@ -2013,7 +1613,7 @@ public class ScanResult {
     }
 }
 
-public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, state: MonitorState, feishu: FakeNotifier, telegram: FakeNotifier, mcp: FakeMcpClient, writer: FakeCommentWriter): ScanResult {
+public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, state: MonitorState): ScanResult {
     let result = emptyScanResult(config)
     for (repo in transport.repos) {
         result.scannedRepos++
@@ -2047,40 +1647,10 @@ public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, sta
             state.markSeen(event.id)
             result.accepted++
             result.newEvents++
-            feishu.notify(event)
-            telegram.notify(event)
-            result.notified += 2
-            result.notificationsSent += 2
             let audit = AuditRecord(event.id, status: "accepted")
+            audit.deliveryStatus = "metis_service_plugin"
             state.addAudit(audit)
-            var sampleStatus = "accepted"
-            var sampleReason = ""
-            if (!state.hasMcpCall(event.id)) {
-                let input = eventToToolInput(event)
-                let mcpResult = mcp.call(input)
-                if (mcpResult.ok) {
-                    state.markMcpCall(event.id)
-                    result.mcpCalls++
-                    result.draftsGenerated++
-                    audit.status = "drafted"
-                    let decision = writebackGate(config, state, event, mcpResult)
-                    audit.reason = decision.reason
-                    sampleStatus = "drafted"
-                    sampleReason = decision.reason
-                    if (decision.allowed) {
-                        audit.replyUrl = writer.write(event, mcpResult.draft, state)
-                        result.writes++
-                        sampleStatus = "replied"
-                    }
-                } else {
-                    audit.status = "mcp_degraded"
-                    audit.reason = mcpResult.errorKind
-                    result.draftsFailed++
-                    sampleStatus = "mcp_degraded"
-                    sampleReason = mcpResult.errorKind
-                }
-            }
-            result.addNewSample(event, sampleStatus, reason: sampleReason)
+            result.addNewSample(event, "accepted")
         }
         if (!hadBaseline) {
             state.markBaseline(scopeKey, baselineSeededForRepo)
@@ -2090,7 +1660,7 @@ public func scanOnce(config: MonitorConfig, transport: FakeGitCodeTransport, sta
     finalizeScanResult(state, "scan_once", result)
 }
 
-func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, feishu: HttpNotifier, telegram: HttpNotifier, mcp: McpHttpClient, writer: GitCodeCommentWriter, baselineMode!: Bool = false): ScanResult {
+func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, baselineMode!: Bool = false): ScanResult {
     let filter = filterEvent(event)
     if (filter.ignored) {
         state.addAudit(AuditRecord(event.id, status: "ignored", reason: filter.reason))
@@ -2112,45 +1682,12 @@ func processRuntimeEvent(config: MonitorConfig, state: MonitorState, event: GitC
         return result
     }
     state.markSeen(event.id)
-    let feishuDelivery = feishu.notify(event)
-    let telegramDelivery = telegram.notify(event)
     let audit = AuditRecord(event.id, status: "accepted")
-    audit.deliveryStatus = "${feishuDelivery.channel}:${feishuDelivery.status},${telegramDelivery.channel}:${telegramDelivery.status}"
+    audit.deliveryStatus = "metis_service_plugin"
     state.addAudit(audit)
 
-    var mcpCalls: Int64 = 0
-    var writes: Int64 = 0
-    var draftsGenerated: Int64 = 0
-    var draftsFailed: Int64 = 0
-    var sampleStatus = "accepted"
-    var sampleReason = ""
-    if (!state.hasMcpCall(event.id)) {
-        let mcpResult = mcp.call(eventToToolInput(event))
-        if (mcpResult.ok) {
-            state.markMcpCall(event.id)
-            mcpCalls = 1
-            draftsGenerated = 1
-            audit.status = "drafted"
-            let decision = writer.writeIfAllowed(config, state, event, mcpResult)
-            audit.reason = decision.reason
-            audit.writeDecision = decision.reason
-            sampleStatus = "drafted"
-            sampleReason = decision.reason
-            if (decision.allowed) {
-                writes = 1
-                audit.status = "replied"
-                sampleStatus = "replied"
-            }
-        } else {
-            audit.status = "mcp_degraded"
-            audit.reason = mcpResult.errorKind
-            draftsFailed = 1
-            sampleStatus = "mcp_degraded"
-            sampleReason = mcpResult.errorKind
-        }
-    }
-    let result = ScanResult(1, 0, 2, mcpCalls, writes, newEvents: 1, draftsGenerated: draftsGenerated, draftsFailed: draftsFailed, notificationsSent: 2, writeMode: scanWriteMode(config))
-    result.addNewSample(event, sampleStatus, reason: sampleReason)
+    let result = ScanResult(1, 0, 0, 0, 0, newEvents: 1, writeMode: scanWriteMode(config))
+    result.addNewSample(event, "accepted")
     result
 }
 
@@ -2220,10 +1757,10 @@ func sanitizeScanReportText(raw: String, limit!: Int64 = 160): String {
     compactSummary(text, limit: limit)
 }
 
-public func doctorReport(config: MonitorConfig, state: MonitorState, mcp: FakeMcpClient): String {
+public func doctorReport(config: MonitorConfig, state: MonitorState): String {
     let acp = if (config.acpEnabled) { "enabled" } else { "disabled" }
     let auth = if (gitCodeAuthPresent(config)) { "present" } else { "absent" }
-    "GitCodeMonitor doctor\norgs=${config.orgs.size}\ngitCodeBaseUrl=${config.gitCodeBaseUrl}\ntransport=${configuredHttpTransport(config)}\nnetworkEnabled=${config.notifyNetworkEnabled}\ngitCodeAuth=${auth}\nstatePath=${config.statePath}\nfullScanIntervalMinutes=${config.fullScanIntervalMinutes}\ndryRun=${config.dryRun}\nautoReply=${config.autoReply}\nacp=${acp}\nmcpInitialized=${mcp.initialized}\naudit=${state.audit.size}"
+    "GitCodeMonitor doctor\nmode=service-plugin-only\norgs=${config.orgs.size}\ngitCodeBaseUrl=${config.gitCodeBaseUrl}\ntransport=${configuredHttpTransport(config)}\ngitCodeAuth=${auth}\nstatePath=${config.statePath}\nfullScanIntervalMinutes=${config.fullScanIntervalMinutes}\ndryRun=${config.dryRun}\nautoReply=${config.autoReply}\nacp=${acp}\naudit=${state.audit.size}"
 }
 
 public func probeGitCode(config: MonitorConfig): String {
@@ -2233,9 +1770,8 @@ public func probeGitCode(config: MonitorConfig): String {
 }
 
 public func probeMcp(config: MonitorConfig): String {
-    let client = McpHttpClient(config.mcpEndpoint, serviceToken: config.mcpServiceToken)
-    let req = client.buildInitializeRequest()
-    "probe-mcp\n${req.redactedLogLine()}\nrequestBody=${req.body}"
+    let _ = config
+    "probe-mcp unsupported: GitCodeMonitor is service-plugin-only; Metis generates drafts and calls gitcode.writeback.apply_result"
 }
 
 public func serveOnceBaseline(config: MonitorConfig): String {
@@ -2292,11 +1828,11 @@ public func runServiceScans(config: MonitorConfig, runtime: RuntimeContainer, cl
 }
 
 public func cliHelp(): String {
-    "Usage: gitcodemonitor [--config path] <doctor|scan-once [--offline-fixture]|serve|probe-gitcode|probe-mcp|config summary|tests>"
+    "Usage: gitcodemonitor [--config path] <plugin-stdio|doctor|probe-gitcode|config summary|tests>"
 }
 
-public func notificationText(event: GitCodeEvent): String {
-    "[${event.itemKind}] ${event.org}/${event.repo}#${event.itemId} by ${event.actor}\n${event.url}\n${compactSummary(redactSecrets(event.content))}"
+public func servicePluginOnlyUnsupportedCommand(command: String): String {
+    "${command} unsupported: GitCodeMonitor runs as a Metis service-plugin only; use plugin-stdio"
 }
 
 public func containsLocalPath(text: String): Bool {
@@ -2308,14 +1844,6 @@ func applyConfigObject(config: MonitorConfig, root: JsonObject): Unit {
     match (root.get("gitcode")) {
         case Some(v) => try { applyGitCodeSection(config, v.asObject()) } catch (_: Exception) { () }
         case None => applyGitCodeSection(config, root)
-    }
-    match (root.get("feishu")) {
-        case Some(v) => try { applyFeishuSection(config, v.asObject()) } catch (_: Exception) { () }
-        case None => ()
-    }
-    match (root.get("telegram")) {
-        case Some(v) => try { applyTelegramSection(config, v.asObject()) } catch (_: Exception) { () }
-        case None => ()
     }
     match (root.get("metis")) {
         case Some(v) => try { applyMetisSection(config, v.asObject()) } catch (_: Exception) { () }
@@ -2398,18 +1926,6 @@ func authorPolicyDomainIsValid(domain: String): Bool {
     true
 }
 
-func applyFeishuSection(config: MonitorConfig, obj: JsonObject): Unit {
-    let webhook = firstJsonString(obj, ["webhook", "webhookUrl", "feishuWebhook"])
-    if (!webhook.isEmpty()) { config.feishuWebhook = webhook }
-}
-
-func applyTelegramSection(config: MonitorConfig, obj: JsonObject): Unit {
-    let token = firstJsonString(obj, ["botToken", "token", "telegramBotToken"])
-    if (!token.isEmpty()) { config.telegramBotToken = token }
-    let chatId = firstJsonString(obj, ["chatId", "telegramChatId"])
-    if (!chatId.isEmpty()) { config.telegramChatId = chatId }
-}
-
 func applyMetisSection(config: MonitorConfig, obj: JsonObject): Unit {
     let endpoint = firstJsonString(obj, ["mcpEndpoint", "endpoint", "metisMcpEndpoint"])
     if (!endpoint.isEmpty()) { config.mcpEndpoint = endpoint }
@@ -2433,7 +1949,6 @@ func applyMonitorSection(config: MonitorConfig, obj: JsonObject): Unit {
     if (!transport.isEmpty()) { config.httpTransport = transport }
     config.dryRun = firstJsonBool(obj, ["dryRun"], config.dryRun)
     config.autoReply = firstJsonBool(obj, ["autoReply"], config.autoReply)
-    config.notifyNetworkEnabled = firstJsonBool(obj, ["notifyNetworkEnabled"], config.notifyNetworkEnabled)
     let orgs = firstJsonStringArray(obj, ["orgs", "organizations"])
     if (orgs.size > 0) { config.orgs = orgs }
     let allowlist = firstJsonStringArray(obj, ["repoAllowlist", "allowlist"])
@@ -2442,24 +1957,12 @@ func applyMonitorSection(config: MonitorConfig, obj: JsonObject): Unit {
         case Some(value) => try { applyWritebackScopeSection(config, value.asObject()) } catch (_: Exception) { () }
         case None => ()
     }
-    mergeLegacyRepoAllowlistIntoWritebackScope(config)
 }
 
 func applyWritebackScopeSection(config: MonitorConfig, obj: JsonObject): Unit {
     config.writebackScope.allowedOrgs = normalizeWritebackScopeArray(firstJsonStringArray(obj, ["allowedOrgs"]))
     config.writebackScope.allowedRepos = normalizeWritebackScopeArray(firstJsonStringArray(obj, ["allowedRepos"]))
     config.writebackScope.deniedRepos = normalizeWritebackScopeArray(firstJsonStringArray(obj, ["deniedRepos"]))
-}
-
-func mergeLegacyRepoAllowlistIntoWritebackScope(config: MonitorConfig): Unit {
-    let merged = ArrayList<String>()
-    for (repo in config.writebackScope.allowedRepos) {
-        addUniqueWritebackScopeValue(merged, repo)
-    }
-    for (repo in config.repoAllowlist) {
-        addUniqueWritebackScopeValue(merged, repo)
-    }
-    config.writebackScope.allowedRepos = merged.toArray()
 }
 
 func applyWebhookSection(config: MonitorConfig, obj: JsonObject): Unit {
@@ -2543,70 +2046,6 @@ func collectPagedEvents(repo: GitCodeRepo, kind: String, transport: GitCodeHttpT
         page++
     }
     "ok"
-}
-
-public func parseMcpToolsResponse(body: String): Array<ToolSchema> {
-    let out = ArrayList<ToolSchema>()
-    try {
-        let root = JsonValue.fromStr(body).asObject()
-        match (root.get("error")) {
-            case Some(_) => return []
-            case None => ()
-        }
-        let toolsValue = findMcpToolsValue(root)
-        for (item in toolsValue.asArray().getItems()) {
-            try {
-                let obj = item.asObject()
-                let name = firstJsonString(obj, ["name"])
-                if (!name.isEmpty()) {
-                    let version = firstJsonString(obj, ["version"])
-                    let schemaHash = stableSchemaHash(obj)
-                    out.add(ToolSchema(name, version: if (version.isEmpty()) { "v1" } else { version }, schemaHash: schemaHash))
-                }
-            } catch (_inner: Exception) { () }
-        }
-    } catch (_: Exception) { () }
-    out.toArray()
-}
-
-public func parseMcpCallResponse(body: String): McpResult {
-    if (body.trimAscii().isEmpty()) {
-        return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_empty_body")
-    }
-    try {
-        let root = JsonValue.fromStr(body).asObject()
-        match (root.get("error")) {
-            case Some(value) =>
-                let obj = try { value.asObject() } catch (_: Exception) { JsonObject() }
-                let message = firstJsonString(obj, ["message", "reason"])
-                return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_jsonrpc_error", reason: message)
-            case None => ()
-        }
-        let result = mcpResultObject(root)
-        match (result.get("isError")) {
-            case Some(value) =>
-                if (jsonValueToString(value).toAsciiLower() == "true") {
-                    return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_tool_error", reason: firstJsonString(result, ["reason", "message"]))
-                }
-            case None => ()
-        }
-        let structured = mcpStructuredObject(result)
-        let parsed = mcpResultFromObject(structured)
-        if (parsed.ok) { return parsed }
-        let text = firstMcpContentText(result)
-        if (!text.isEmpty()) {
-            try {
-                let textObj = JsonValue.fromStr(text).asObject()
-                let fromTextJson = mcpResultFromObject(textObj)
-                if (fromTextJson.ok) { return fromTextJson }
-            } catch (_inner: Exception) {
-                return McpResult(true, draft: text, approved: true, needsHumanReview: false)
-            }
-        }
-    } catch (_: Exception) {
-        return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_parse_error")
-    }
-    McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_result_missing")
 }
 
 public func parseReposResponse(body: String, org: String): Array<GitCodeRepo> {
@@ -2700,16 +2139,8 @@ func arrayContains(items: Array<String>, value: String): Bool {
     false
 }
 
-func repoAllowlisted(items: Array<String>, value: String): Bool {
-    let expected = value.trimAscii().toAsciiLower()
-    for (item in items) {
-        if (item.trimAscii().toAsciiLower() == expected) { return true }
-    }
-    false
-}
-
 func writebackScopeHasAllow(config: MonitorConfig): Bool {
-    config.writebackScope.allowedOrgs.size > 0 || config.writebackScope.allowedRepos.size > 0 || config.repoAllowlist.size > 0
+    config.writebackScope.allowedOrgs.size > 0 || config.writebackScope.allowedRepos.size > 0
 }
 
 func writebackOrgScopeIsValid(raw: String): Bool {
@@ -2892,77 +2323,6 @@ func jsonObjectItems(root: JsonValue): Array<JsonObject> {
         } catch (_inner: Exception) { () }
     }
     out.toArray()
-}
-
-func findMcpToolsValue(root: JsonObject): JsonValue {
-    match (root.get("tools")) {
-        case Some(v) => return v
-        case None => ()
-    }
-    match (root.get("result")) {
-        case Some(resultValue) =>
-            try {
-                let result = resultValue.asObject()
-                match (result.get("tools")) {
-                    case Some(v) => return v
-                    case None => ()
-                }
-            } catch (_: Exception) {
-                return resultValue
-            }
-        case None => ()
-    }
-    JsonArray([])
-}
-
-func mcpResultObject(root: JsonObject): JsonObject {
-    match (root.get("result")) {
-        case Some(v) => try { return v.asObject() } catch (_: Exception) { () }
-        case None => ()
-    }
-    root
-}
-
-func mcpStructuredObject(result: JsonObject): JsonObject {
-    for (key in ["structuredContent", "structured_content", "output", "data"]) {
-        match (result.get(key)) {
-            case Some(v) => try { return v.asObject() } catch (_: Exception) { () }
-            case None => ()
-        }
-    }
-    result
-}
-
-func mcpResultFromObject(obj: JsonObject): McpResult {
-    let draft = firstJsonString(obj, ["draft", "draftReply", "reply", "body", "text"])
-    let summary = firstJsonString(obj, ["summary"])
-    let reason = firstJsonString(obj, ["reason", "message"])
-    let approved = firstJsonBool(obj, ["approved", "safe"], true)
-    let needsHumanReview = firstJsonBool(obj, ["needsHumanReview", "needs_human_review", "humanReviewRequired"], false)
-    if (draft.isEmpty() && summary.isEmpty()) {
-        return McpResult(false, approved: false, needsHumanReview: true, errorKind: "mcp_result_missing")
-    }
-    McpResult(true, summary: summary, draft: draft, approved: approved, needsHumanReview: needsHumanReview, reason: reason, citations: firstJsonStringArray(obj, ["citations", "sources"]))
-}
-
-func firstMcpContentText(result: JsonObject): String {
-    match (result.get("content")) {
-        case Some(v) =>
-            try {
-                for (item in v.asArray().getItems()) {
-                    let obj = item.asObject()
-                    let text = firstJsonString(obj, ["text", "body"])
-                    if (!text.isEmpty()) { return text }
-                }
-            } catch (_: Exception) { () }
-        case None => ()
-    }
-    ""
-}
-
-func stableSchemaHash(obj: JsonObject): String {
-    let raw = obj.toJsonString()
-    "len-${raw.size}"
 }
 
 func actorName(obj: JsonObject): String {

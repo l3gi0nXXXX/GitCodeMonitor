@@ -73,11 +73,9 @@ public class GcmRuntimeConfigResult {
 public class SecretStateSummary {
     public let gitCodeAuth: String
     public let mcpAuth: String
-    public let legacyNotificationAuth: String
-    public init(gitCodeAuth: String, mcpAuth: String, legacyNotificationAuth: String) {
+    public init(gitCodeAuth: String, mcpAuth: String) {
         this.gitCodeAuth = gitCodeAuth
         this.mcpAuth = mcpAuth
-        this.legacyNotificationAuth = legacyNotificationAuth
     }
 }
 
@@ -98,8 +96,8 @@ public class GcmPluginContext {
 public class GcmRuntime {
     public let config: MonitorConfig
     public let state: MonitorState
-    public let writer: FakeCommentWriter
-    public init(config: MonitorConfig, state!: MonitorState = MonitorState(), writer!: FakeCommentWriter = FakeCommentWriter()) {
+    public let writer: GitCodeWritebackWriter
+    public init(config: MonitorConfig, state!: MonitorState = MonitorState(), writer!: GitCodeWritebackWriter = FakeCommentWriter()) {
         this.config = config
         this.state = state
         this.writer = writer
@@ -401,17 +399,6 @@ public class GcmWritebackAudit {
     }
 }
 
-public class LegacyNotificationConfigSummary {
-    public let hasFeishuWebhook: Bool
-    public let hasTelegramChatId: Bool
-    public let status: String
-    public init(hasFeishuWebhook: Bool, hasTelegramChatId: Bool, status: String) {
-        this.hasFeishuWebhook = hasFeishuWebhook
-        this.hasTelegramChatId = hasTelegramChatId
-        this.status = status
-    }
-}
-
 public class GcmConfigValidationResult {
     public let ok: Bool
     public let diagnostics: Array<String>
@@ -449,7 +436,7 @@ public class GcmMcpClientMode {
 public func gcmPluginMain(args: Array<String>): Int64 {
     let writer = GcmPluginStdioWriter(GcmStdoutLineSink())
     let configRef = pluginArgValue(args, "--config") ?? pluginArgValue(args, "configRef") ?? defaultConfigPath()
-    let bootstrap = initializeGcmPlugin(ServiceInitializeRequest(GCM_SERVICE_PROTOCOL_VERSION, configRef: configRef, hostApis: ["host.agent.invoke", "host.audit.append"]))
+    let bootstrap = initializeGcmPlugin(ServiceInitializeRequest(GCM_SERVICE_PROTOCOL_VERSION, configRef: configRef, hostApis: ["host.audit.append"]))
     if (!bootstrap.ok) {
         writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(bootstrap)))
         return 2
@@ -592,7 +579,7 @@ public func loadGcmRuntimeConfig(path: String): GcmRuntimeConfigResult {
 }
 
 public func summarizeGcmSecretState(config: MonitorConfig): SecretStateSummary {
-    SecretStateSummary(if (gitCodeAuthPresentForPlugin(config)) { "present" } else { "absent" }, if (config.mcpServiceToken.isEmpty()) { "absent" } else { "present" }, if (config.feishuWebhook.isEmpty() && config.telegramChatId.isEmpty() && config.telegramBotToken.isEmpty()) { "absent" } else { "legacy_present" })
+    SecretStateSummary(if (gitCodeAuthPresentForPlugin(config)) { "present" } else { "absent" }, if (config.mcpServiceToken.isEmpty()) { "absent" } else { "present" })
 }
 
 public func buildGitCodeMonitorCapabilities(config: MonitorConfig): ArrayList<ServiceCapabilityRecord> {
@@ -602,7 +589,7 @@ public func buildGitCodeMonitorCapabilities(config: MonitorConfig): ArrayList<Se
 public func handleGcmStatusCapability(payload: String, runtime: GcmRuntime): GcmStatusResult {
     let secret = summarizeGcmSecretState(runtime.config)
     let diagnostics = webhookDiagnosticCounters(runtime.state)
-    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} legacyNotify=${secret.legacyNotificationAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
+    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
 }
 
 public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): GcmScanOnceResult {
@@ -679,7 +666,7 @@ public func handleGcmPluginInputLineWithJobs(
         return GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", "{\"ok\":true,\"status\":\"ok\"}"))
     }
     if (frame.method == "status") {
-        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state))
+        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer))
         return GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
     }
     if (frame.method == "stop") {
@@ -690,7 +677,7 @@ public func handleGcmPluginInputLineWithJobs(
     }
     match (frame.capabilityId) {
         case "gitcode.monitor.status" =>
-            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state))
+            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer))
             GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
         case "gitcode.monitor.scan_once" =>
             let mode = scanPayloadMode(frame.payload)
@@ -792,8 +779,12 @@ public func handleGcmPluginInputLineWithJobs(
             }
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "accepted", eventReconcilePayload(config)))
         case "gitcode.writeback.apply_result" =>
-            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state))
-            GcmPluginFrameHandleResult(applied.ok, frame: gcmPluginResponseFrame(frame, applied.ok, applied.decision.reason, gcmWritebackApplyResultPayload(applied)))
+            let beforeVersion = state.version()
+            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer))
+            let saved = runtime.store.saveIfChanged(state, beforeVersion, reason: "writeback_apply_result")
+            let ok = applied.ok && saved.status != "state_save_failed"
+            let status = if (ok) { applied.decision.reason } else { "state_save_failed" }
+            GcmPluginFrameHandleResult(ok, frame: gcmPluginResponseFrame(frame, ok, status, gcmWritebackApplyResultPayload(applied)))
         case _ =>
             GcmPluginFrameHandleResult(false, frame: gcmPluginResponseFrame(frame, false, "capability_unsupported", "{\"ok\":false,\"status\":\"capability_unsupported\",\"capabilityId\":\"${jsonEscape(frame.capabilityId)}\"}"))
     }
@@ -931,19 +922,6 @@ private func gcmWritebackApplyResultPayload(result: GcmWritebackApplyResult): St
     "}"
 }
 
-public func classifyGcmLegacyNotificationConfig(config: MonitorConfig): LegacyNotificationConfigSummary {
-    let hasFeishu = !config.feishuWebhook.trimAscii().isEmpty()
-    let hasTelegram = !config.telegramBotToken.trimAscii().isEmpty() || !config.telegramChatId.trimAscii().isEmpty()
-    LegacyNotificationConfigSummary(hasFeishu, hasTelegram, if (hasFeishu || hasTelegram) { "legacy_present" } else { "absent" })
-}
-
-public func renderLegacyNotificationWarning(summary: LegacyNotificationConfigSummary): String {
-    if (summary.status == "absent") {
-        return "legacy notification config absent"
-    }
-    "legacy notification config detected; plugin mode delivers Telegram/Feishu notifications through Metis Gateway subscriptions"
-}
-
 public func validateGcmPluginModeConfig(config: MonitorConfig): GcmConfigValidationResult {
     let diagnostics = ArrayList<String>()
     if (config.gitCodeBaseUrl.trimAscii().isEmpty()) { diagnostics.add("gitcode.baseUrl missing") }
@@ -958,7 +936,7 @@ public func validateGcmPluginModeConfig(config: MonitorConfig): GcmConfigValidat
 
 public func summarizeGcmPluginModeConfig(config: MonitorConfig): GcmConfigSummary {
     let secret = summarizeGcmSecretState(config)
-    GcmConfigSummary("orgs=${config.orgs.size} dryRun=${config.dryRun} autoReply=${config.autoReply} ${writebackScopeSummary(config)} gitCodeAuth=${secret.gitCodeAuth} mcpAuth=${secret.mcpAuth} legacyNotify=${secret.legacyNotificationAuth} statePath=${redactServicePayload(config.statePath).text}")
+    GcmConfigSummary("orgs=${config.orgs.size} dryRun=${config.dryRun} autoReply=${config.autoReply} ${writebackScopeSummary(config)} gitCodeAuth=${secret.gitCodeAuth} mcpAuth=${secret.mcpAuth} statePath=${redactServicePayload(config.statePath).text}")
 }
 
 public func migrateLegacyAutoReply(config: MonitorConfig): MonitorConfig {

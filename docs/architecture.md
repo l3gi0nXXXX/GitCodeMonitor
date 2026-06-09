@@ -1,9 +1,9 @@
 # GitCodeMonitor Cangjie Baseline
 
 This repository is an independent Cangjie `cjpm` project. It owns GitCode
-scanning, event filtering, state, delivery audit, dry-run audit, and the final
-writeback decision. Metis is represented only by an MCP client contract in this
-baseline; tests use fake transports and do not perform real network calls.
+scanning, event filtering, state, dry-run audit, and the final GitCode
+writeback executor. Metis integration is service-plugin-only; tests use fake
+transports and do not perform real network calls.
 
 Implemented baseline areas:
 
@@ -18,12 +18,12 @@ Implemented baseline areas:
 - GitCode event model and filters for `CangjiePL`, exact `start build`, and
   the self marker.
 - Fake-clock friendly full scan scheduler with overlap guard and in-memory
-  state for seen events, MCP calls, replies, and audit records.
+  state for seen events, legacy diagnostic MCP markers, replies, and audit
+  records.
 - Fake GitCode transport for repo refresh, pagination, event scan, and stable
   error mapping.
-- Feishu and Telegram notifier audit skeletons.
-- MCP initialize, tools/list schema cache, tools/call result, and event-to-tool
-  mapper skeletons.
+- Service-plugin protocol handling for accepted events, status, scan jobs, and
+  `gitcode.writeback.apply_result`.
 - Writeback gate for dry-run, autoReply, writeback scope including allowed orgs,
   allowed repos, denied repos, safety result, duplicate reply, local secret
   detection, and self marker checks.

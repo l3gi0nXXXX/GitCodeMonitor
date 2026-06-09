@@ -1,6 +1,6 @@
 # GitCodeMonitor 配置说明
 
-本文档说明 GitCodeMonitor 配置文件中每一项应该填写什么、从哪里获取，以及开启真实网络、通知、MCP 调用和自动写回时的安全边界。
+本文档说明 GitCodeMonitor 配置文件中每一项应该填写什么、从哪里获取，以及在 Metis service-plugin 模式下开启真实 GitCode 写回时的安全边界。
 
 ## 配置文件位置
 
@@ -26,11 +26,11 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 
 - 不要把真实 token、cookie、bot token、webhook、service token 写进 README、docs、测试用例或提交记录。
 - `.gitcodemonitor/` 已被忽略，适合存放本机真实配置和状态文件。
-- 删除 `monitor.statePath` 指向的状态文件会导致已处理事件重新被扫描、通知和调用 MCP。
+- 删除 `monitor.statePath` 指向的状态文件会导致已处理事件重新进入 service-plugin 事件处理和写回审计流程。
 
 ## 最小安全配置
 
-这是只验证 GitCode 配置、不开通知、不开写回的最小配置：
+这是只验证 GitCode 配置、不开写回的最小配置：
 
 ```json
 {
@@ -45,7 +45,6 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
     "jitterSeconds": 30,
     "dryRun": true,
     "autoReply": false,
-    "notifyNetworkEnabled": false,
     "transport": "native"
   }
 }
@@ -125,7 +124,7 @@ record-only 命中后的运行行为：
 2. GCM 写入审计记录，原因是 `record_only/corporate_author`。
 3. GCM 标记 webhook delivery 已处理。
 4. GCM 不发送 `gitcode.event.accepted` 给 Metis。
-5. GCM 不调用 LLM、不通知 TG/Feishu bot、不执行 GitCode 写回。
+5. GCM 不执行 GitCode 写回。
 
 ## GitCode Webhook 配置
 
@@ -240,68 +239,34 @@ GitCode 后台 webhook 配置时：
 - 密码/Secret Token 填 `endpoints[0].token` 的值。
 - 事件只勾选 Issue、Pull Request/Merge Request、评论/Note 相关事件。
 
-## Metis MCP 配置
+## Metis service-plugin 边界
 
-| 字段 | 是否建议填写 | 应该填什么 |
-| --- | --- | --- |
-| `metis.mcpEndpoint` | 需要大模型总结/回复时必填 | Metis 暴露的 MCP HTTP 入口，例如 `http://127.0.0.1:8787/mcp`。GitCodeMonitor 只把已过滤后的 PR/Issue 上下文发给 Metis，不把 GitCode 凭证发给 Metis。 |
-| `metis.mcpServiceToken` | 按 Metis 服务端要求填写 | 如果 Metis MCP 入口要求服务 token，就填对应 Bearer token；如果 Metis 不要求鉴权，留空。 |
+GitCodeMonitor 当前生产运行形态只有 Metis service-plugin 模式：
 
-没有配置 `metis.mcpEndpoint` 时，GitCodeMonitor 仍可做扫描和通知，但不能从 Metis 获取总结、回复草稿和安全审查结果。
+- GCM 通过 `plugin-stdio` 被 Metis service-plugin host 启动。
+- GCM 发出 `gitcode.event.accepted` 等契约化事件，不直接调用 Metis MCP。
+- Metis 负责 LLM、回复生成、安全判断、飞书/Telegram 等 IM 通知。
+- Metis 需要写回 GitCode 时，调用 GCM 的 `gitcode.writeback.apply_result` capability。
+- GCM 在 `apply_result` 中执行最终写回门禁和 GitCode API 评论写入。
 
-## 飞书通知配置
+因此，GCM 配置中不再需要 `monitor.notifyNetworkEnabled`，也不再需要 `feishu.webhook`、`telegram.botToken`、`telegram.chatId` 作为 GCM 通知配置。旧配置字段会被忽略或只作为脱敏兼容输入处理，不能触发 GCM 自己发送 IM 通知。
 
-| 字段 | 是否建议填写 | 应该填什么 |
-| --- | --- | --- |
-| `feishu.webhook` | 需要飞书通知时必填 | 飞书群自定义机器人的 Incoming Webhook URL，形如 `https://open.feishu.cn/open-apis/bot/v2/hook/<webhook-id>`。海外租户可能是 `https://open.larksuite.com/open-apis/bot/v2/hook/<webhook-id>`。 |
-
-`feishu.webhook` 不是飞书 App ID、App Secret、tenant token，也不是 GitCode token。它是你在飞书群里添加“自定义机器人”后复制出来的完整 webhook 地址。
-
-只有满足以下条件时才会真实发送飞书通知：
-
-- `monitor.notifyNetworkEnabled=true`
-- `feishu.webhook` 不为空
-- 扫描到的事件没有被过滤规则忽略
-
-`monitor.dryRun=true` 不会阻止飞书通知。`dryRun` 只阻止 GitCode 自动写回。
-
-## Telegram 通知配置
-
-| 字段 | 是否建议填写 | 应该填什么 |
-| --- | --- | --- |
-| `telegram.botToken` | 需要 Telegram 通知时必填 | BotFather 创建 bot 后给出的 token，形如 `<digits>:<secret>`。 |
-| `telegram.chatId` | 需要 Telegram 通知时必填 | 目标私聊、群或频道的 chat id。私聊通常是正数，群或超级群通常是负数。建议作为字符串填写。 |
-
-获取 `telegram.chatId` 的常用方法：
-
-1. 在 Telegram 中通过 BotFather 创建 bot，拿到 `telegram.botToken`。
-2. 给 bot 发一条消息，或者把 bot 加入目标群并在群里发一条消息。
-3. 访问 `https://api.telegram.org/bot<telegram.botToken>/getUpdates`。
-4. 在返回 JSON 中找到 `message.chat.id`，把这个值填入 `telegram.chatId`。
-
-发送通知时，GitCodeMonitor 会调用：
-
-```text
-POST https://api.telegram.org/bot<telegram.botToken>/sendMessage
-```
-
-如果群里看不到 `getUpdates` 返回，通常是 bot 没收到群消息、没有被加入目标群，或者 BotFather 的 group privacy 设置影响了可见消息。
+如果需要配置飞书或 Telegram，请在 Metis Gateway / channel 配置中完成，不要放到 GCM 配置里。
 
 ## Monitor 配置
 
 | 字段 | 默认值 | 应该填什么 |
 | --- | --- | --- |
 | `monitor.orgs` | `["cangjie", "cangjie-sig", "cangjie-tpc"]` | 需要扫描的 GitCode 组织列表。当前目标就是这三个组织。这个字段只控制扫描范围，不控制自动写回范围。 |
-| `monitor.statePath` | `data/gitcodemonitor-state.json` | 扫描游标、通知审计、写回审计的本地状态文件。建议填 `.gitcodemonitor/state.json`。 |
+| `monitor.statePath` | `.gitcodemonitor/state.json` | 扫描游标、写回审计的本地状态文件。建议使用 `.gitcodemonitor/` 下的路径，该目录已被 `.gitignore` 忽略。 |
 | `monitor.fullScanIntervalMinutes` | `10` | 全量扫描间隔，单位分钟。生产配置不能低于 5。当前方案建议 10 分钟。 |
 | `monitor.jitterSeconds` | `30` | 扫描抖动秒数，用于避免固定时间点集中请求。当前校验要求不超过 30。 |
 | `monitor.dryRun` | `true` | 是否禁止 GitCode 自动写回。`true` 表示不写回 GitCode；`false` 才允许进入写回门禁。 |
-| `monitor.autoReply` | `false` | 是否启用自动回复。即使设为 `true`，仍需 `dryRun=false`、MCP 安全通过、writebackScope 命中、无重复写回、无敏感信息和本地路径，才会真正写回。 |
-| `monitor.notifyNetworkEnabled` | `false` | 是否启用真实飞书/Telegram 发送。`false` 时只记录 dry-run audit，不发网络请求。 |
+| `monitor.autoReply` | `false` | 是否启用自动回复写回。即使设为 `true`，仍需 `dryRun=false`、Metis 安全通过、writebackScope 命中、无重复写回、无敏感信息和本地路径，才会真正写回。 |
 | `monitor.writebackScope.allowedOrgs` | `[]` | 允许自动写回的组织列表，格式是 GitCode owner 名，例如 `["cangjie", "cangjie-sig", "cangjie-tpc"]`。只控制写回范围，不扩大或缩小 `monitor.orgs` 扫描范围。 |
 | `monitor.writebackScope.allowedRepos` | `[]` | 允许自动写回的仓库列表，格式是 `owner/repo`，例如 `["Cangjie/community"]`。用于补充组织外或少量精确仓库授权。 |
 | `monitor.writebackScope.deniedRepos` | `[]` | 禁止自动写回的仓库列表，格式是 `owner/repo`。优先级最高，即使命中 `allowedOrgs` 或 `allowedRepos` 也不会写回。 |
-| `monitor.repoAllowlist` | `[]` | 兼容字段，旧配置入口。格式是 `owner/repo`，语义等价于合并进 `monitor.writebackScope.allowedRepos`；新配置建议使用 `writebackScope`。 |
+| `monitor.repoAllowlist` | `[]` | 旧配置诊断字段。格式是 `owner/repo`，只做解析和校验，不再授权写回；新配置必须使用 `writebackScope`。 |
 | `monitor.transport` | `native` | HTTP 传输方式。默认 `native`。`curl` 只作为显式回退。 |
 
 ### writebackScope 优先级与匹配示例
@@ -340,9 +305,9 @@ deniedRepos > allowedRepos > allowedOrgs > 默认拒绝
 
 ## 分阶段配置示例
 
-### 阶段 1：GitCode 扫描 dry-run
+### 阶段 1：GitCode 配置 dry-run
 
-用于确认 GitCode token、组织仓库扫描、状态文件是否正常：
+用于确认 GitCode token、组织列表、状态文件路径和脱敏输出是否正常：
 
 ```json
 {
@@ -357,7 +322,6 @@ deniedRepos > allowedRepos > allowedOrgs > 默认拒绝
     "jitterSeconds": 30,
     "dryRun": true,
     "autoReply": false,
-    "notifyNetworkEnabled": false,
     "transport": "native"
   }
 }
@@ -368,16 +332,16 @@ deniedRepos > allowedRepos > allowedOrgs > 默认拒绝
 ```bash
 cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.json doctor"
 cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.json probe-gitcode"
-cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.json scan-once"
 ```
 
 验收标准：
 
 - `doctor` 中 `gitCodeAuth=present`。
 - 输出不包含真实 token、cookie、webhook、bot token。
-- `scan-once` 能完成，不写 GitCode 评论，不发送飞书/Telegram。
+- `dryRun=true` 且 `autoReply=false`，不会写 GitCode 评论。
+- `scan-once`、`serve`、`webhook-http` 作为独立运行命令会返回 service-plugin-only 不支持提示。
 
-### 阶段 2：开启飞书和 Telegram 通知
+### 阶段 2：接入 Metis service-plugin host
 
 ```json
 {
@@ -386,20 +350,12 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
     "authMode": "PRIVATE-TOKEN",
     "token": "<GitCode API access token>"
   },
-  "feishu": {
-    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/<webhook-id>"
-  },
-  "telegram": {
-    "botToken": "<Telegram bot token>",
-    "chatId": "<Telegram chat id>"
-  },
   "monitor": {
     "statePath": ".gitcodemonitor/state.json",
     "fullScanIntervalMinutes": 10,
     "jitterSeconds": 30,
     "dryRun": true,
     "autoReply": false,
-    "notifyNetworkEnabled": true,
     "transport": "native"
   }
 }
@@ -407,11 +363,13 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 
 验收标准：
 
-- 未被过滤的事件会同时发到飞书和 Telegram。
+- Metis 能以 service-plugin 模式启动 GCM 的 `plugin-stdio`。
+- GCM 初始化响应不包含 GitCode token、cookie、IM bot token 或 webhook。
+- 未被过滤的 GitCode 事件通过 `gitcode.event.accepted` 进入 Metis。
+- Metis 侧 IM 通知由 Metis Gateway/channel 发送，GCM 不直接发送飞书或 Telegram。
 - GitCode 仍不会被自动回复，因为 `dryRun=true` 且 `autoReply=false`。
-- 通知内容包含原始事件摘要和 PR/Issue 链接。
 
-### 阶段 3：接入 Metis MCP，但仍不写回
+### 阶段 3：Metis 生成回复，但 GCM 仍不写回
 
 ```json
 {
@@ -420,17 +378,12 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
     "authMode": "PRIVATE-TOKEN",
     "token": "<GitCode API access token>"
   },
-  "metis": {
-    "mcpEndpoint": "http://127.0.0.1:8787/mcp",
-    "mcpServiceToken": "<optional Metis MCP service token>"
-  },
   "monitor": {
     "statePath": ".gitcodemonitor/state.json",
     "fullScanIntervalMinutes": 10,
     "jitterSeconds": 30,
     "dryRun": true,
     "autoReply": false,
-    "notifyNetworkEnabled": false,
     "transport": "native"
   }
 }
@@ -438,9 +391,9 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 
 验收标准：
 
-- `probe-mcp` 能生成已脱敏的 MCP initialize 请求。
-- 扫描事件可以进入 MCP 总结/回复草稿链路。
-- GitCode 不发生写回。
+- Metis 能基于 `gitcode.event.accepted` 生成回复草稿和安全判断。
+- Metis 调用 `gitcode.writeback.apply_result` 时，GCM 返回 `dry_run` 或 `auto_reply_disabled`，不写 GitCode 评论。
+- GCM 状态文件记录 dry-run/门禁审计，状态文件位于 `.gitcodemonitor/` 或临时测试目录。
 
 ### 阶段 4：受控开启自动写回
 
@@ -451,17 +404,12 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
     "authMode": "PRIVATE-TOKEN",
     "token": "<GitCode API access token>"
   },
-  "metis": {
-    "mcpEndpoint": "http://127.0.0.1:8787/mcp",
-    "mcpServiceToken": "<optional Metis MCP service token>"
-  },
   "monitor": {
     "statePath": ".gitcodemonitor/state.json",
     "fullScanIntervalMinutes": 10,
     "jitterSeconds": 30,
     "dryRun": false,
     "autoReply": true,
-    "notifyNetworkEnabled": true,
     "writebackScope": {
       "allowedOrgs": ["cangjie", "cangjie-sig", "cangjie-tpc"],
       "allowedRepos": [],
@@ -475,7 +423,7 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 验收标准：
 
 - 只有命中 `writebackScope` 的仓库允许自动写回；`monitor.orgs` 只控制扫描范围。
-- MCP 安全审查拒绝、检测到本地路径、检测到密钥、重复回复、人审要求时，都不会写回。
+- Metis 安全审查拒绝、检测到本地路径、检测到密钥、重复回复、人审要求时，都不会写回。
 - 写回评论包含 `<!-- gitcodemonitor:auto-reply:v1 -->` 标记，后续扫描会忽略自生成评论。
 
 ## 当前不建议配置 ACP
@@ -483,7 +431,7 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 当前 GitCodeMonitor 主链路是：
 
 ```text
-GitCodeMonitor -> Metis MCP -> Metis agent runtime/model
+GitCodeMonitor service-plugin -> Metis Gateway/agent runtime/model -> GitCodeMonitor apply_result
 ```
 
 代码中存在 ACP client 原语，但当前 JSON 配置解析没有把 ACP 字段作为正式运行路径暴露出来。现阶段不要在 GitCodeMonitor 配置里尝试配置 ACP。后续如果要支持长流程 ACP，应单独补方案、补配置解析、补联调和测试。
@@ -491,18 +439,16 @@ GitCodeMonitor -> Metis MCP -> Metis agent runtime/model
 ## 常见误区
 
 - `gitcode.token` 是 GitCode API token，不是飞书、Telegram 或 Metis 的 token。
-- `feishu.webhook` 是飞书自定义机器人 webhook 完整 URL，不是飞书应用凭证。
-- `telegram.chatId` 不是 bot token，需要通过 `getUpdates` 或 Telegram 管理工具查目标会话 id。
-- `monitor.dryRun=true` 只阻止 GitCode 写回，不阻止飞书/Telegram 真实通知；通知是否真实发送看 `monitor.notifyNetworkEnabled`。
+- 飞书和 Telegram 配置属于 Metis Gateway/channel，不属于 GCM。
+- `monitor.dryRun=true` 阻止 GCM 写回 GitCode；IM 通知是否发送由 Metis Gateway/channel 配置决定。
 - `monitor.autoReply=true` 不等于一定写回，还需要满足所有写回门禁。
 - `monitor.orgs` 是扫描范围，`monitor.writebackScope` 是写回范围，两者不是同一个开关。
-- `repoAllowlist` 只是旧配置兼容字段，不推荐作为几百仓库的生产配置主路径。新配置应使用 `writebackScope.allowedOrgs`、`writebackScope.allowedRepos` 和 `writebackScope.deniedRepos`。
+- `repoAllowlist` 只是旧配置诊断字段，不再授权写回。新配置必须使用 `writebackScope.allowedOrgs`、`writebackScope.allowedRepos` 和 `writebackScope.deniedRepos`。
 
 ## 依据
 
-- 本项目配置解析与默认值：`src/core.cj` 中 `MonitorConfig`、`applyGitCodeSection`、`applyFeishuSection`、`applyTelegramSection`、`applyMetisSection`、`applyMonitorSection`。
-- 本项目通知构造：`src/core.cj` 中 `buildFeishuPayload`、`buildTelegramPayload`。
+- 本项目配置解析与默认值：`src/core.cj` 中 `MonitorConfig`、`applyGitCodeSection`、`applyMetisSection`、`applyMonitorSection`。
+- 本项目 service-plugin 运行时：`src/plugin_runtime.cj` 中 `requiredGitCodeMonitorCapabilityIds`、`handleGcmPluginInputLineWithJobs`、`handleGcmWritebackApplyResult`。
+- 本项目写回实现：`src/core.cj` 中 `GitCodeCommentWriter`、`GitCodeApiClient`。
 - 本项目 GitCode API 请求构造：`src/core.cj` 中 `GitCodeApiClient`。
 - GitCode/AtomGit API 文档：<https://docs.atomgit.com/docs/apis/>。
-- Telegram Bot API：<https://core.telegram.org/bots/api>，`sendMessage` 使用 `chat_id` 和 `text` 参数，`getUpdates` 可获取 bot 收到的更新。
-- 飞书开放平台自定义机器人文档：<https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot>，自定义机器人通过 webhook 接收消息。

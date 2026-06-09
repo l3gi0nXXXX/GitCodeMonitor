@@ -313,7 +313,7 @@ public class GitCodeWebhookETest {
         let versionBefore = state.version()
         let auditCountBefore = state.audit.size
 
-        let result = processRuntimeEvent(config, state, event, runtime.feishu, runtime.telegram, runtime.mcp, runtime.writer, baselineMode: false)
+        let result = processRuntimeEvent(config, state, event, baselineMode: false)
 
         @Expect(result.duplicateEvents, 1)
         @Expect(state.version(), versionBefore)
