@@ -66,6 +66,7 @@ public func requiredGitCodeMonitorCapabilityIds(): Array<String> {
         "gitcode.monitor.scan_completed",
         "gitcode.monitor.scan_failed",
         "gitcode.monitor.scan_cancelled",
+        "gitcode.monitor.orphan_detected",
         "gitcode.event.accepted",
         "gitcode.event.ignored",
         "gitcode.writeback.apply_result",
@@ -187,6 +188,13 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         direction: "gcm-to-metis",
         description: "GitCode scan job cancelled event",
         outputSchema: "schemas/gitcode.monitor.scan_cancelled.event.json"
+    ))
+    records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.orphan_detected",
+        "event",
+        direction: "gcm-to-metis",
+        description: "GitCode Monitor service-plugin parent lease watchdog detected an orphaned plugin process",
+        outputSchema: "schemas/gitcode.monitor.orphan_detected.event.json"
     ))
     records.add(ServiceCapabilityRecord(
         "gitcode.event.accepted",
