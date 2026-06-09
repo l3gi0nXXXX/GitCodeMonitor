@@ -453,6 +453,41 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func p0p2WritebackBodyIsNaturalAndPostedResultRecordsLedger(): Unit {
+        // T-P0-U-001, T-P2-U-001, T-P7-E2E-003
+        let dir = tempRuntimeDir("gcm-p2-writeback-runtime-ledger")
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = dir.join("state.json").toString()
+        config.autoReply = true
+        config.dryRun = false
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer)
+        let payload = "{\"eventId\":\"source-event-runtime\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"4\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\",\"draft\":\"natural reply body\",\"safety\":\"approved\"}"
+
+        let applied = handleGcmWritebackApplyResult(payload, runtime)
+
+        @Expect(applied.ok, true)
+        @Expect(applied.posted, true)
+        @Expect(writer.written.size, 1)
+        @Expect(writer.written[0].contains("auto-reply"), false)
+        @Expect(writer.written[0].contains("auto reply"), false)
+        @Expect(writer.written[0].contains("automatic reply"), false)
+        @Expect(writer.written[0].toAsciiLower().contains("gitcodemonitor"), false)
+        @Expect(writer.written[0].contains("generated-by"), false)
+        @Expect(writer.written[0].contains("bot attribution"), false)
+        @Expect(writer.written[0].contains("<!--"), false)
+        let ledgerPath = writebackLedgerPathForConfig(config)
+        @Expect(exists(Path(ledgerPath)), true)
+        let ledgerText = String.fromUtf8(File.readFrom(Path(ledgerPath)))
+        @Expect(ledgerText.contains("source-event-runtime"), true)
+        @Expect(ledgerText.contains("natural reply body"), false)
+        @Expect(ledgerText.contains("auto-reply"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func writebackApplyResultHonorsOrgScopeDeniedReposAndLegacyAllowlist(): Unit {
         let payload = "{\"eventId\":\"wb-scope-p4-e2e\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}"
 

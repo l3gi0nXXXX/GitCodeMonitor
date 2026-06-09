@@ -611,7 +611,7 @@ public func buildGitCodeMonitorCapabilities(config: MonitorConfig): ArrayList<Se
 public func handleGcmStatusCapability(payload: String, runtime: GcmRuntime): GcmStatusResult {
     let secret = summarizeGcmSecretState(runtime.config)
     let diagnostics = webhookDiagnosticCounters(runtime.state)
-    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
+    GcmStatusResult(true, "running", summary: "dryRun=${runtime.config.dryRun} autoReply=${runtime.config.autoReply} ${writebackScopeSummary(runtime.config)} gitCodeAuth=${secret.gitCodeAuth} seen=${runtime.state.seenCount()} baselineScopes=${runtime.state.baselineScopeCount()} recordOnlyEnabled=${runtime.config.authorPolicy.recordOnlyEnabled} recordOnlyDomainCount=${runtime.config.authorPolicy.recordOnlyEmailDomains.size} recordOnlyEffective=${authorPolicyRecordOnlyEffective(runtime.config.authorPolicy)} recordOnly=${diagnostics.recordOnlyCount} recordOnlyTargetAuthor=${diagnostics.recordOnlyTargetAuthorCount} recordOnlyCommentAuthor=${diagnostics.recordOnlyCommentAuthorCount} recordOnlyEventActor=${diagnostics.recordOnlyEventActorCount} selfEchoIgnored=${diagnostics.selfEchoIgnoredCount} accepted=${diagnostics.acceptedCount} writebackPosted=${diagnostics.writebackPostedCount} writebackSkipped=${diagnostics.writebackSkippedCount} maintainerMentionSkipped=${diagnostics.maintainerMentionSkippedCount} mentionDegraded=${diagnostics.mentionDegradedCount}")
 }
 
 public func handleGcmScanOnceCapability(payload: String, runtime: GcmRuntime): GcmScanOnceResult {
@@ -865,6 +865,9 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
     let replyUrl = runtime.writer.write(event, appended.body, runtime.state)
     let writeStatus = if (replyUrl.startsWith("error:")) { replyUrl.split(":", 2)[1] } else { "posted" }
     let finalDecision = GcmWritebackDecision(writeStatus == "posted", writeStatus)
+    if (writeStatus == "posted") {
+        let _ = recordWriteback(writebackLedgerPathForConfig(runtime.config), request.repo, request.kind, request.number, replyUrl, appended.body, request.eventId)
+    }
     recordGcmWritebackAuditState(runtime.state, request, finalDecision, replyUrl: if (writeStatus == "posted") { replyUrl } else { "" }, posted: writeStatus == "posted")
     GcmWritebackApplyResult(
         true,

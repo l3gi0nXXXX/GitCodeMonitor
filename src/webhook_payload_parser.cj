@@ -15,6 +15,15 @@ public class GitCodeWebhookEnvelope {
     public let authorLogin: String
     public let authorDisplayName: String
     public let authorUrl: String
+    public let targetAuthorId: String
+    public let targetAuthorUsername: String
+    public let targetAuthorEmailHash: String
+    public let commentAuthorId: String
+    public let commentAuthorUsername: String
+    public let commentAuthorEmailHash: String
+    public let eventActorId: String
+    public let eventActorUsername: String
+    public let eventActorEmailHash: String
     public let deliveryId: String
 
     public init(
@@ -30,6 +39,15 @@ public class GitCodeWebhookEnvelope {
         authorLogin!: String = "",
         authorDisplayName!: String = "",
         authorUrl!: String = "",
+        targetAuthorId!: String = "",
+        targetAuthorUsername!: String = "",
+        targetAuthorEmailHash!: String = "",
+        commentAuthorId!: String = "",
+        commentAuthorUsername!: String = "",
+        commentAuthorEmailHash!: String = "",
+        eventActorId!: String = "",
+        eventActorUsername!: String = "",
+        eventActorEmailHash!: String = "",
         deliveryId!: String = ""
     ) {
         this.eventHeader = eventHeader
@@ -44,6 +62,15 @@ public class GitCodeWebhookEnvelope {
         this.authorLogin = authorLogin
         this.authorDisplayName = authorDisplayName
         this.authorUrl = authorUrl
+        this.targetAuthorId = targetAuthorId
+        this.targetAuthorUsername = targetAuthorUsername
+        this.targetAuthorEmailHash = targetAuthorEmailHash
+        this.commentAuthorId = commentAuthorId
+        this.commentAuthorUsername = commentAuthorUsername
+        this.commentAuthorEmailHash = commentAuthorEmailHash
+        this.eventActorId = eventActorId
+        this.eventActorUsername = eventActorUsername
+        this.eventActorEmailHash = eventActorEmailHash
         this.deliveryId = deliveryId
     }
 }
@@ -96,6 +123,7 @@ func parseWebhookItem(root: JsonObject, kind: String, eventName: String): GitCod
     let content = sanitizeWebhookContent("${title}\n${desc}")
     let url = firstNonEmpty([firstJsonString(attrs, ["url", "html_url", "web_url"]), "https://gitcode.com/${repo.fullName()}/${if (kind == "pr") { "pulls" } else { "issues" }}/${itemId}"])
     let identity = extractAuthorIdentityFromWebhook(root)
+    let subjects = extractWebhookSubjectSet(root)
     GitCodeWebhookParseResult(
         true,
         event: GitCodeEvent(canonicalGitCodeEventId(repo, kind, itemId), repo.org, repo.name, kind, itemId, identity.login, identity.url, url, content),
@@ -109,7 +137,13 @@ func parseWebhookItem(root: JsonObject, kind: String, eventName: String): GitCod
             body: sanitizeWebhookContent(desc),
             authorLogin: identity.login,
             authorDisplayName: identity.displayName,
-            authorUrl: identity.url
+            authorUrl: identity.url,
+            targetAuthorId: envelopeSubjectId(subjects.targetAuthor),
+            targetAuthorUsername: envelopeSubjectLogin(subjects.targetAuthor),
+            targetAuthorEmailHash: envelopeSubjectEmailHash(subjects.targetAuthor),
+            eventActorId: envelopeSubjectId(subjects.eventActor),
+            eventActorUsername: envelopeSubjectLogin(subjects.eventActor),
+            eventActorEmailHash: envelopeSubjectEmailHash(subjects.eventActor)
         ))
     )
 }
@@ -142,6 +176,7 @@ func parseWebhookNote(root: JsonObject, eventName: String): GitCodeWebhookParseR
     let body = sanitizeWebhookContent(rawComment)
     let url = firstNonEmpty([firstJsonString(attrs, ["url", "html_url", "web_url"]), firstJsonString(item, ["url", "html_url", "web_url"])])
     let identity = extractAuthorIdentityFromWebhook(root)
+    let subjects = extractWebhookSubjectSet(root)
     GitCodeWebhookParseResult(
         true,
         event: GitCodeEvent(canonicalGitCodeEventId(repo, kind, itemId, commentId: commentId), repo.org, repo.name, kind, itemId, identity.login, identity.url, url, body),
@@ -157,9 +192,40 @@ func parseWebhookNote(root: JsonObject, eventName: String): GitCodeWebhookParseR
             commentBody: body,
             authorLogin: identity.login,
             authorDisplayName: identity.displayName,
-            authorUrl: identity.url
+            authorUrl: identity.url,
+            targetAuthorId: envelopeSubjectId(subjects.targetAuthor),
+            targetAuthorUsername: envelopeSubjectLogin(subjects.targetAuthor),
+            targetAuthorEmailHash: envelopeSubjectEmailHash(subjects.targetAuthor),
+            commentAuthorId: envelopeSubjectId(subjects.commentAuthor),
+            commentAuthorUsername: envelopeSubjectLogin(subjects.commentAuthor),
+            commentAuthorEmailHash: envelopeSubjectEmailHash(subjects.commentAuthor),
+            eventActorId: envelopeSubjectId(subjects.eventActor),
+            eventActorUsername: envelopeSubjectLogin(subjects.eventActor),
+            eventActorEmailHash: envelopeSubjectEmailHash(subjects.eventActor)
         ))
     )
+}
+
+func envelopeSubjectId(subject: ?GitCodeAuthorIdentity): String {
+    match (subject) {
+        case Some(identity) => identity.id
+        case None => ""
+    }
+}
+
+func envelopeSubjectLogin(subject: ?GitCodeAuthorIdentity): String {
+    match (subject) {
+        case Some(identity) => identity.login
+        case None => ""
+    }
+}
+
+func envelopeSubjectEmailHash(subject: ?GitCodeAuthorIdentity): String {
+    match (subject) {
+        case Some(identity) =>
+            if (identity.emails.size == 0) { "" } else { hashRawPayload(identity.emails[0]) }
+        case None => ""
+    }
 }
 
 func webhookRepo(root: JsonObject): GitCodeRepo {
