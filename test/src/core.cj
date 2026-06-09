@@ -29,6 +29,22 @@ public class AuthorPolicyConfig {
     }
 }
 
+public class WritebackScopeConfig {
+    public var allowedOrgs: Array<String>
+    public var allowedRepos: Array<String>
+    public var deniedRepos: Array<String>
+
+    public init(
+        allowedOrgs!: Array<String> = [],
+        allowedRepos!: Array<String> = [],
+        deniedRepos!: Array<String> = []
+    ) {
+        this.allowedOrgs = allowedOrgs
+        this.allowedRepos = allowedRepos
+        this.deniedRepos = deniedRepos
+    }
+}
+
 public class MonitorConfig {
     public var orgs: Array<String>
     public var fullScanIntervalMinutes: Int64
@@ -38,6 +54,7 @@ public class MonitorConfig {
     public var autoReply: Bool
     public var acpEnabled: Bool
     public var repoAllowlist: Array<String>
+    public var writebackScope: WritebackScopeConfig
     public var acpEndpoint: String
     public var acpServiceToken: String
     public var acpAllowedTasks: Array<String>
@@ -66,6 +83,7 @@ public class MonitorConfig {
         this.autoReply = false
         this.acpEnabled = false
         this.repoAllowlist = []
+        this.writebackScope = WritebackScopeConfig()
         this.acpEndpoint = ""
         this.acpServiceToken = ""
         this.acpAllowedTasks = []
@@ -120,8 +138,12 @@ public func validateConfig(config: MonitorConfig): String {
     if (config.acpEnabled && (config.acpEndpoint.isEmpty() || config.acpServiceToken.isEmpty() || config.acpAllowedTasks.size == 0)) {
         return "acp enabled but endpoint/token/allowedTasks missing"
     }
-    if (!config.dryRun && config.autoReply && config.repoAllowlist.size == 0) {
-        return "writeback enabled but repo allowlist missing"
+    let scopeDiagnostics = validateWritebackScopeConfig(config.writebackScope, config.repoAllowlist)
+    if (scopeDiagnostics.size > 0) {
+        return "writebackScope ${scopeDiagnostics[0]}"
+    }
+    if (!config.dryRun && config.autoReply && !writebackScopeHasAllow(config)) {
+        return "writeback enabled but writebackScope has no allowed orgs or repos"
     }
     let authorPolicyValidation = validateAuthorPolicyConfig(config.authorPolicy)
     if (authorPolicyValidation != "ok") {
@@ -131,6 +153,31 @@ public func validateConfig(config: MonitorConfig): String {
         return "ok"
     }
     return "ok"
+}
+
+public func validateWritebackScopeConfig(scope: WritebackScopeConfig, legacyRepos: Array<String>): Array<String> {
+    let diagnostics = ArrayList<String>()
+    for (org in scope.allowedOrgs) {
+        if (!writebackOrgScopeIsValid(org)) {
+            diagnostics.add("invalid org scope: ${org.trimAscii()}")
+        }
+    }
+    for (repo in scope.allowedRepos) {
+        if (!writebackRepoScopeIsValid(repo)) {
+            diagnostics.add("invalid repo scope: ${repo.trimAscii()}")
+        }
+    }
+    for (repo in scope.deniedRepos) {
+        if (!writebackRepoScopeIsValid(repo)) {
+            diagnostics.add("invalid repo scope: ${repo.trimAscii()}")
+        }
+    }
+    for (repo in legacyRepos) {
+        if (!writebackRepoScopeIsValid(repo)) {
+            diagnostics.add("invalid repo scope: ${repo.trimAscii()}")
+        }
+    }
+    diagnostics.toArray()
 }
 
 public func configSummary(config: MonitorConfig): String {
@@ -1465,6 +1512,47 @@ public func eventToToolInput(event: GitCodeEvent): ToolInput {
     ToolInput(tool, event.id, "${event.org}/${event.repo}", event.content, itemKind: event.itemKind, itemId: event.itemId, actor: event.actor, actorUrl: event.actorUrl, url: event.url, rawSummary: compactSummary(redactSecrets(event.content), limit: 500))
 }
 
+public class WritebackScopeDecision {
+    public let allowed: Bool
+    public let reason: String
+    public let matchedBy: String
+    public let matchedValue: String
+
+    public init(allowed: Bool, reason: String, matchedBy!: String = "none", matchedValue!: String = "") {
+        this.allowed = allowed
+        this.reason = reason
+        this.matchedBy = matchedBy
+        this.matchedValue = matchedValue
+    }
+}
+
+public func evaluateWritebackScope(config: MonitorConfig, repoFullName: String): WritebackScopeDecision {
+    if (config.dryRun) { return WritebackScopeDecision(false, "dry_run") }
+    if (!config.autoReply) { return WritebackScopeDecision(false, "auto_reply_disabled") }
+    let normalizedRepo = normalizeWritebackRepoFullName(repoFullName)
+    if (normalizedRepo.isEmpty()) {
+        return WritebackScopeDecision(false, "invalid_repo_scope")
+    }
+    let denied = findWritebackRepoScopeMatch(config.writebackScope.deniedRepos, normalizedRepo)
+    if (!denied.isEmpty()) {
+        return WritebackScopeDecision(false, "repo_denied_by_writeback_scope", matchedBy: "denied_repo", matchedValue: denied)
+    }
+    let allowedRepo = findWritebackRepoScopeMatch(config.writebackScope.allowedRepos, normalizedRepo)
+    if (!allowedRepo.isEmpty()) {
+        return WritebackScopeDecision(true, "allowed", matchedBy: "allowed_repo", matchedValue: allowedRepo)
+    }
+    let legacyRepo = findWritebackRepoScopeMatch(config.repoAllowlist, normalizedRepo)
+    if (!legacyRepo.isEmpty()) {
+        return WritebackScopeDecision(true, "allowed", matchedBy: "allowed_repo", matchedValue: legacyRepo)
+    }
+    let owner = normalizedRepo.split("/")[0]
+    let allowedOrg = findWritebackOrgScopeMatch(config.writebackScope.allowedOrgs, owner)
+    if (!allowedOrg.isEmpty()) {
+        return WritebackScopeDecision(true, "allowed", matchedBy: "allowed_org", matchedValue: allowedOrg)
+    }
+    WritebackScopeDecision(false, "repo_not_allowlisted")
+}
+
 public class WriteDecision {
     public let allowed: Bool
     public let reason: String
@@ -1475,9 +1563,8 @@ public class WriteDecision {
 }
 
 public func writebackGate(config: MonitorConfig, state: MonitorState, event: GitCodeEvent, mcp: McpResult): WriteDecision {
-    if (config.dryRun) { return WriteDecision(false, "dry_run") }
-    if (!config.autoReply) { return WriteDecision(false, "auto_reply_disabled") }
-    if (!repoAllowlisted(config.repoAllowlist, "${event.org}/${event.repo}")) { return WriteDecision(false, "repo_not_allowlisted") }
+    let scopeDecision = evaluateWritebackScope(config, "${event.org}/${event.repo}")
+    if (!scopeDecision.allowed) { return WriteDecision(false, scopeDecision.reason) }
     if (filterEvent(event).ignored) { return WriteDecision(false, "filtered_event") }
     if (!mcp.ok || !mcp.approved || mcp.needsHumanReview) { return WriteDecision(false, "safety_rejected") }
     if (state.hasReply(event.id)) { return WriteDecision(false, "duplicate") }
@@ -2122,7 +2209,29 @@ func applyMonitorSection(config: MonitorConfig, obj: JsonObject): Unit {
     let orgs = firstJsonStringArray(obj, ["orgs", "organizations"])
     if (orgs.size > 0) { config.orgs = orgs }
     let allowlist = firstJsonStringArray(obj, ["repoAllowlist", "allowlist"])
-    if (allowlist.size > 0) { config.repoAllowlist = allowlist }
+    if (allowlist.size > 0) { config.repoAllowlist = normalizeWritebackScopeArray(allowlist) }
+    match (obj.get("writebackScope")) {
+        case Some(value) => try { applyWritebackScopeSection(config, value.asObject()) } catch (_: Exception) { () }
+        case None => ()
+    }
+    mergeLegacyRepoAllowlistIntoWritebackScope(config)
+}
+
+func applyWritebackScopeSection(config: MonitorConfig, obj: JsonObject): Unit {
+    config.writebackScope.allowedOrgs = normalizeWritebackScopeArray(firstJsonStringArray(obj, ["allowedOrgs"]))
+    config.writebackScope.allowedRepos = normalizeWritebackScopeArray(firstJsonStringArray(obj, ["allowedRepos"]))
+    config.writebackScope.deniedRepos = normalizeWritebackScopeArray(firstJsonStringArray(obj, ["deniedRepos"]))
+}
+
+func mergeLegacyRepoAllowlistIntoWritebackScope(config: MonitorConfig): Unit {
+    let merged = ArrayList<String>()
+    for (repo in config.writebackScope.allowedRepos) {
+        addUniqueWritebackScopeValue(merged, repo)
+    }
+    for (repo in config.repoAllowlist) {
+        addUniqueWritebackScopeValue(merged, repo)
+    }
+    config.writebackScope.allowedRepos = merged.toArray()
 }
 
 func gitCodeAuthPresent(config: MonitorConfig): Bool {
@@ -2318,6 +2427,68 @@ func repoAllowlisted(items: Array<String>, value: String): Bool {
         if (item.trimAscii().toAsciiLower() == expected) { return true }
     }
     false
+}
+
+func writebackScopeHasAllow(config: MonitorConfig): Bool {
+    config.writebackScope.allowedOrgs.size > 0 || config.writebackScope.allowedRepos.size > 0 || config.repoAllowlist.size > 0
+}
+
+func writebackOrgScopeIsValid(raw: String): Bool {
+    let value = raw.trimAscii()
+    !value.isEmpty() && !value.contains("/")
+}
+
+func writebackRepoScopeIsValid(raw: String): Bool {
+    let value = raw.trimAscii()
+    if (value.isEmpty()) { return false }
+    let parts = value.split("/")
+    parts.size == 2 && !parts[0].trimAscii().isEmpty() && !parts[1].trimAscii().isEmpty()
+}
+
+func normalizeWritebackRepoFullName(repoFullName: String): String {
+    if (!writebackRepoScopeIsValid(repoFullName)) { return "" }
+    let parts = repoFullName.trimAscii().split("/")
+    "${parts[0].trimAscii()}/${parts[1].trimAscii()}"
+}
+
+func normalizeWritebackScopeArray(items: Array<String>): Array<String> {
+    let out = ArrayList<String>()
+    for (item in items) {
+        addUniqueWritebackScopeValue(out, item)
+    }
+    out.toArray()
+}
+
+func addUniqueWritebackScopeValue(out: ArrayList<String>, raw: String): Unit {
+    let value = raw.trimAscii()
+    if (value.isEmpty()) { return }
+    let expected = value.toAsciiLower()
+    for (item in out) {
+        if (item.trimAscii().toAsciiLower() == expected) { return }
+    }
+    out.add(value)
+}
+
+func findWritebackRepoScopeMatch(items: Array<String>, normalizedRepo: String): String {
+    let expected = normalizedRepo.trimAscii().toAsciiLower()
+    for (item in items) {
+        let normalizedItem = normalizeWritebackRepoFullName(item)
+        if (!normalizedItem.isEmpty() && normalizedItem.toAsciiLower() == expected) {
+            return item.trimAscii()
+        }
+    }
+    ""
+}
+
+func findWritebackOrgScopeMatch(items: Array<String>, owner: String): String {
+    let expected = owner.trimAscii().toAsciiLower()
+    for (item in items) {
+        let value = item.trimAscii()
+        if (!value.isEmpty() && !value.contains("/") && value.toAsciiLower() == expected) {
+            return value
+        }
+    }
+    ""
 }
 
 func joinStrings(items: Array<String>, sep: String): String {

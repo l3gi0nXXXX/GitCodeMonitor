@@ -21,6 +21,16 @@ private class FakeNativeRawTransport <: NativeRawHttpTransport {
     }
 }
 
+private func loadConfigJsonForTest(name: String, body: String): MonitorConfig {
+    let dir = Path("/tmp/gcm-${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+    Directory.create(dir, recursive: true)
+    let path = dir.join("metis.json")
+    File.writeTo(path, body.toArray())
+    let config = loadConfig(path: path.toString())
+    try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    config
+}
+
 @Test
 public class GitCodeMonitorCoreTest {
     @TestCase
@@ -76,6 +86,45 @@ public class GitCodeMonitorCoreTest {
         File.writeTo(path, "{\"gitcode\":{\"authorPolicy\":{\"unknownEmailDecision\":\"record_only\"}}}".toArray())
         @Expect(validateConfig(loadConfig(path: path.toString())).contains("authorPolicy author_policy_unknown_email_decision"), true)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func writebackScopeConfigParsesAndMergesLegacyAllowlist(): Unit {
+        let orgScope = loadConfigJsonForTest("wb-scope-p1-ut-001", "{\"monitor\":{\"dryRun\":false,\"autoReply\":true,\"writebackScope\":{\"allowedOrgs\":[\" cangjie \"]}}}")
+        @Expect(orgScope.writebackScope.allowedOrgs.size, 1)
+        @Expect(orgScope.writebackScope.allowedOrgs[0], "cangjie")
+        @Expect(validateConfig(orgScope), "ok")
+
+        let repoScope = loadConfigJsonForTest("wb-scope-p1-ut-002", "{\"monitor\":{\"dryRun\":false,\"autoReply\":true,\"writebackScope\":{\"allowedRepos\":[\" Cangjie/community \"]}}}")
+        @Expect(repoScope.writebackScope.allowedRepos.size, 1)
+        @Expect(repoScope.writebackScope.allowedRepos[0], "Cangjie/community")
+        @Expect(validateConfig(repoScope), "ok")
+
+        let deniedScope = loadConfigJsonForTest("wb-scope-p1-ut-003", "{\"monitor\":{\"dryRun\":true,\"autoReply\":true,\"writebackScope\":{\"deniedRepos\":[\" Cangjie/experimental \"]}}}")
+        @Expect(deniedScope.writebackScope.deniedRepos.size, 1)
+        @Expect(deniedScope.writebackScope.deniedRepos[0], "Cangjie/experimental")
+        @Expect(validateConfig(deniedScope), "ok")
+
+        let legacy = loadConfigJsonForTest("wb-scope-p1-reg-001", "{\"monitor\":{\"dryRun\":false,\"autoReply\":true,\"repoAllowlist\":[\"Cangjie/community\"]}}")
+        @Expect(legacy.repoAllowlist.size, 1)
+        @Expect(legacy.writebackScope.allowedRepos.size, 1)
+        @Expect(legacy.writebackScope.allowedRepos[0], "Cangjie/community")
+        @Expect(validateConfig(legacy), "ok")
+    }
+
+    @TestCase
+    public func writebackScopeValidationRejectsInvalidLiveScopes(): Unit {
+        let dryRunEmptyScope = loadConfigJsonForTest("wb-scope-p1-bnd-001", "{\"monitor\":{\"dryRun\":true,\"autoReply\":true,\"writebackScope\":{}}}")
+        @Expect(validateConfig(dryRunEmptyScope), "ok")
+
+        let invalidOrg = loadConfigJsonForTest("wb-scope-p1-neg-001", "{\"monitor\":{\"dryRun\":false,\"autoReply\":true,\"writebackScope\":{\"allowedOrgs\":[\"Cangjie/community\"]}}}")
+        @Expect(validateConfig(invalidOrg).contains("invalid org scope"), true)
+
+        let invalidRepo = loadConfigJsonForTest("wb-scope-p1-neg-002", "{\"monitor\":{\"dryRun\":false,\"autoReply\":true,\"writebackScope\":{\"allowedRepos\":[\"Cangjie\"]}}}")
+        @Expect(validateConfig(invalidRepo).contains("invalid repo scope"), true)
+
+        let denyOnly = loadConfigJsonForTest("wb-scope-p2-neg-001", "{\"monitor\":{\"dryRun\":false,\"autoReply\":true,\"writebackScope\":{\"deniedRepos\":[\"Cangjie/community\"]}}}")
+        @Expect(validateConfig(denyOnly).contains("writebackScope has no allowed orgs or repos"), true)
     }
 
     @TestCase
@@ -712,6 +761,64 @@ public class GitCodeMonitorCoreTest {
         @Expect(url.contains("https://gitcode.com/cangjie/compiler/comments/"), true)
         @Expect(writebackGate(config, state, event, mcp).reason, "duplicate")
         @Expect(filterEvent(GitCodeEvent("self", "cangjie", "compiler", "issue", "1", "bot", "", "", writer.written[0])).reason, "self_marker")
+    }
+
+    @TestCase
+    public func evaluateWritebackScopeHonorsOrgRepoDenyTrimAndInvalidRepo(): Unit {
+        let orgConfig = defaultConfig()
+        orgConfig.dryRun = false
+        orgConfig.autoReply = true
+        orgConfig.writebackScope.allowedOrgs = [" cangjie "]
+        let orgDecision = evaluateWritebackScope(orgConfig, " Cangjie/community ")
+        @Expect(orgDecision.allowed, true)
+        @Expect(orgDecision.matchedBy, "allowed_org")
+
+        let repoConfig = defaultConfig()
+        repoConfig.dryRun = false
+        repoConfig.autoReply = true
+        repoConfig.writebackScope.allowedRepos = ["Cangjie/community"]
+        let repoDecision = evaluateWritebackScope(repoConfig, "cangjie/community")
+        @Expect(repoDecision.allowed, true)
+        @Expect(repoDecision.matchedBy, "allowed_repo")
+
+        let denyConfig = defaultConfig()
+        denyConfig.dryRun = false
+        denyConfig.autoReply = true
+        denyConfig.writebackScope.allowedOrgs = ["cangjie"]
+        denyConfig.writebackScope.deniedRepos = ["Cangjie/community"]
+        let denyDecision = evaluateWritebackScope(denyConfig, "Cangjie/community")
+        @Expect(denyDecision.allowed, false)
+        @Expect(denyDecision.reason, "repo_denied_by_writeback_scope")
+        @Expect(denyDecision.matchedBy, "denied_repo")
+
+        let invalidDecision = evaluateWritebackScope(orgConfig, "Cangjie/community/extra")
+        @Expect(invalidDecision.allowed, false)
+        @Expect(invalidDecision.reason, "invalid_repo_scope")
+    }
+
+    @TestCase
+    public func writebackGateUsesWritebackScopeAndLegacyAllowlist(): Unit {
+        let event = GitCodeEvent("evt", "cangjie", "compiler", "issue", "1", "alice", "", "", "need help")
+        let mcp = McpResult(true, draft: "safe reply", approved: true, needsHumanReview: false)
+
+        let orgConfig = defaultConfig()
+        orgConfig.dryRun = false
+        orgConfig.autoReply = true
+        orgConfig.writebackScope.allowedOrgs = ["cangjie"]
+        @Expect(writebackGate(orgConfig, MonitorState(), event, mcp).allowed, true)
+
+        let legacyConfig = defaultConfig()
+        legacyConfig.dryRun = false
+        legacyConfig.autoReply = true
+        legacyConfig.repoAllowlist = ["Cangjie/Compiler"]
+        @Expect(writebackGate(legacyConfig, MonitorState(), event, mcp).allowed, true)
+
+        let deniedConfig = defaultConfig()
+        deniedConfig.dryRun = false
+        deniedConfig.autoReply = true
+        deniedConfig.writebackScope.allowedOrgs = ["cangjie"]
+        deniedConfig.writebackScope.deniedRepos = ["Cangjie/compiler"]
+        @Expect(writebackGate(deniedConfig, MonitorState(), event, mcp).reason, "repo_denied_by_writeback_scope")
     }
 
     @TestCase
