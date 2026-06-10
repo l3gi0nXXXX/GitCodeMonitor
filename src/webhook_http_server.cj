@@ -2,6 +2,8 @@ package gitcodemonitor
 
 import std.collection.*
 import std.convert.Parsable
+import std.env.{getProcessId, getVariable}
+import std.fs.{Directory, File, Path, exists, OpenMode}
 import std.sync.*
 import std.time.*
 import stdx.net.http.*
@@ -102,25 +104,31 @@ public class WebhookHttpServerRuntime {
     }
 
     public func start(): WebhookHttpServerStartResult {
+        appendGcmListenerDiagnostic("start_enter", detail: "bind=${this.config.webhook.bindHost}:${this.config.webhook.port} enabled=${this.config.webhook.enabled}")
         synchronized(this.lock) {
             if (!this.config.webhook.enabled) {
                 this.listenerStatus = "disabled"
+                appendGcmListenerDiagnostic("start_disabled")
                 return WebhookHttpServerStartResult(false, "disabled", snapshot: this.snapshotLocked())
             }
             let validation = validateWebhookReceiverConfig(this.config.webhook)
             if (!validation.ok) {
                 this.listenerStatus = "degraded"
                 this.lastError = validation.status
+                appendGcmListenerDiagnostic("start_config_degraded", detail: "status=${validation.status}")
                 return WebhookHttpServerStartResult(false, validation.status, snapshot: this.snapshotLocked())
             }
             if (this.server.isSome()) {
+                appendGcmListenerDiagnostic("start_already_started")
                 return WebhookHttpServerStartResult(true, "already_started", snapshot: this.snapshotLocked())
             }
             try {
+                appendGcmListenerDiagnostic("server_build_enter", detail: "bind=${this.config.webhook.bindHost}:${this.config.webhook.port}")
                 let s = ServerBuilder()
                     .addr(this.config.webhook.bindHost)
                     .port(UInt16(this.config.webhook.port))
                     .build()
+                appendGcmListenerDiagnostic("server_build_done")
                 for (endpoint in this.config.webhook.endpoints) {
                     if (!endpoint.enabled) { continue }
                     s.distributor.register(endpoint.path, { ctx =>
@@ -137,12 +145,16 @@ public class WebhookHttpServerRuntime {
                 this.lastError = ""
                 this.serveWorkerDone = false
                 this.stopBounded = true
+                appendGcmListenerDiagnostic("serve_worker_spawn")
                 let worker = spawn {
                     var failed = false
                     var diagnostic = ""
+                    appendGcmListenerDiagnostic("serve_worker_enter")
                     try {
                         s.serve()
+                        appendGcmListenerDiagnostic("serve_returned")
                     } catch (e: Exception) {
+                        appendGcmListenerDiagnostic("serve_exception", detail: "stopRequested=${this.stopRequested.load()} errorHash=${redactServicePayload(e.message).rawHash}")
                         if (!this.stopRequested.load()) {
                             failed = true
                             diagnostic = redactServicePayload(e.message).rawHash
@@ -159,12 +171,15 @@ public class WebhookHttpServerRuntime {
                             this.listenerStatus = "stopped"
                         }
                     }
+                    appendGcmListenerDiagnostic("serve_worker_done", detail: "failed=${failed}")
                 }
                 this.serveWorker = Some<Future<Unit>>(worker)
+                appendGcmListenerDiagnostic("start_listening")
                 WebhookHttpServerStartResult(true, "listening", snapshot: this.snapshotLocked())
             } catch (e: Exception) {
                 this.listenerStatus = "degraded"
                 this.lastError = redactServicePayload(e.message).rawHash
+                appendGcmListenerDiagnostic("start_bind_failed", detail: "errorHash=${this.lastError}")
                 WebhookHttpServerStartResult(false, "bind_failed", snapshot: this.snapshotLocked())
             }
         }
@@ -174,14 +189,30 @@ public class WebhookHttpServerRuntime {
         let current = synchronized(this.lock) {
             let s = this.server
             let worker = this.serveWorker
+            let status = this.listenerStatus
+            let serveDone = this.serveWorkerDone
             this.server = None<Server>
             this.stopRequested.store(true)
             if (this.listenerStatus == "listening") { this.listenerStatus = "stopped" }
-            (s, worker)
+            (s, worker, status, serveDone)
         }
-        try { current[0]?.close() } catch (_: Exception) { () }
+        appendGcmListenerDiagnostic("stop_enter", detail: "serverPresent=${current[0].isSome()} workerPresent=${current[1].isSome()} statusBefore=${current[2]} serveWorkerDoneBefore=${current[3]}")
+        let closeStarted = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        appendGcmListenerDiagnostic("stop_server_close_enter", detail: "serverPresent=${current[0].isSome()}")
+        try {
+            current[0]?.close()
+            let closeEnded = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            appendGcmListenerDiagnostic("stop_server_close_done", detail: "durationMs=${if (closeEnded >= closeStarted) { closeEnded - closeStarted } else { 0 }}")
+        } catch (e: Exception) {
+            let closeEnded = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            appendGcmListenerDiagnostic("stop_server_close_exception", detail: "durationMs=${if (closeEnded >= closeStarted) { closeEnded - closeStarted } else { 0 }} errorHash=${redactServicePayload(e.message).rawHash}")
+        }
+        appendGcmListenerDiagnostic("stop_worker_cancel_enter", detail: "workerPresent=${current[1].isSome()}")
         current[1]?.cancel()
+        appendGcmListenerDiagnostic("stop_worker_cancel_done")
+        appendGcmListenerDiagnostic("stop_wait_worker_enter", detail: "timeoutMs=500")
         let bounded = this.waitServeWorkerDone(500)
+        appendGcmListenerDiagnostic("stop_wait_worker_done", detail: "bounded=${bounded}")
         synchronized(this.lock) {
             this.stopBounded = bounded
             if (!bounded) {
@@ -288,6 +319,43 @@ public class WebhookHttpServerRuntime {
         synchronized(this.lock) {
             this.serveWorkerDone
         }
+    }
+}
+
+private func appendGcmListenerDiagnostic(phase: String, detail!: String = ""): Unit {
+    let path = gcmListenerDiagnosticPath()
+    if (path.isEmpty()) { return }
+    let safePhase = phase.trimAscii()
+    if (safePhase.isEmpty()) { return }
+    let safeDetail = redactServicePayload(detail.trimAscii()).text
+    let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    let line = if (safeDetail.isEmpty()) {
+        "${nowMs} pid=${getProcessId()} phase=${safePhase}\n"
+    } else {
+        "${nowMs} pid=${getProcessId()} phase=${safePhase} ${safeDetail}\n"
+    }
+    try {
+        let target = Path(path)
+        let parent = target.parent
+        if (!exists(parent)) { Directory.create(parent, recursive: true) }
+        try (file = File(target, OpenMode.Append)) {
+            file.write(line.toArray())
+        }
+    } catch (_: Exception) {
+        ()
+    }
+}
+
+private func gcmListenerDiagnosticPath(): String {
+    let leasePath = match (getVariable("METIS_SERVICE_PLUGIN_LEASE_PATH")) {
+        case Some(value) => value.trimAscii()
+        case None => ""
+    }
+    if (leasePath.isEmpty()) { return "" }
+    try {
+        Path(leasePath).parent.join("listener-diagnostics.log").toString()
+    } catch (_: Exception) {
+        ""
     }
 }
 
