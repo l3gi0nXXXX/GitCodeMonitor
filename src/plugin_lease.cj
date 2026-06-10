@@ -77,12 +77,34 @@ public class GcmPluginOwnerSnapshot {
     public let portOwnerKnown: Bool
     public let portOwnerPid: Int64
     public let observedParentPid: Int64
+    public let pidProbeStatus: String
+    public let parentPidProbeStatus: String
+    public let observedParentPidStatus: String
 
-    public init(pidExists: Bool, portOwnerKnown: Bool, portOwnerPid: Int64, observedParentPid!: Int64 = 0) {
+    public init(
+        pidExists: Bool,
+        portOwnerKnown: Bool,
+        portOwnerPid: Int64,
+        observedParentPid!: Int64 = 0,
+        pidProbeStatus!: String = "",
+        parentPidProbeStatus!: String = "",
+        observedParentPidStatus!: String = "ok"
+    ) {
         this.pidExists = pidExists
         this.portOwnerKnown = portOwnerKnown
         this.portOwnerPid = portOwnerPid
         this.observedParentPid = observedParentPid
+        this.pidProbeStatus = if (pidProbeStatus.trimAscii().isEmpty()) {
+            if (pidExists) { "ok" } else { "pid_missing" }
+        } else {
+            pidProbeStatus.trimAscii()
+        }
+        this.parentPidProbeStatus = if (parentPidProbeStatus.trimAscii().isEmpty()) {
+            this.pidProbeStatus
+        } else {
+            parentPidProbeStatus.trimAscii()
+        }
+        this.observedParentPidStatus = observedParentPidStatus.trimAscii()
     }
 }
 
@@ -197,6 +219,9 @@ public func classifyGcmPluginLease(lease: GcmPluginLease, nowMs: Int64, heartbea
 }
 
 public func classifyGcmPluginOwner(lease: GcmPluginLease, snapshot: GcmPluginOwnerSnapshot): GcmPluginOwnerClassification {
+    if (snapshot.pidProbeStatus == "probe_unavailable" || snapshot.parentPidProbeStatus == "probe_unavailable") {
+        return GcmPluginOwnerClassification("probe_unavailable")
+    }
     if (!snapshot.pidExists) {
         return GcmPluginOwnerClassification("pid_missing")
     }
