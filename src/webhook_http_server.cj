@@ -6,6 +6,7 @@ import std.env.{getProcessId, getVariable}
 import std.fs.{Directory, File, Path, exists, OpenMode}
 import std.sync.*
 import std.time.*
+import stdx.log.*
 import stdx.net.http.*
 
 public class WebhookHttpServerSnapshot {
@@ -128,6 +129,7 @@ public class WebhookHttpServerRuntime {
                     .addr(this.config.webhook.bindHost)
                     .port(UInt16(this.config.webhook.port))
                     .build()
+                s.logger.level = LogLevel.OFF
                 appendGcmListenerDiagnostic("server_build_done")
                 for (endpoint in this.config.webhook.endpoints) {
                     if (!endpoint.enabled) { continue }

@@ -104,6 +104,16 @@ public class GitCodeWebhookETest {
         File.readFrom(Path(path)).size
     }
 
+    private func readProjectFile(path: String): String {
+        let candidates = [path, "../${path}"]
+        for (candidate in candidates) {
+            if (exists(Path(candidate))) {
+                return String.fromUtf8(File.readFrom(Path(candidate))).trimAscii()
+            }
+        }
+        ""
+    }
+
     @TestCase
     public func configParsesTopLevelAndGitCodeWebhookWithoutLeakingSecrets(): Unit {
         let dir = tempDir("gcm-webhook-config")
@@ -697,6 +707,16 @@ public class GitCodeWebhookETest {
         @Expect(snapshot.lastResponseStatus, 200)
         server.stop()
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Stress03WebhookServerDisablesStdXHttpLoggerBeforeServe(): Unit {
+        let source = readProjectFile("src/webhook_http_server.cj")
+        let beforeServe = source.split("s.serve()")[0]
+
+        @Expect(source.contains("import stdx.log.*"), true)
+        @Expect(source.contains("s.logger.level = LogLevel.OFF"), true)
+        @Expect(beforeServe.contains("s.logger.level = LogLevel.OFF"), true)
     }
 
     @TestCase
