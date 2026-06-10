@@ -451,9 +451,11 @@ private func shutdownGcmPluginRuntime(
     runtime: RuntimeContainer,
     state: MonitorState,
     leasePath: ?String,
+    heartbeat: ?GcmPluginLeaseHeartbeatRuntime,
     processorLoop: WebhookProcessorLoopRuntime,
     listener: WebhookHttpServerRuntime
 ): Unit {
+    heartbeat?.stop()
     let _ = runtime.store.save(state)
     match (leasePath) {
         case Some(path) =>
@@ -486,9 +488,13 @@ public func gcmPluginMain(args: Array<String>): Int64 {
     let processorLoop = WebhookProcessorLoopRuntime(loaded.config, runtime, state, queue)
     processorLoop.start(eventWriter: Some<GcmPluginStdioWriter>(writer))
     let startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    var heartbeatRuntime: ?GcmPluginLeaseHeartbeatRuntime = None<GcmPluginLeaseHeartbeatRuntime>
     let leasePath = match (buildGcmPluginLeaseFromEnv(loaded.config, startedAtMs)) {
         case Some((leasePath, lease, _)) =>
             let _ = writeGcmPluginLease(leasePath, lease)
+            let heartbeat = GcmPluginLeaseHeartbeatRuntime(leasePath, lease)
+            heartbeat.start()
+            heartbeatRuntime = Some<GcmPluginLeaseHeartbeatRuntime>(heartbeat)
             Some<String>(leasePath)
         case None => None<String>
     }
@@ -519,16 +525,16 @@ public func gcmPluginMain(args: Array<String>): Int64 {
                         startGcmScanJobWorker(handled.asyncJobId, loaded.config, runtime, state, jobs, writer)
                     }
                     if (handled.shouldStop) {
-                        shutdownGcmPluginRuntime(runtime, state, leasePath, processorLoop, listener)
+                        shutdownGcmPluginRuntime(runtime, state, leasePath, heartbeatRuntime, processorLoop, listener)
                         return 0
                     }
                 case None =>
-                    shutdownGcmPluginRuntime(runtime, state, leasePath, processorLoop, listener)
+                    shutdownGcmPluginRuntime(runtime, state, leasePath, heartbeatRuntime, processorLoop, listener)
                     return 0
             }
         }
     } catch (_: Exception) {
-        shutdownGcmPluginRuntime(runtime, state, leasePath, processorLoop, listener)
+        shutdownGcmPluginRuntime(runtime, state, leasePath, heartbeatRuntime, processorLoop, listener)
         return 2
     }
     0

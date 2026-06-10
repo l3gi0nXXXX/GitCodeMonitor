@@ -53,6 +53,25 @@ public class GitCodeMonitorPluginLeaseTest {
     }
 
     @TestCase
+    public func p7u002LeaseHeartbeatOnceUpdatesTimestampWithoutOrphanWatchdogSemantics(): Unit {
+        // T-P7-U-002
+        let dir = tempDir("gcm-lease-heartbeat-once")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-heartbeat", 101, 202, "127.0.0.1", 19096, 1000, 1000, "running", "old")
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+
+        let heartbeat = gcmPluginLeaseHeartbeatOnce(path, lease, 8000)
+        @Expect(heartbeat.ok, true)
+        let reloaded = readGcmPluginLease(path).lease
+        @Expect(reloaded.state, "running")
+        @Expect(reloaded.lastHeartbeatMs, 8000)
+        @Expect(reloaded.orphanReason, "")
+        @Expect(reloaded.pid, 101)
+        @Expect(reloaded.parentPid, 202)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func p2u002LeaseBaseRecordSemanticsStayStable(): Unit {
         // T-P2-U-002
         let dir = tempDir("gcm-p2-u002-lease-semantics")

@@ -331,6 +331,20 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(runtimeSource.contains("METIS_SERVICE_PLUGIN_STDIN_PATH"), true)
         @Expect(runtimeSource.contains("File(gcmPluginStdinPath(), OpenMode.Read)"), true)
         @Expect(runtimeSource.contains("StringReader<File>"), true)
+        @Expect(runtimeSource.contains("GcmPluginLeaseHeartbeatRuntime"), true)
+    }
+
+    @TestCase
+    public func p1u004PluginStdioStartsLeaseHeartbeatWithoutWatchdogRuntime(): Unit {
+        // T-P1-U-004
+        let runtimeSource = readFixture("src/plugin_runtime.cj")
+        let heartbeatSource = readFixture("src/plugin_lease_heartbeat.cj")
+        @Expect(runtimeSource.contains("GcmPluginLeaseHeartbeatRuntime"), true)
+        @Expect(runtimeSource.contains("heartbeatRuntime"), true)
+        @Expect(runtimeSource.contains("GcmPluginWatchdogRuntime"), false)
+        @Expect(heartbeatSource.contains("parentPid"), false)
+        @Expect(heartbeatSource.contains("orphan_detected"), false)
+        @Expect(heartbeatSource.contains("gcmPluginLeaseHeartbeatOnce"), true)
     }
 
     @TestCase
