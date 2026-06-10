@@ -233,19 +233,14 @@ public class WebhookHttpServerRuntime {
             this.activeRequestCount++
         }
         let response = handleWebhookHealthzRequest()
-        let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
-        synchronized(this.lock) {
-            this.lastRequestAtMs = ended
-            this.lastResponseStatus = response.statusCode
-            this.lastRequestDurationMs = if (ended >= started) { ended - started } else { 0 }
-            this.healthzCount++
-            if (this.activeRequestCount > 0) { this.activeRequestCount-- }
+        try {
+            this.writeWebhookHttpResponse(ctx, response)
+            this.finishHealthzRequest(started, response.statusCode)
+        } catch (e: Exception) {
+            let diagnostic = redactServicePayload(e.message).rawHash
+            appendGcmListenerDiagnostic("healthz_response_exception", detail: "errorHash=${diagnostic}")
+            this.finishHealthzRequest(started, 500, error: diagnostic)
         }
-        ctx.responseBuilder.status(UInt16(response.statusCode))
-        for ((key, value) in response.headers) {
-            ctx.responseBuilder.header(key, value)
-        }
-        ctx.responseBuilder.body(response.body)
     }
 
     private func handleHttpContext(ctx: HttpContext, routePath: String): Unit {
@@ -253,36 +248,63 @@ public class WebhookHttpServerRuntime {
         synchronized(this.lock) {
             this.activeRequestCount++
         }
-        let read = readWebhookRequestBody(ctx, this.config.webhook.maxBodyBytes + 1)
-        let response = if (read.ok) {
-            handleWebhookHttpServerRequest(
-                this.config,
-                this.queue,
-                convertWebhookHttpRequest(
-                    ctx.request.method,
-                    routePath,
-                    collectWebhookHeaders(ctx),
-                    read.body,
-                    webhookRequestRemoteAddress(ctx)
+        try {
+            let read = readWebhookRequestBody(ctx, this.config.webhook.maxBodyBytes + 1)
+            let response = if (read.ok) {
+                handleWebhookHttpServerRequest(
+                    this.config,
+                    this.queue,
+                    convertWebhookHttpRequest(
+                        ctx.request.method,
+                        routePath,
+                        collectWebhookHeaders(ctx),
+                        read.body,
+                        webhookRequestRemoteAddress(ctx)
+                    )
                 )
-            )
-        } else {
-            WebhookHttpResponse(if (read.status == "payload_too_large") { 413 } else { 408 }, read.status)
+            } else {
+                WebhookHttpResponse(if (read.status == "payload_too_large") { 413 } else { 408 }, read.status)
+            }
+            this.writeWebhookHttpResponse(ctx, response)
+            this.finishWebhookRequest(started, response.statusCode)
+        } catch (e: Exception) {
+            let diagnostic = redactServicePayload(e.message).rawHash
+            appendGcmListenerDiagnostic("webhook_response_exception", detail: "route=${routePath} errorHash=${diagnostic}")
+            this.finishWebhookRequest(started, 500, error: diagnostic)
         }
+    }
+
+    private func finishHealthzRequest(started: Int64, statusCode: Int64, error!: String = ""): Unit {
         let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
         synchronized(this.lock) {
             this.lastRequestAtMs = ended
-            this.lastResponseStatus = response.statusCode
+            this.lastResponseStatus = statusCode
             this.lastRequestDurationMs = if (ended >= started) { ended - started } else { 0 }
-            if (response.statusCode >= 200 && response.statusCode < 300) {
+            if (!error.isEmpty()) { this.lastError = error }
+            this.healthzCount++
+            if (this.activeRequestCount > 0) { this.activeRequestCount-- }
+        }
+    }
+
+    private func finishWebhookRequest(started: Int64, statusCode: Int64, error!: String = ""): Unit {
+        let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        synchronized(this.lock) {
+            this.lastRequestAtMs = ended
+            this.lastResponseStatus = statusCode
+            this.lastRequestDurationMs = if (ended >= started) { ended - started } else { 0 }
+            if (!error.isEmpty()) { this.lastError = error }
+            if (statusCode >= 200 && statusCode < 300) {
                 this.acceptedCount++
             } else {
                 this.rejectedCount++
             }
             if (this.activeRequestCount > 0) { this.activeRequestCount-- }
         }
+    }
+
+    private func writeWebhookHttpResponse(ctx: HttpContext, response: WebhookHttpResponse): Unit {
         ctx.responseBuilder.status(UInt16(response.statusCode))
-        for ((key, value) in response.headers) {
+        for ((key, value) in webhookHttpResponseWireHeaders(response)) {
             ctx.responseBuilder.header(key, value)
         }
         ctx.responseBuilder.body(response.body)
@@ -369,6 +391,21 @@ public func handleWebhookHttpServerRequest(config: MonitorConfig, queue: Webhook
 
 public func handleWebhookHealthzRequest(): WebhookHttpResponse {
     WebhookHttpResponse(200, "ok")
+}
+
+public func webhookHttpResponseWireHeaders(response: WebhookHttpResponse): Array<(String, String)> {
+    let headers = ArrayList<(String, String)>()
+    var hasConnection = false
+    var hasContentLength = false
+    for ((key, value) in response.headers) {
+        let lower = key.trimAscii().toAsciiLower()
+        if (lower == "connection") { hasConnection = true }
+        if (lower == "content-length") { hasContentLength = true }
+        headers.add((key, value))
+    }
+    if (!hasConnection) { headers.add(("Connection", "close")) }
+    if (!hasContentLength) { headers.add(("Content-Length", "${response.body.toArray().size}")) }
+    headers.toArray()
 }
 
 public func collectWebhookHeaders(ctx: HttpContext): Array<(String, String)> {

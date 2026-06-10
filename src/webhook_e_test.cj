@@ -521,6 +521,9 @@ public class GitCodeWebhookETest {
         @Expect(healthz.headers[0][0].toAsciiLower(), "content-type")
         @Expect(healthz.body.contains("token"), false)
         @Expect(healthz.body.contains("{"), false)
+        let wireHeaders = webhookHttpResponseWireHeaders(healthz)
+        @Expect(webhookHeader(wireHeaders, ["Connection"]), "close")
+        @Expect(webhookHeader(wireHeaders, ["Content-Length"]), "2")
     }
 
     @TestCase
@@ -656,6 +659,42 @@ public class GitCodeWebhookETest {
         @Expect(yielded, true)
         @Expect(loop.snapshot().processorStatus, "running")
         @Expect(queue.countByStatus("dead-letter"), 0)
+        server.stop()
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1Stress02HealthzBurstKeepsRuntimeListening(): Unit {
+        let dir = tempDir("gcm-webhook-p1-healthz-burst")
+        let config = enabledConfig(dir.join("queue").toString())
+        let port = 19100 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 1000)
+        config.webhook = WebhookReceiverConfig(
+            enabled: true,
+            bindHost: config.webhook.bindHost,
+            port: port,
+            publicBaseUrl: config.webhook.publicBaseUrl,
+            maxBodyBytes: config.webhook.maxBodyBytes,
+            queueDir: config.webhook.queueDir,
+            endpoints: config.webhook.endpoints,
+            processor: config.webhook.processor
+        )
+        let server = WebhookHttpServerRuntime(config, WebhookQueue(config.webhook.queueDir))
+        @Expect(server.start().ok, true)
+        sleep(Duration.millisecond * 20)
+
+        let curl = CurlHttpSender()
+        var healthzOk: Int64 = 0
+        for (_ in 0..40) {
+            let healthz = curl.send(HttpRequestSpec("GET", "http://127.0.0.1:${port}/healthz"))
+            if (healthz.statusCode == 200 && healthz.body.trimAscii() == "ok") { healthzOk++ }
+        }
+        let snapshot = server.snapshot()
+
+        @Expect(healthzOk, 40)
+        @Expect(snapshot.listenerStatus, "listening")
+        @Expect(snapshot.healthzCount, 40)
+        @Expect(snapshot.activeRequestCount, 0)
+        @Expect(snapshot.lastResponseStatus, 200)
         server.stop()
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
