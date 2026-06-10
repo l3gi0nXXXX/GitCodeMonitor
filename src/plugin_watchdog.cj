@@ -87,6 +87,7 @@ public class GcmPluginOrphanHandleResult {
     }
 }
 
+// Historical compatibility runtime; gcmPluginMain no longer starts it in production.
 public class GcmPluginWatchdogRuntime {
     private let leasePath: String
     private let baseLease: GcmPluginLease

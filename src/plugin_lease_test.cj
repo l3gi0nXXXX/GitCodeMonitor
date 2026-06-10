@@ -53,6 +53,46 @@ public class GitCodeMonitorPluginLeaseTest {
     }
 
     @TestCase
+    public func p2u002LeaseBaseRecordSemanticsStayStable(): Unit {
+        // T-P2-U-002
+        let dir = tempDir("gcm-p2-u002-lease-semantics")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(
+            GCM_SERVICE_PLUGIN_ID,
+            "session-p2-u002",
+            3001,
+            4002,
+            "127.0.0.1",
+            19095,
+            11000,
+            12000,
+            "running",
+            ""
+        )
+
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+        let loaded = readGcmPluginLease(path)
+        @Expect(loaded.ok, true)
+        @Expect(loaded.lease.pluginId, GCM_SERVICE_PLUGIN_ID)
+        @Expect(loaded.lease.sessionId, "session-p2-u002")
+        @Expect(loaded.lease.pid, 3001)
+        @Expect(loaded.lease.parentPid, 4002)
+        @Expect(loaded.lease.bindHost, "127.0.0.1")
+        @Expect(loaded.lease.port, 19095)
+        @Expect(loaded.lease.startedAtMs, 11000)
+        @Expect(loaded.lease.lastHeartbeatMs, 12000)
+        @Expect(loaded.lease.state, "running")
+        @Expect(loaded.lease.orphanReason, "")
+        @Expect(classifyGcmPluginLease(loaded.lease, 12500, heartbeatTtlMs: 10000).status, "running")
+        @Expect(markGcmPluginLeaseStopped(path, nowMs: 13000).ok, true)
+        let stopped = readGcmPluginLease(path)
+        @Expect(stopped.lease.state, "stopped")
+        @Expect(stopped.lease.lastHeartbeatMs, 13000)
+        @Expect(stopped.lease.orphanReason, "")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func oprB002ClassifiesPidAndPortOwnerMismatchWithoutKill(): Unit {
         let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-b002", 1111, 2222, "127.0.0.1", 19082, 10000, 11000, "running", "")
         let missingPid = classifyGcmPluginOwner(lease, GcmPluginOwnerSnapshot(false, false, 0))

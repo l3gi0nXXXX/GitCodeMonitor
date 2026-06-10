@@ -66,10 +66,9 @@ public func requiredGitCodeMonitorCapabilityIds(): Array<String> {
         "gitcode.monitor.scan_completed",
         "gitcode.monitor.scan_failed",
         "gitcode.monitor.scan_cancelled",
+        "gitcode.monitor.orphan_detected",
         "gitcode.event.accepted",
         "gitcode.event.ignored",
-        "gitcode.agent.draft_request",
-        "gitcode.notification.generated_reply",
         "gitcode.writeback.apply_result",
         "gitcode.writeback.audit"
     ]
@@ -191,11 +190,18 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         outputSchema: "schemas/gitcode.monitor.scan_cancelled.event.json"
     ))
     records.add(ServiceCapabilityRecord(
+        "gitcode.monitor.orphan_detected",
+        "event",
+        direction: "gcm-to-metis",
+        description: "historical diagnostic compatibility event for orphaned GitCode Monitor plugin processes; production runtime no longer emits it from the GCM built-in watchdog loop",
+        outputSchema: "schemas/gitcode.monitor.orphan_detected.event.json"
+    ))
+    records.add(ServiceCapabilityRecord(
         "gitcode.event.accepted",
         "event",
         direction: "gcm-to-metis",
-        description: "Accepted GitCode issue/PR/comment event",
-        outputSchema: "schemas/gitcode.event.accepted.json"
+        description: "Accepted GitCode issue/PR/comment event; legacy top-level fields coexist with contractVersion and reviewRequest, and accepted comment events may include reviewRequest.context parent/previous-comment facts",
+        outputSchema: "schemas/gitcode.event.accepted.contract-v1-plus-legacy.json"
     ))
     records.add(ServiceCapabilityRecord(
         "gitcode.event.ignored",
@@ -203,20 +209,6 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         direction: "gcm-to-metis",
         description: "Ignored GitCode event audit",
         outputSchema: "schemas/gitcode.event.ignored.json"
-    ))
-    records.add(ServiceCapabilityRecord(
-        "gitcode.agent.draft_request",
-        "agentRequest",
-        direction: "gcm-to-metis",
-        description: "Request summary/draft/safety/citations from Metis Agent Runtime",
-        requiredHostApis: ["host.agent.invoke"]
-    ))
-    records.add(ServiceCapabilityRecord(
-        "gitcode.notification.generated_reply",
-        "notificationTopic",
-        direction: "metis-internal-delivery",
-        description: "Metis-delivered generated reply notification",
-        requiredHostApis: ["host.notification.publish"]
     ))
     records.add(ServiceCapabilityRecord(
         "gitcode.writeback.apply_result",
@@ -250,20 +242,6 @@ public func validateGitCodeMonitorCapabilitySet(records: ArrayList<ServiceCapabi
     }
 
     let degraded = ArrayList<String>()
-    match (seen.get("gitcode.agent.draft_request")) {
-        case Some(record) =>
-            if (!arrayContains(record.requiredHostApis, "host.agent.invoke")) {
-                degraded.add("gitcode.agent.draft_request")
-            }
-        case None => ()
-    }
-    match (seen.get("gitcode.notification.generated_reply")) {
-        case Some(record) =>
-            if (!arrayContains(record.requiredHostApis, "host.notification.publish")) {
-                degraded.add("gitcode.notification.generated_reply")
-            }
-        case None => ()
-    }
 
     let diagnostics = ArrayList<String>()
     for (id in missing) { diagnostics.add("missing capability: ${id}") }

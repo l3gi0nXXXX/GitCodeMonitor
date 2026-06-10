@@ -456,13 +456,11 @@ public func gcmPluginMain(args: Array<String>): Int64 {
     let processorLoop = WebhookProcessorLoopRuntime(loaded.config, runtime, state, queue)
     processorLoop.start(eventWriter: Some<GcmPluginStdioWriter>(writer))
     let startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-    let leaseRuntime = match (buildGcmPluginLeaseFromEnv(loaded.config, startedAtMs)) {
-        case Some((leasePath, lease, forceOrphan)) =>
+    let leasePath = match (buildGcmPluginLeaseFromEnv(loaded.config, startedAtMs)) {
+        case Some((leasePath, lease, _)) =>
             let _ = writeGcmPluginLease(leasePath, lease)
-            let watchdog = GcmPluginWatchdogRuntime(leasePath, lease, writer, listener, processorLoop, forceOrphan: forceOrphan)
-            watchdog.start()
-            Some<(String, GcmPluginWatchdogRuntime)>((leasePath, watchdog))
-        case None => None<(String, GcmPluginWatchdogRuntime)>
+            Some<String>(leasePath)
+        case None => None<String>
     }
     let initResult = buildGcmPluginInitializeResult(
         loaded.config,
@@ -496,10 +494,9 @@ public func gcmPluginMain(args: Array<String>): Int64 {
                 }
                 if (handled.shouldStop) {
                     let _ = runtime.store.save(state)
-                    match (leaseRuntime) {
-                        case Some((leasePath, watchdog)) =>
-                            watchdog.stop()
-                            let _ = markGcmPluginLeaseStopped(leasePath, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
+                    match (leasePath) {
+                        case Some(path) =>
+                            let _ = markGcmPluginLeaseStopped(path, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
                         case None => ()
                     }
                     processorLoop.stop()
@@ -508,10 +505,9 @@ public func gcmPluginMain(args: Array<String>): Int64 {
                 }
             case None =>
                 let _ = runtime.store.save(state)
-                match (leaseRuntime) {
-                    case Some((leasePath, watchdog)) =>
-                        watchdog.stop()
-                        let _ = markGcmPluginLeaseStopped(leasePath, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
+                match (leasePath) {
+                    case Some(path) =>
+                        let _ = markGcmPluginLeaseStopped(path, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
                     case None => ()
                 }
                 processorLoop.stop()

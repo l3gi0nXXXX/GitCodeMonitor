@@ -193,7 +193,7 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         "gitcode.monitor.orphan_detected",
         "event",
         direction: "gcm-to-metis",
-        description: "GitCode Monitor service-plugin parent lease watchdog detected an orphaned plugin process",
+        description: "historical diagnostic compatibility event for orphaned GitCode Monitor plugin processes; production runtime no longer emits it from the GCM built-in watchdog loop",
         outputSchema: "schemas/gitcode.monitor.orphan_detected.event.json"
     ))
     records.add(ServiceCapabilityRecord(

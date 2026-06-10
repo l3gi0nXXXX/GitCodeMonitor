@@ -198,6 +198,175 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func p1u001RuntimeInitializationWritesLeaseWithoutStartingWatchdogWorker(): Unit {
+        // T-P1-U-001
+        let dir = tempRuntimeDir("gcm-p1-u001-lease-only")
+        let leasePath = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p1-u001", 101, 202, "127.0.0.1", 19091, 1000, 1000, "running", "")
+
+        @Expect(writeGcmPluginLease(leasePath, lease).ok, true)
+        let loaded = readGcmPluginLease(leasePath)
+        @Expect(loaded.ok, true)
+        @Expect(loaded.lease.state, "running")
+        @Expect(loaded.lease.lastHeartbeatMs, 1000)
+
+        let runtimeSource = readFixture("src/plugin_runtime.cj")
+        @Expect(runtimeSource.contains("GcmPluginWatchdogRuntime"), false)
+        @Expect(runtimeSource.contains("watchdog.start()"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1u002RuntimeStopMarksLeaseStoppedWithoutWatchdogStopDependency(): Unit {
+        // T-P1-U-002
+        let dir = tempRuntimeDir("gcm-p1-u002-stop-lease")
+        let leasePath = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p1-u002", 101, 202, "127.0.0.1", 19092, 1000, 1000, "running", "parent_lost")
+
+        @Expect(writeGcmPluginLease(leasePath, lease).ok, true)
+        @Expect(markGcmPluginLeaseStopped(leasePath, nowMs: 2000).ok, true)
+        let stopped = readGcmPluginLease(leasePath)
+        @Expect(stopped.ok, true)
+        @Expect(stopped.lease.state, "stopped")
+        @Expect(stopped.lease.lastHeartbeatMs, 2000)
+        @Expect(stopped.lease.orphanReason, "")
+
+        let runtimeSource = readFixture("src/plugin_runtime.cj")
+        @Expect(runtimeSource.contains("watchdog.stop()"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1b001MissingLeaseEnvironmentKeepsBasicCapabilities(): Unit {
+        // T-P1-B-001
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        let leaseFromEnv = buildGcmPluginLeaseFromEnv(config, 1000)
+        @Expect(leaseFromEnv.isNone(), true)
+
+        let initResult = buildGcmPluginInitializeResult(config)
+        @Expect(initResult.ok, true)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.monitor.status"), true)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.monitor.scan_once"), true)
+        @Expect(arrayContains(requiredGitCodeMonitorCapabilityIds(), "gitcode.monitor.orphan_detected"), true)
+    }
+
+    @TestCase
+    public func p1b002LeaseWriteFailureDoesNotBreakStdioProtocol(): Unit {
+        // T-P1-B-002
+        let dir = tempRuntimeDir("gcm-p1-b002-lease-write-failed")
+        let badParent = dir.join("lease-parent-file")
+        File.writeTo(badParent, "not-a-directory".toArray())
+        let badLeasePath = badParent.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p1-b002", 101, 202, "127.0.0.1", 19093, 1000, 1000, "running", "")
+        let writeFailed = writeGcmPluginLease(badLeasePath, lease)
+        @Expect(writeFailed.ok, false)
+        @Expect(writeFailed.status, "lease_write_failed")
+
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = dir.join("state.json").toString()
+        config.webhook = WebhookReceiverConfig(enabled: false, queueDir: dir.join("queue").toString())
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
+        let statusFrame = ServiceFrame("request", "status-p1-b002", GCM_SERVICE_PLUGIN_ID, method: "invokeCapability", capabilityId: "gitcode.monitor.status", correlationId: "corr-p1-b002-status", payload: "{}")
+        let stopFrame = ServiceFrame("request", "stop-p1-b002", GCM_SERVICE_PLUGIN_ID, method: "stop", correlationId: "corr-p1-b002-stop", payload: "{}")
+        let out = handleGcmPluginInputLinesForTest([encodeServiceFrame(statusFrame).trimAscii(), encodeServiceFrame(stopFrame).trimAscii()], config, runtime, state)
+
+        @Expect(out.size, 2)
+        @Expect(decodeServiceFrame(out[0]).ok, true)
+        @Expect(decodeServiceFrame(out[0]).frame.correlationId, "corr-p1-b002-status")
+        @Expect(decodeServiceFrame(out[1]).ok, true)
+        @Expect(decodeServiceFrame(out[1]).frame.correlationId, "corr-p1-b002-stop")
+        @Expect(out[0].contains("lease_write_failed"), false)
+        @Expect(out[1].contains("lease_write_failed"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p1n001StopOrEofShutdownMarksLeaseStoppedAndStopsRuntimes(): Unit {
+        // T-P1-N-001
+        let dir = tempRuntimeDir("gcm-p1-n001-stop-eof")
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = dir.join("state.json").toString()
+        config.webhook = WebhookReceiverConfig(enabled: false, queueDir: dir.join("queue").toString())
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
+        let queue = WebhookQueue(config.webhook.queueDir)
+        let listener = WebhookHttpServerRuntime(config, queue)
+        let _ = listener.start()
+        let processorLoop = WebhookProcessorLoopRuntime(config, runtime, state, queue)
+        processorLoop.start()
+        let leasePath = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p1-n001", 101, 202, "127.0.0.1", 19094, 1000, 1000, "running", "")
+        @Expect(writeGcmPluginLease(leasePath, lease).ok, true)
+
+        let stopFrame = ServiceFrame("request", "stop-p1-n001", GCM_SERVICE_PLUGIN_ID, method: "stop", correlationId: "corr-p1-n001-stop", payload: "{}")
+        let handled = handleGcmPluginInputLineWithJobs(encodeServiceFrame(stopFrame).trimAscii(), config, runtime, state, GcmScanJobStore(maxConcurrent: 1))
+        @Expect(handled.shouldStop, true)
+
+        let _ = runtime.store.save(state)
+        @Expect(markGcmPluginLeaseStopped(leasePath, nowMs: 2000).ok, true)
+        processorLoop.stop()
+        listener.stop()
+
+        @Expect(exists(Path(config.statePath)), true)
+        @Expect(readGcmPluginLease(leasePath).lease.state, "stopped")
+        let processorStatus = processorLoop.snapshot().processorStatus
+        @Expect(processorStatus == "disabled" || processorStatus == "stopped", true)
+        let listenerStatus = listener.snapshot().listenerStatus
+        @Expect(listenerStatus == "disabled" || listenerStatus == "stopped", true)
+        let runtimeSource = readFixture("src/plugin_runtime.cj")
+        @Expect(runtimeSource.contains("watchdog.stop()"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func p2u001OrphanCapabilityRemainsAsHistoricalDiagnosticCompatibility(): Unit {
+        // T-P2-U-001
+        let records = buildGitCodeMonitorCapabilityDeclarations()
+        var orphanDescription = ""
+        for (record in records) {
+            if (record.capabilityId == "gitcode.monitor.orphan_detected") {
+                orphanDescription = record.description
+            }
+        }
+        @Expect(orphanDescription.isEmpty(), false)
+        @Expect(orphanDescription.contains("historical"), true)
+        @Expect(orphanDescription.contains("diagnostic"), true)
+        @Expect(orphanDescription.contains("no longer"), true)
+        @Expect(orphanDescription.contains("built-in watchdog"), true)
+        @Expect(buildGitCodeMonitorServicePluginManifest().contains("gitcode.monitor.orphan_detected"), true)
+        @Expect(validateGitCodeMonitorCapabilitySet(records).ok, true)
+    }
+
+    @TestCase
+    public func p2n001ProductionIdleStdioPathDoesNotEmitOrphanFrame(): Unit {
+        // T-P2-N-001
+        let dir = tempRuntimeDir("gcm-p2-n001-no-orphan")
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.statePath = dir.join("state.json").toString()
+        config.webhook = WebhookReceiverConfig(enabled: false, queueDir: dir.join("queue").toString())
+        let runtime = RuntimeContainer(config)
+        let state = runtime.store.load()
+        let statusFrame = ServiceFrame("request", "status-p2-n001", GCM_SERVICE_PLUGIN_ID, method: "invokeCapability", capabilityId: "gitcode.monitor.status", correlationId: "corr-p2-n001-status", payload: "{}")
+        let stopFrame = ServiceFrame("request", "stop-p2-n001", GCM_SERVICE_PLUGIN_ID, method: "stop", correlationId: "corr-p2-n001-stop", payload: "{}")
+        let out = handleGcmPluginInputLinesForTest([encodeServiceFrame(statusFrame).trimAscii(), encodeServiceFrame(stopFrame).trimAscii()], config, runtime, state)
+
+        @Expect(out.size, 2)
+        for (line in out) {
+            @Expect(line.contains("gitcode.monitor.orphan_detected"), false)
+            @Expect(line.contains("orphan_detected"), false)
+        }
+        let runtimeSource = readFixture("src/plugin_runtime.cj")
+        @Expect(runtimeSource.contains("gcmPluginOrphanDetectedFrame("), false)
+        @Expect(runtimeSource.contains("GcmPluginWatchdogRuntime"), false)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func configResolutionSecretSummaryAndValidationAreExplicit(): Unit {
         @Expect(resolveGcmPluginConfig("").ok, false)
         let config = defaultConfig()
