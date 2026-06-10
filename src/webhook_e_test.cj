@@ -661,6 +661,35 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func gcmListenerU001StopReportsBoundedServeWorkerShutdown(): Unit {
+        // GCM-LISTENER-U-001
+        let dir = tempDir("gcm-listener-u001")
+        let config = enabledConfig(dir.join("queue").toString())
+        let port = 19200 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 1000)
+        config.webhook = WebhookReceiverConfig(
+            enabled: true,
+            bindHost: config.webhook.bindHost,
+            port: port,
+            publicBaseUrl: config.webhook.publicBaseUrl,
+            maxBodyBytes: config.webhook.maxBodyBytes,
+            queueDir: config.webhook.queueDir,
+            endpoints: config.webhook.endpoints,
+            processor: config.webhook.processor
+        )
+        let server = WebhookHttpServerRuntime(config, WebhookQueue(config.webhook.queueDir))
+
+        @Expect(server.start().ok, true)
+        sleep(Duration.millisecond * 20)
+        server.stop()
+        let stopped = server.snapshot()
+
+        @Expect(stopped.listenerStatus == "stopped" || stopped.listenerStatus == "disabled" || stopped.listenerStatus == "not_started", true)
+        @Expect(stopped.serveWorkerDone, true)
+        @Expect(stopped.stopBounded, true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func p8E2e02FakeHttpPostQueuesProcessesAndEmitsAcceptedFrame(): Unit {
         let dir = tempDir("gcm-webhook-p8-e2e")
         let config = enabledConfig(dir.join("queue").toString())

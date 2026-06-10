@@ -18,6 +18,8 @@ public class WebhookHttpServerSnapshot {
     public let lastRequestDurationMs: Int64
     public let healthzCount: Int64
     public let activeRequestCount: Int64
+    public let serveWorkerDone: Bool
+    public let stopBounded: Bool
 
     public init(
         status: String,
@@ -30,7 +32,9 @@ public class WebhookHttpServerSnapshot {
         lastResponseStatus!: Int64 = 0,
         lastRequestDurationMs!: Int64 = 0,
         healthzCount!: Int64 = 0,
-        activeRequestCount!: Int64 = 0
+        activeRequestCount!: Int64 = 0,
+        serveWorkerDone!: Bool = true,
+        stopBounded!: Bool = true
     ) {
         this.listenerStatus = status.trimAscii()
         this.bind = bind.trimAscii()
@@ -43,6 +47,8 @@ public class WebhookHttpServerSnapshot {
         this.lastRequestDurationMs = lastRequestDurationMs
         this.healthzCount = healthzCount
         this.activeRequestCount = activeRequestCount
+        this.serveWorkerDone = serveWorkerDone
+        this.stopBounded = stopBounded
     }
 }
 
@@ -74,7 +80,9 @@ public class WebhookHttpServerRuntime {
     private let config: MonitorConfig
     private let queue: WebhookQueue
     private let lock = Mutex()
+    private let stopRequested = AtomicBool(false)
     private var server: Option<Server> = None
+    private var serveWorker: Option<Future<Unit>> = None
     private var listenerStatus: String = "not_started"
     private var startedAtMs: Int64 = 0
     private var lastRequestAtMs: Int64 = 0
@@ -85,6 +93,8 @@ public class WebhookHttpServerRuntime {
     private var lastRequestDurationMs: Int64 = 0
     private var healthzCount: Int64 = 0
     private var activeRequestCount: Int64 = 0
+    private var serveWorkerDone: Bool = true
+    private var stopBounded: Bool = true
 
     public init(config: MonitorConfig, queue: WebhookQueue) {
         this.config = config
@@ -121,20 +131,36 @@ public class WebhookHttpServerRuntime {
                     this.handleHealthzContext(ctx)
                 })
                 this.server = Some<Server>(s)
+                this.stopRequested.store(false)
                 this.listenerStatus = "listening"
                 this.startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                 this.lastError = ""
-                spawn {
+                this.serveWorkerDone = false
+                this.stopBounded = true
+                let worker = spawn {
+                    var failed = false
+                    var diagnostic = ""
                     try {
                         s.serve()
                     } catch (e: Exception) {
-                        synchronized(this.lock) {
+                        if (!this.stopRequested.load()) {
+                            failed = true
+                            diagnostic = redactServicePayload(e.message).rawHash
+                        }
+                    }
+                    synchronized(this.lock) {
+                        this.serveWorkerDone = true
+                        this.serveWorker = None<Future<Unit>>
+                        this.server = None<Server>
+                        if (failed) {
                             this.listenerStatus = "degraded"
-                            this.lastError = redactServicePayload(e.message).rawHash
-                            this.server = None<Server>
+                            this.lastError = diagnostic
+                        } else if (this.listenerStatus == "listening") {
+                            this.listenerStatus = "stopped"
                         }
                     }
                 }
+                this.serveWorker = Some<Future<Unit>>(worker)
                 WebhookHttpServerStartResult(true, "listening", snapshot: this.snapshotLocked())
             } catch (e: Exception) {
                 this.listenerStatus = "degraded"
@@ -147,11 +173,21 @@ public class WebhookHttpServerRuntime {
     public func stop(): Unit {
         let current = synchronized(this.lock) {
             let s = this.server
+            let worker = this.serveWorker
             this.server = None<Server>
+            this.stopRequested.store(true)
             if (this.listenerStatus == "listening") { this.listenerStatus = "stopped" }
-            s
+            (s, worker)
         }
-        try { current?.close() } catch (_: Exception) { () }
+        try { current[0]?.close() } catch (_: Exception) { () }
+        current[1]?.cancel()
+        let bounded = this.waitServeWorkerDone(500)
+        synchronized(this.lock) {
+            this.stopBounded = bounded
+            if (!bounded) {
+                this.lastError = "serve_worker_stop_timeout"
+            }
+        }
     }
 
     public func snapshot(): WebhookHttpServerSnapshot {
@@ -233,8 +269,25 @@ public class WebhookHttpServerRuntime {
             lastResponseStatus: this.lastResponseStatus,
             lastRequestDurationMs: this.lastRequestDurationMs,
             healthzCount: this.healthzCount,
-            activeRequestCount: this.activeRequestCount
+            activeRequestCount: this.activeRequestCount,
+            serveWorkerDone: this.serveWorkerDone,
+            stopBounded: this.stopBounded
         )
+    }
+
+    private func waitServeWorkerDone(timeoutMs: Int64): Bool {
+        let boundedTimeout = if (timeoutMs <= 0) { 1 } else { timeoutMs }
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + boundedTimeout
+        while (DateTime.now().toUnixTimeStamp().toMilliseconds() <= deadline) {
+            let done = synchronized(this.lock) {
+                this.serveWorkerDone
+            }
+            if (done) { return true }
+            sleep(Duration.millisecond * 5)
+        }
+        synchronized(this.lock) {
+            this.serveWorkerDone
+        }
     }
 }
 

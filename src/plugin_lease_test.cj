@@ -1,7 +1,7 @@
 package gitcodemonitor
 
 import std.fs.{Directory, File, Path, exists, remove}
-import std.time.DateTime
+import std.time.*
 import std.unittest.testmacro.*
 
 @Test
@@ -14,6 +14,7 @@ public class GitCodeMonitorPluginLeaseTest {
 
     @TestCase
     public func oprU002LeaseRoundtripMarkRemoveAndStaleClassification(): Unit {
+        // GCM-LISTENER-N-001
         let dir = tempDir("gcm-lease-u002")
         let path = dir.join("lease.json").toString()
         let lease = GcmPluginLease(
@@ -69,6 +70,7 @@ public class GitCodeMonitorPluginLeaseTest {
 
     @TestCase
     public func oprP002WatchdogTickUpdatesHeartbeatWhenParentAndStdinNormal(): Unit {
+        // GCM-ORPHAN-U-001
         let dir = tempDir("gcm-lease-p002")
         let path = dir.join("lease.json").toString()
         let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p002", 101, 202, "127.0.0.1", 19083, 1000, 1000, "running", "")
@@ -80,6 +82,48 @@ public class GitCodeMonitorPluginLeaseTest {
         let reloaded = readGcmPluginLease(path).lease
         @Expect(reloaded.lastHeartbeatMs, 2000)
         @Expect(reloaded.state, "running")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func gcmOrphanB001SingleParentProbeFailureIsOnlySuspect(): Unit {
+        // GCM-ORPHAN-B-001
+        let dir = tempDir("gcm-orphan-b001")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-b001", 101, 202, "127.0.0.1", 19088, 1000, 1000, "running", "")
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+
+        let snapshot = GcmPluginOwnerSnapshot(false, false, 0, observedParentPid: 0, pidProbeStatus: "probe_unavailable", parentPidProbeStatus: "probe_unavailable")
+        let tick = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, snapshot, parentProbeFailureCount: 0, parentProbeFailureThreshold: 3), nowMs: 2000)
+
+        @Expect(tick.orphanDetected, false)
+        @Expect(tick.status, "parent_probe_suspect")
+        @Expect(tick.reason, "probe_unavailable")
+        let reloaded = readGcmPluginLease(path).lease
+        @Expect(reloaded.state, "running")
+        @Expect(reloaded.orphanReason, "")
+        @Expect(reloaded.lastHeartbeatMs, 2000)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func gcmOrphanB002ObservedParentProbeUnavailableDoesNotCauseParentLost(): Unit {
+        // GCM-ORPHAN-B-002
+        let dir = tempDir("gcm-orphan-b002")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-b002-watchdog", 101, 202, "127.0.0.1", 19089, 1000, 1000, "running", "")
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+
+        let snapshot = GcmPluginOwnerSnapshot(true, false, 0, observedParentPid: 0, observedParentPidStatus: "probe_unavailable")
+        let tick = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, snapshot, parentProbeFailureCount: 0, parentProbeFailureThreshold: 3), nowMs: 2100)
+
+        @Expect(tick.orphanDetected, false)
+        @Expect(tick.status, "parent_probe_suspect")
+        @Expect(tick.reason, "probe_unavailable")
+        let reloaded = readGcmPluginLease(path).lease
+        @Expect(reloaded.state, "running")
+        @Expect(reloaded.orphanReason, "")
+        @Expect(reloaded.lastHeartbeatMs, 2100)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
@@ -106,18 +150,44 @@ public class GitCodeMonitorPluginLeaseTest {
     }
 
     @TestCase
-    public func watchdogMarksParentMismatchWhenConfiguredParentIsUnreachable(): Unit {
-        let dir = tempDir("gcm-lease-parent-mismatch")
+    public func gcmOrphanN001WrapperPpidMismatchDoesNotOrphanWhileParentProbeIsSuspect(): Unit {
+        // GCM-ORPHAN-N-001
+        let dir = tempDir("gcm-orphan-n001")
         let path = dir.join("lease.json").toString()
-        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-parent-mismatch", 101, 202, "127.0.0.1", 19085, 1000, 1000, "running", "")
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-n001", 101, 202, "127.0.0.1", 19085, 1000, 1000, "running", "")
         @Expect(writeGcmPluginLease(path, lease).ok, true)
-        let context = GcmPluginWatchdogContext(path, lease, GcmPluginOwnerSnapshot(false, false, 0, observedParentPid: 303), forceOrphan: false)
+        let context = GcmPluginWatchdogContext(path, lease, GcmPluginOwnerSnapshot(false, false, 0, observedParentPid: 303, parentPidProbeStatus: "probe_unavailable"), parentProbeFailureCount: 0, parentProbeFailureThreshold: 3, forceOrphan: false)
         let tick = gcmPluginWatchdogTick(context, nowMs: 4000)
-        @Expect(tick.orphanDetected, true)
-        @Expect(tick.reason, "parent_mismatch_unreachable")
+        @Expect(tick.orphanDetected, false)
+        @Expect(tick.status, "parent_probe_suspect")
+        @Expect(tick.reason, "probe_unavailable")
+        let reloaded = readGcmPluginLease(path).lease
+        @Expect(reloaded.state, "running")
+        @Expect(reloaded.orphanReason, "")
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func gcmOrphanP001ConfirmedParentMissingRequiresConsecutiveThreshold(): Unit {
+        // GCM-ORPHAN-P-001
+        let dir = tempDir("gcm-orphan-p001")
+        let path = dir.join("lease.json").toString()
+        let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-p001", 101, 202, "127.0.0.1", 19090, 1000, 1000, "running", "")
+        @Expect(writeGcmPluginLease(path, lease).ok, true)
+        let missing = GcmPluginOwnerSnapshot(false, false, 0, observedParentPid: 0, parentPidProbeStatus: "pid_missing")
+
+        let suspect = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, missing, parentProbeFailureCount: 1, parentProbeFailureThreshold: 3), nowMs: 2000)
+        @Expect(suspect.orphanDetected, false)
+        @Expect(suspect.status, "parent_probe_suspect")
+        @Expect(readGcmPluginLease(path).lease.state, "running")
+
+        let confirmed = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease.withHeartbeat(2000), missing, parentProbeFailureCount: 2, parentProbeFailureThreshold: 3), nowMs: 3000)
+        @Expect(confirmed.orphanDetected, true)
+        @Expect(confirmed.status, "orphan_detected")
+        @Expect(confirmed.reason, "parent_lost")
         let reloaded = readGcmPluginLease(path).lease
         @Expect(reloaded.state, "orphan_detected")
-        @Expect(reloaded.orphanReason, "parent_mismatch_unreachable")
+        @Expect(reloaded.orphanReason, "parent_lost")
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 
@@ -139,7 +209,7 @@ public class GitCodeMonitorPluginLeaseTest {
         @Expect(writeFailed.orphanDetected, false)
         @Expect(writeFailed.status.contains("lease"), true)
 
-        let orphan = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, GcmPluginOwnerSnapshot(false, false, 0)), nowMs: 3000)
+        let orphan = gcmPluginWatchdogTick(GcmPluginWatchdogContext(path, lease, GcmPluginOwnerSnapshot(false, false, 0, parentPidProbeStatus: "pid_missing"), parentProbeFailureCount: 2, parentProbeFailureThreshold: 3), nowMs: 3000)
         @Expect(orphan.orphanDetected, true)
         @Expect(orphan.reason, "parent_lost")
         let orphanedLease = readGcmPluginLease(path).lease
@@ -171,11 +241,20 @@ public class GitCodeMonitorPluginLeaseTest {
         let lease = GcmPluginLease(GCM_SERVICE_PLUGIN_ID, "session-helper", 101, 202, "127.0.0.1", 19087, 1000, 3000, "orphan_detected", "parent_lost")
         @Expect(writeGcmPluginLease(path, lease).ok, true)
         let config = defaultConfig()
-        config.webhook = WebhookReceiverConfig(enabled: true, bindHost: "127.0.0.1", port: 0, queueDir: dir.join("queue").toString())
+        let port = 19100 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 1000)
+        config.webhook = WebhookReceiverConfig(
+            enabled: true,
+            bindHost: "127.0.0.1",
+            port: port,
+            queueDir: dir.join("queue").toString(),
+            endpoints: [WebhookEndpointConfig("main", "/webhooks/gitcode/main", token: "receiver-token")]
+        )
         let queue = WebhookQueue(config.webhook.queueDir)
         let processor = WebhookProcessorLoopRuntime(config, RuntimeContainer(config), MonitorState(), queue)
         processor.start()
         let listener = WebhookHttpServerRuntime(config, queue)
+        @Expect(listener.start().ok, true)
+        sleep(Duration.millisecond * 20)
         let sink = GcmMemoryLineSink()
         let writer = GcmPluginStdioWriter(sink)
 
@@ -188,6 +267,8 @@ public class GitCodeMonitorPluginLeaseTest {
         @Expect(processor.snapshot().processorStatus, "stopped")
         @Expect(handled.processorStopped, true)
         @Expect(handled.listenerStopped, true)
+        @Expect(listener.snapshot().serveWorkerDone, true)
+        @Expect(listener.snapshot().stopBounded, true)
         try { remove(dir, recursive: true) } catch (_: Exception) { () }
     }
 }
