@@ -5,8 +5,8 @@
   "kind": "service",
   "protocolVersion": "1.0",
   "entry": {
-    "command": "cjpm",
-    "args": ["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
+    "command": "./target/release/bin/gitcodemonitor",
+    "args": ["plugin-stdio"]
   },
   "capabilityDeclarations": [
     {"capabilityId": "gitcode.monitor.status", "kind": "controlAction", "direction": "metis-to-gcm"},

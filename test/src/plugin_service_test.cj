@@ -93,13 +93,14 @@ public class GitCodeMonitorPluginServiceTest {
     }
 
     @TestCase
-    public func generatedManifestUsesSkipBuildAndCheckedInEntryMatches(): Unit {
+    public func generatedManifestUsesDirectBinaryAndCheckedInEntryMatches(): Unit {
         let generated = JsonValue.fromStr(buildGitCodeMonitorServicePluginManifest()).asObject()
         let generatedEntry = generated.get("entry").getOrThrow().asObject()
         let generatedArgs = jsonStringArray(generatedEntry.get("args").getOrThrow())
-        let expectedArgs = ["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]
-        @Expect(generatedEntry.get("command").getOrThrow().asString().getValue(), "cjpm")
-        @Expect(generatedArgs.contains("--skip-build"), true)
+        let expectedArgs = ["plugin-stdio"]
+        @Expect(generatedEntry.get("command").getOrThrow().asString().getValue(), "./target/release/bin/gitcodemonitor")
+        @Expect(generatedArgs.contains("--skip-build"), false)
+        @Expect(generatedArgs.contains("--run-args"), false)
         @Expect(generatedArgs.size, expectedArgs.size)
         for (i in 0..expectedArgs.size) {
             @Expect(generatedArgs[i], expectedArgs[i])

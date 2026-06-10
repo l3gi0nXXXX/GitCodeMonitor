@@ -258,8 +258,8 @@ public func buildGitCodeMonitorServicePluginManifest(): String {
     root.put("protocolVersion", JsonString(GCM_SERVICE_PROTOCOL_VERSION))
 
     let entry = JsonObject()
-    entry.put("command", JsonString("cjpm"))
-    entry.put("args", stringArrayJson(["run", "--skip-build", "--name", "gitcodemonitor", "--run-args", "plugin-stdio"]))
+    entry.put("command", JsonString("./target/release/bin/gitcodemonitor"))
+    entry.put("args", stringArrayJson(["plugin-stdio"]))
     root.put("entry", entry)
 
     let capabilities = JsonArray([])
