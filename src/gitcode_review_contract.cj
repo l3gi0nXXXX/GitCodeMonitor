@@ -40,7 +40,8 @@ public func renderReviewRequestJson(
     codeowners!: ?GitCodeCodeownerResolution = None<GitCodeCodeownerResolution>,
     issueKind!: String = "",
     issueFields!: ?GitCodeIssueFields = None<GitCodeIssueFields>,
-    prFields!: ?GitCodePrFields = None<GitCodePrFields>
+    prFields!: ?GitCodePrFields = None<GitCodePrFields>,
+    discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>
 ): String {
     let legacy = legacyAcceptedPayload(jobId, event)
     let kind = reviewEventKind(event)
@@ -71,6 +72,10 @@ public func renderReviewRequestJson(
         case Some(value) => webhookEnvelopeJson(value)
         case None => "{\"eventHeader\":\"\",\"action\":\"\",\"deliveryId\":\"\"}"
     }
+    let contextJson = match (discussionContext) {
+        case Some(value) => ",\"context\":${value.toJsonString()}"
+        case None => ""
+    }
     "{" +
         legacy[1..legacy.size - 1] + "," +
         "\"contractVersion\":\"${GITCODE_REVIEW_CONTRACT_VERSION}\"," +
@@ -86,6 +91,7 @@ public func renderReviewRequestJson(
             "\"templates\":{\"issueKind\":\"${jsonEscape(resolvedIssueKind)}\",\"templateStatus\":\"${jsonEscape(resolvedIssueFields.templateStatus)}\",\"fields\":{\"cjcVersion\":\"${jsonEscape(resolvedIssueFields.cjcVersion)}\",\"branchVersions\":${stringArrayJson(resolvedIssueFields.branchVersions).toJsonString()}}}," +
             "\"pr\":{\"changedFiles\":${stringArrayJson(resolvedCodeowners.changedFiles).toJsonString()},\"changedFilesTruncated\":${resolvedCodeowners.changedFilesTruncated},\"prTemplate\":\"${jsonEscape(resolvedPrFields.prTemplate)}\",\"changeTypes\":${stringArrayJson(resolvedPrFields.changeTypes).toJsonString()},\"selfCheck\":${stringArrayJson(resolvedPrFields.selfCheck).toJsonString()},\"relatedIssues\":${stringArrayJson(resolvedPrFields.relatedIssues).toJsonString()}}," +
             "\"content\":{\"title\":\"${jsonEscape(compactSummary(redactSecrets(scanEventTitle(event)), limit: 160))}\",\"body\":\"${jsonEscape(compactSummary(redactSecrets(resolvedIssueFields.description), limit: 4096))}\"}" +
+            contextJson +
         "}" +
     "}"
 }

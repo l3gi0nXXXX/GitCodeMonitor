@@ -561,11 +561,11 @@ func emitGcmScanJobEvent(job: GcmScanJob, writer: GcmPluginStdioWriter): Unit {
     writer.writeFrame(gcmScanJobEventFrame(job))
 }
 
-func emitGcmAcceptedScanEvent(jobId: String, event: GitCodeEvent, writer: GcmPluginStdioWriter): Unit {
-    writer.writeFrame(gcmAcceptedScanEventFrame(jobId, event))
+func emitGcmAcceptedScanEvent(jobId: String, event: GitCodeEvent, writer: GcmPluginStdioWriter, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>): Unit {
+    writer.writeFrame(gcmAcceptedScanEventFrame(jobId, event, discussionContext: discussionContext))
 }
 
-func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent): ServiceFrame {
+func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>): ServiceFrame {
     ServiceFrame(
         "event",
         "accepted-${jobId}-${hashRawPayload(event.id)}",
@@ -573,12 +573,12 @@ func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent): ServiceFrame
         method: "emitCapabilityEvent",
         capabilityId: "gitcode.event.accepted",
         correlationId: "corr-${jobId}",
-        payload: gcmAcceptedScanEventPayload(jobId, event)
+        payload: gcmAcceptedScanEventPayload(jobId, event, discussionContext: discussionContext)
     )
 }
 
-func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent): String {
-    renderReviewRequestJson(jobId, event)
+func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>): String {
+    renderReviewRequestJson(jobId, event, discussionContext: discussionContext)
 }
 
 func gcmScanJobEventFrame(job: GcmScanJob): ServiceFrame {

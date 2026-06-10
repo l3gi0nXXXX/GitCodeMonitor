@@ -45,6 +45,23 @@ Required `reviewRequest` fields:
 - `pr.changedFiles`, `pr.changedFilesTruncated`, `pr.prTemplate`, `pr.changeTypes`, `pr.selfCheck`, `pr.relatedIssues`
 - `content.title`, `content.body`
 
+For comment events, GCM also sends `reviewRequest.context` when the event is accepted through the webhook processor. Older scan/reconcile producers may omit it; Metis must keep legacy compatibility, but must treat missing comment context as degraded when generating a user-facing draft.
+
+`reviewRequest.context` fields:
+
+- `status`: `resolved` when parent detail and comment context were built without fetch failures; `degraded` when detail/comments fetch failed, current comment ordering is uncertain, or fallback data was used.
+- `parent`: parent Issue/PR facts with `kind`, `number`, `title`, `body`, `url`, `author`, `authorUrl`, and `source`. `source` is `api`, `webhook_envelope`, or `event`.
+- `triggerComment`: the current comment that triggered the accepted event, with `id`, `body`, `url`, `author`, `authorUrl`, `createdAt`, `createdAtMs`, and `updatedAtMs`.
+- `previousComments`: comments before `triggerComment` after GCM ordering. If GitCode omits created-time metadata, GCM preserves API order and adds `order_degraded`.
+- `previousCommentsTotal`: total previous comments available before safety truncation.
+- `previousCommentsIncluded`: previous comments included in this payload after safety truncation.
+- `truncated`: `true` when parent body, trigger body, or previous comments were shortened or omitted to fit the GCM context budget.
+- `diagnostics`: redacted diagnostic strings such as `detail_fetch_failed:forbidden`, `comments_fetch_failed:rate_limited`, `order_degraded`, or `current_comment_not_found`.
+
+GCM builds this context before emitting an accepted comment frame, but only after record-only author policy and self-echo checks have passed. Record-only and self-echo events must not fetch context and must not emit `gitcode.event.accepted`.
+
+GCM context is factual GitCode data only. GCM must not call LLM/model/session APIs or write prompts. Metis owns prompt construction and draft generation.
+
 Validation statuses:
 
 - `ok`

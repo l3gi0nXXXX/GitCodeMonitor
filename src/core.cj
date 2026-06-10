@@ -1024,6 +1024,14 @@ public class GitCodeApiClient {
         HttpRequestSpec("GET", withAuthQuery(url), headers: authHeaders())
     }
 
+    public func issueDetailRequest(repo: GitCodeRepo, number: String): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues/${urlPart(number)}"), headers: authHeaders())
+    }
+
+    public func pullRequestDetailRequest(repo: GitCodeRepo, number: String): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls/${urlPart(number)}"), headers: authHeaders())
+    }
+
     public func listCommentsRequest(repo: GitCodeRepo, itemKind: String, itemId: String, page: Int64, pageSize: Int64): HttpRequestSpec {
         if (itemKind == "pr") {
             return listPullRequestCommentsRequest(repo, itemId, page, pageSize)
@@ -1035,8 +1043,19 @@ public class GitCodeApiClient {
         HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues/comments?page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
     }
 
+    public func listIssueItemCommentsRequest(repo: GitCodeRepo, number: String, page: Int64, pageSize: Int64): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/issues/${urlPart(number)}/comments?page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
+    }
+
     public func listPullRequestCommentsRequest(repo: GitCodeRepo, itemId: String, page: Int64, pageSize: Int64): HttpRequestSpec {
         HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls/${urlPart(itemId)}/comments?page=${page}&per_page=${boundedPageSize(pageSize)}"), headers: authHeaders())
+    }
+
+    public func listItemCommentsRequest(repo: GitCodeRepo, itemKind: String, itemId: String, page: Int64, pageSize: Int64): HttpRequestSpec {
+        if (itemKind == "pr") {
+            return listPullRequestCommentsRequest(repo, itemId, page, pageSize)
+        }
+        listIssueItemCommentsRequest(repo, itemId, page, pageSize)
     }
 
     public func contentsRequest(repo: GitCodeRepo, path: String, ref: String): HttpRequestSpec {
@@ -1128,6 +1147,30 @@ public class GitCodeHttpTransport {
             return GitCodeListResult(errorKind: mapGitCodeError(res.statusCode), retryAfterMs: retryAfterMs(res))
         }
         GitCodeListResult(events: parseCommentsResponse(res.body, repo, kind, itemId))
+    }
+
+    public func fetchIssueDetail(repo: GitCodeRepo, number: String): GitCodeDiscussionParentFetchResult {
+        let res = sender.send(client.issueDetailRequest(repo, number))
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            return GitCodeDiscussionParentFetchResult(errorKind: mapGitCodeError(res.statusCode), retryAfterMs: retryAfterMs(res))
+        }
+        GitCodeDiscussionParentFetchResult(parent: parseItemDetailResponse(res.body, repo, "issue", number))
+    }
+
+    public func fetchPullRequestDetail(repo: GitCodeRepo, number: String): GitCodeDiscussionParentFetchResult {
+        let res = sender.send(client.pullRequestDetailRequest(repo, number))
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            return GitCodeDiscussionParentFetchResult(errorKind: mapGitCodeError(res.statusCode), retryAfterMs: retryAfterMs(res))
+        }
+        GitCodeDiscussionParentFetchResult(parent: parseItemDetailResponse(res.body, repo, "pr", number))
+    }
+
+    public func listItemCommentsPage(repo: GitCodeRepo, kind: String, itemId: String, page: Int64): GitCodeDiscussionCommentsPageResult {
+        let res = sender.send(client.listItemCommentsRequest(repo, kind, itemId, page, pageSize))
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            return GitCodeDiscussionCommentsPageResult(errorKind: mapGitCodeError(res.statusCode), retryAfterMs: retryAfterMs(res))
+        }
+        GitCodeDiscussionCommentsPageResult(comments: parseDiscussionCommentsResponse(res.body, repo, kind, itemId))
     }
 }
 
@@ -2283,6 +2326,52 @@ public func parseCommentsResponse(body: String, repo: GitCodeRepo, kind: String,
     out.toArray()
 }
 
+public func parseItemDetailResponse(body: String, repo: GitCodeRepo, kind: String, number: String): GitCodeDiscussionParent {
+    try {
+        let root = JsonValue.fromStr(body)
+        let obj = detailJsonObject(root)
+        let itemNumber = firstNonEmpty([firstJsonString(obj, ["iid", "number", "id", "pull_request_number"]), number])
+        GitCodeDiscussionParent(
+            kind: kind,
+            number: itemNumber,
+            title: firstJsonString(obj, ["title", "name"]),
+            body: firstJsonString(obj, ["body", "description", "content"]),
+            url: firstJsonString(obj, ["html_url", "web_url", "url"]),
+            author: actorName(obj),
+            authorUrl: actorUrl(obj),
+            source: "api"
+        )
+    } catch (_: Exception) {
+        GitCodeDiscussionParent(kind: kind, number: number, source: "api")
+    }
+}
+
+public func parseDiscussionCommentsResponse(body: String, repo: GitCodeRepo, kind: String, itemId: String): Array<GitCodeDiscussionComment> {
+    let out = ArrayList<GitCodeDiscussionComment>()
+    try {
+        let root = JsonValue.fromStr(body)
+        var index: Int64 = 0
+        for (obj in jsonObjectItems(root)) {
+            let commentId = firstJsonString(obj, ["id", "note_id", "comment_id"])
+            if (!commentId.isEmpty()) {
+                out.add(GitCodeDiscussionComment(
+                    id: commentId,
+                    body: firstJsonString(obj, ["body", "note", "content"]),
+                    url: firstJsonString(obj, ["html_url", "web_url", "url"]),
+                    author: actorName(obj),
+                    authorUrl: actorUrl(obj),
+                    createdAt: firstJsonString(obj, ["created_at", "createdAt", "created"]),
+                    createdAtMs: firstJsonInt(obj, ["created_at_ms", "createdAtMs", "created_ms"]),
+                    updatedAtMs: firstJsonInt(obj, ["updated_at_ms", "updatedAtMs", "updated_ms"]),
+                    orderIndex: index
+                ))
+                index++
+            }
+        }
+    } catch (_: Exception) { () }
+    out.toArray()
+}
+
 func retryAfterMs(res: HttpResponseSpec): Int64 {
     for ((key, value) in res.headers) {
         if (key.toAsciiLower() == "retry-after") {
@@ -2485,6 +2574,24 @@ func jsonObjectItems(root: JsonValue): Array<JsonObject> {
         } catch (_inner: Exception) { () }
     }
     out.toArray()
+}
+
+func detailJsonObject(root: JsonValue): JsonObject {
+    try {
+        let obj = root.asObject()
+        for (key in ["data", "result", "item", "issue", "pull_request", "merge_request"]) {
+            match (obj.get(key)) {
+                case Some(v) =>
+                    try { return v.asObject() } catch (_: Exception) { () }
+                case None => ()
+            }
+        }
+        return obj
+    } catch (_: Exception) {
+        let items = jsonObjectItems(root)
+        if (items.size > 0) { return items[0] }
+    }
+    JsonValue.fromStr("{}").asObject()
 }
 
 func actorName(obj: JsonObject): String {

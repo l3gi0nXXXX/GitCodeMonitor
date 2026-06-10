@@ -1273,6 +1273,169 @@ public class GitCodeWebhookETest {
     }
 
     @TestCase
+    public func ctxP2U001U002AndP4U001ReviewContractRendersContextAndKeepsLegacyCompatibility(): Unit {
+        // CTX-P2-U-001, CTX-P2-U-002, CTX-P4-U-001
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:4:comment:9003", "cangjie", "compiler", "issue", "4", "bob", "", "https://gitcode.com/cangjie/compiler/issues/4#note_9003", "trigger body")
+        let context = GitCodeDiscussionContext(
+            status: "resolved",
+            repo: "cangjie/compiler",
+            kind: "issue",
+            number: "4",
+            commentId: "9003",
+            parent: GitCodeDiscussionParent(kind: "issue", number: "4", title: "Issue 4", body: "Parent issue body", url: "https://gitcode.com/cangjie/compiler/issues/4", author: "alice"),
+            triggerComment: GitCodeDiscussionComment(id: "9003", body: "trigger body", author: "bob"),
+            previousComments: [GitCodeDiscussionComment(id: "9001", body: "previous comment body", author: "carol")],
+            previousCommentsTotal: 1,
+            previousCommentsIncluded: 1
+        )
+
+        let payload = renderReviewRequestJson("job-context", event, discussionContext: Some<GitCodeDiscussionContext>(context))
+        let root = JsonValue.fromStr(payload).asObject()
+        let request = nestedObject(root, ["reviewRequest"])
+        let contextJson = nestedObject(request, ["context"])
+        let parent = nestedObject(contextJson, ["parent"])
+        let previous = contextJson.get("previousComments").getOrThrow().asArray().getItems()
+        let previous0 = previous[0].asObject()
+        let oldPayload = renderReviewRequestJson("job-legacy", event)
+
+        @Expect(firstJsonString(parent, ["body"]), "Parent issue body")
+        @Expect(firstJsonString(previous0, ["body"]), "previous comment body")
+        @Expect(payloadHasField(payload, "kind"), true)
+        @Expect(validateReviewRequestForTest(payload).ok, true)
+        @Expect(validateReviewRequestForTest(oldPayload).ok, true)
+        @Expect(oldPayload.contains("\"context\""), false)
+
+        let unsafeContext = GitCodeDiscussionContext(
+            status: "resolved",
+            repo: "cangjie/compiler",
+            kind: "issue",
+            number: "4",
+            commentId: "9004",
+            parent: GitCodeDiscussionParent(kind: "issue", number: "4", body: "gitcode_token=fake-secret /Users/example/private"),
+            triggerComment: GitCodeDiscussionComment(id: "9004", body: "safe"),
+            previousComments: []
+        )
+        let safeRendered = renderReviewRequestJson("job-safe-context", event, discussionContext: Some<GitCodeDiscussionContext>(unsafeContext))
+        @Expect(validateReviewRequestForTest(safeRendered).ok, true)
+        @Expect(safeRendered.contains("fake-secret"), false)
+        @Expect(safeRendered.contains("/Users/example"), false)
+        let rawUnsafe = "{\"contractVersion\":\"gcm-metis-gitcode-review-v1\",\"reviewRequest\":{\"repo\":\"cangjie/compiler\",\"context\":{\"parent\":{\"body\":\"gitcode_token=fake-secret /Users/example/private\"}}}}"
+        @Expect(validateReviewRequestForTest(rawUnsafe).ok, false)
+    }
+
+    @TestCase
+    public func ctxP2B001ReviewContractTruncatesLongContextAndValidates(): Unit {
+        // CTX-P2-B-001
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:5:comment:9010", "cangjie", "compiler", "issue", "5", "bob", "", "https://gitcode.com/cangjie/compiler/issues/5#note_9010", "trigger body")
+        let comments = ArrayList<GitCodeDiscussionComment>()
+        for (i in 1..=20) {
+            comments.add(GitCodeDiscussionComment(id: "${i}", body: "previous-${i}-" + String(Array<Rune>(900, repeat: r'x')), author: "user${i}", createdAtMs: i * 1000))
+        }
+        let context = GitCodeDiscussionContext(
+            status: "resolved",
+            repo: "cangjie/compiler",
+            kind: "issue",
+            number: "5",
+            commentId: "9010",
+            parent: GitCodeDiscussionParent(kind: "issue", number: "5", body: String(Array<Rune>(9000, repeat: r'p'))),
+            triggerComment: GitCodeDiscussionComment(id: "9010", body: "trigger body"),
+            previousComments: comments.toArray(),
+            previousCommentsTotal: comments.size,
+            previousCommentsIncluded: comments.size
+        )
+
+        let payload = renderReviewRequestJson("job-long-context", event, discussionContext: Some<GitCodeDiscussionContext>(context))
+
+        @Expect(payload.contains("\"context\""), true)
+        @Expect(payload.contains("\"truncated\":true"), true)
+        @Expect(validateReviewRequestForTest(payload).ok, true)
+    }
+
+    @TestCase
+    public func ctxP2P001WebhookNoteAcceptedFrameIncludesDiscussionContext(): Unit {
+        // CTX-P2-P-001
+        let dir = tempDir("gcm-ctx-p2-p001")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("ctx-p2-p001", "main", "Note Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), issue4NotePayload(commentId: "9003", note: "trigger context").toArray()).ok, true)
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"iid\":4,\"title\":\"Issue 4\",\"description\":\"API parent issue body\",\"html_url\":\"https://gitcode.com/Cangjie/community/issues/4\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[" +
+            "{\"id\":9001,\"body\":\"previous context A\",\"created_at_ms\":1000}," +
+            "{\"id\":9002,\"body\":\"previous context B\",\"created_at_ms\":2000}," +
+            "{\"id\":9003,\"body\":\"trigger context\",\"created_at_ms\":3000}" +
+        "]}"))
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = MonitorState()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+
+        @Expect(result.processed, 1)
+        @Expect(sink.lines.size, 1)
+        @Expect(sender.requests.size, 2)
+        let decoded = decodeServiceFrame(sink.lines[0])
+        @Expect(decoded.frame.payload.contains("\"context\""), true)
+        @Expect(decoded.frame.payload.contains("API parent issue body"), true)
+        @Expect(decoded.frame.payload.contains("previous context A"), true)
+        @Expect(decoded.frame.payload.contains("trigger context"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func ctxP2N001ContextFetchFailureStillEmitsDegradedAcceptedFrame(): Unit {
+        // CTX-P2-N-001
+        let dir = tempDir("gcm-ctx-p2-n001")
+        let config = enabledConfig(dir.join("queue").toString())
+        let queue = WebhookQueue(config.webhook.queueDir)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("ctx-p2-n001", "main", "Note Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), issue4NotePayload(commentId: "9006", note: "trigger degraded").toArray()).ok, true)
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(500, body: "{\"message\":\"temporary\"}"))
+        sender.enqueue(HttpResponseSpec(500, body: "{\"message\":\"temporary\"}"))
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = MonitorState()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+
+        @Expect(result.processed, 1)
+        @Expect(sink.lines.size, 1)
+        let payload = decodeServiceFrame(sink.lines[0]).frame.payload
+        let context = nestedObject(nestedObject(JsonValue.fromStr(payload).asObject(), ["reviewRequest"]), ["context"])
+        @Expect(payload.contains("\"context\""), true)
+        @Expect(firstJsonString(context, ["status"]), "degraded")
+        @Expect(payload.contains("detail_fetch_failed:server_error"), true)
+        @Expect(payload.contains("comments_fetch_failed:server_error"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
+    public func ctxP2N002RecordOnlyCommentAuthorDoesNotFetchContextOrEmitAccepted(): Unit {
+        // CTX-P2-N-002
+        let dir = tempDir("gcm-ctx-p2-n002")
+        let config = enabledConfig(dir.join("queue").toString())
+        config.authorPolicy.commentAuthorRule.ids = ["856442"]
+        let queue = WebhookQueue(config.webhook.queueDir)
+        @Expect(queue.enqueue(GitCodeWebhookDelivery("ctx-p2-n002", "main", "Note Hook", 1000, "payload-hash", "", "pending", 0, "", 0, "ip-hash"), issue4NotePayload(commentId: "9007", note: "record only").toArray()).ok, true)
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"iid\":4,\"title\":\"should not fetch\"}"))
+        let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
+        let state = MonitorState()
+        let sink = GcmMemoryLineSink()
+        let writer = GcmPluginStdioWriter(sink)
+
+        let result = processWebhookBatch(config, runtime, state, queue, nowMs: 2000, maxItems: 1, eventWriter: Some<GcmPluginStdioWriter>(writer))
+
+        @Expect(result.processed, 1)
+        @Expect(sink.lines.size, 0)
+        @Expect(sender.requests.size, 0)
+        @Expect(auditContains(state, "record_only", reason: "record_only_comment_author_id"), true)
+        try { remove(dir, recursive: true) } catch (_: Exception) { () }
+    }
+
+    @TestCase
     public func reviewIdentityExtractsEmailsClassifiesCorporateAndDegrades(): Unit {
         // T-IDENTITY-001, T-IDENTITY-002, T-IDENTITY-003, T-IDENTITY-004, T-IDENTITY-005, T-IDENTITY-006, T-IDENTITY-007, T-IDENTITY-008, T-IDENTITY-010
         let corporate = JsonValue.fromStr(reviewFactsIssuePayload(email: "A@HUAWEI.COM")).asObject()

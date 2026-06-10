@@ -169,7 +169,13 @@ public func processWebhookBatch(
         } else {
             if (result.newEvents > 0) {
                 match (eventWriter) {
-                    case Some(writer) => emitGcmAcceptedScanEvent("webhook-${sanitizeDeliveryIdForPath(delivery.deliveryId)}", parsed.event, writer)
+                    case Some(writer) =>
+                        let discussionContext = if (!scanEventCommentId(parsed.event).isEmpty()) {
+                            Some<GitCodeDiscussionContext>(fetchGitCodeDiscussionContext(runtime.gitCode, parsed.event, envelope: parsed.envelope))
+                        } else {
+                            None<GitCodeDiscussionContext>
+                        }
+                        emitGcmAcceptedScanEvent("webhook-${sanitizeDeliveryIdForPath(delivery.deliveryId)}", parsed.event, writer, discussionContext: discussionContext)
                     case None => ()
                 }
             }

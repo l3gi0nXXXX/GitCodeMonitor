@@ -1,8 +1,10 @@
 package gitcodemonitor
 
+import std.collection.*
 import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonValue
 
 @Test
 public class GitCodeMonitorCoreServicePluginOnlyTest {
@@ -148,5 +150,168 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
         let server = writer.write(event, "safe draft", state)
         @Expect(server, "error:server_error")
         @Expect(state.hasReply("issue-e2"), false)
+    }
+
+    @TestCase
+    public func ctxP1U001IssueDetailAndPreviousCommentsUseTriggerBoundary(): Unit {
+        // CTX-P1-U-001
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"iid\":42,\"title\":\"Issue title\",\"description\":\"Issue original body\",\"author\":{\"username\":\"alice\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/42\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[" +
+            "{\"id\":1,\"body\":\"previous one\",\"author\":{\"username\":\"bob\"},\"created_at_ms\":1000,\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/42#note_1\"}," +
+            "{\"id\":2,\"body\":\"previous two\",\"author\":{\"username\":\"carol\"},\"created_at_ms\":2000,\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/42#note_2\"}," +
+            "{\"id\":3,\"body\":\"trigger comment\",\"author\":{\"username\":\"dave\"},\"created_at_ms\":3000,\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/42#note_3\"}" +
+        "]}"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:42:comment:3", "cangjie", "compiler", "issue", "42", "dave", "", "https://gitcode.com/cangjie/compiler/issues/42#note_3", "trigger comment")
+
+        let context = fetchGitCodeDiscussionContext(transport, event)
+
+        @Expect(context.status, "resolved")
+        @Expect(context.parent.kind, "issue")
+        @Expect(context.parent.body, "Issue original body")
+        @Expect(context.triggerComment.id, "3")
+        @Expect(context.triggerComment.body, "trigger comment")
+        @Expect(context.previousComments.size, 2)
+        @Expect(context.previousComments[0].body, "previous one")
+        @Expect(context.previousComments[1].body, "previous two")
+        @Expect(context.previousCommentsTotal, 2)
+        @Expect(context.previousCommentsIncluded, 2)
+        @Expect(sender.requests[0].url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/issues/42")
+        @Expect(sender.requests[1].url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/issues/42/comments?page=1&per_page=100")
+    }
+
+    @TestCase
+    public func ctxP1U002PrDetailAndPrCommentsUsePullsEndpoint(): Unit {
+        // CTX-P1-U-002
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"number\":7,\"title\":\"PR title\",\"body\":\"PR original body\",\"user\":{\"login\":\"alice\"},\"html_url\":\"https://gitcode.com/cangjie/compiler/pulls/7\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[" +
+            "{\"id\":10,\"body\":\"pr previous\",\"user\":{\"login\":\"reviewer\"},\"created_at_ms\":1000,\"html_url\":\"https://gitcode.com/cangjie/compiler/pulls/7#note_10\"}," +
+            "{\"id\":11,\"body\":\"pr trigger\",\"user\":{\"login\":\"dave\"},\"created_at_ms\":2000,\"html_url\":\"https://gitcode.com/cangjie/compiler/pulls/7#note_11\"}" +
+        "]}"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let event = GitCodeEvent("gitcode:cangjie/compiler:pr:7:comment:11", "cangjie", "compiler", "pr", "7", "dave", "", "https://gitcode.com/cangjie/compiler/pulls/7#note_11", "pr trigger")
+
+        let context = fetchGitCodeDiscussionContext(transport, event)
+
+        @Expect(context.status, "resolved")
+        @Expect(context.parent.kind, "pr")
+        @Expect(context.parent.body, "PR original body")
+        @Expect(context.previousComments.size, 1)
+        @Expect(context.previousComments[0].body, "pr previous")
+        @Expect(sender.requests[0].url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/pulls/7")
+        @Expect(sender.requests[1].url, "https://mock.gitcode.test/api/v5/repos/cangjie/compiler/pulls/7/comments?page=1&per_page=100")
+    }
+
+    @TestCase
+    public func ctxP1B001AndP4B001OversizedCommentsAndParentAreTruncatedAsValidJson(): Unit {
+        // CTX-P1-B-001, CTX-P4-B-001
+        let sender = FakeHttpSender()
+        let longParent = String(Array<Rune>(9000, repeat: r'p'))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"iid\":55,\"title\":\"Long issue\",\"description\":\"${longParent}\",\"html_url\":\"https://gitcode.com/cangjie/compiler/issues/55\"}"))
+        let commentItems = ArrayList<String>()
+        for (i in 1..=50) {
+            let body = "comment-${i}-" + String(Array<Rune>(900, repeat: r'x'))
+            commentItems.add("{\"id\":${i},\"body\":\"${body}\",\"created_at_ms\":${i * 1000},\"author\":{\"username\":\"user${i}\"}}")
+        }
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[${joinStrings(commentItems.toArray(), ",")}]}"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:55:comment:50", "cangjie", "compiler", "issue", "55", "user50", "", "https://gitcode.com/cangjie/compiler/issues/55#note_50", "trigger")
+
+        let context = fetchGitCodeDiscussionContext(transport, event)
+        let json = context.toJsonString()
+        let root = JsonValue.fromStr(json).asObject()
+
+        @Expect(context.truncated, true)
+        @Expect(context.previousCommentsTotal, 49)
+        @Expect(context.previousCommentsIncluded < context.previousCommentsTotal, true)
+        @Expect(firstJsonString(root, ["status"]), "resolved")
+        @Expect(json.contains("\"previousComments\""), true)
+    }
+
+    @TestCase
+    public func ctxP1B002MissingCreatedAtKeepsApiOrderAndDiagnosesOrderDegraded(): Unit {
+        // CTX-P1-B-002
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"iid\":43,\"title\":\"Issue title\",\"description\":\"Issue body\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[" +
+            "{\"id\":1,\"body\":\"api first\"}," +
+            "{\"id\":2,\"body\":\"api second\"}," +
+            "{\"id\":3,\"body\":\"api trigger\"}" +
+        "]}"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:43:comment:3", "cangjie", "compiler", "issue", "43", "dave", "", "", "api trigger")
+
+        let context = fetchGitCodeDiscussionContext(transport, event)
+
+        @Expect(context.previousComments.size, 2)
+        @Expect(context.previousComments[0].id, "1")
+        @Expect(context.previousComments[1].id, "2")
+        @Expect(context.diagnostics.contains("order_degraded"), true)
+    }
+
+    @TestCase
+    public func ctxP1P001DetailFailureFallsBackToEnvelopeAndKeepsComments(): Unit {
+        // CTX-P1-P-001
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(500, body: "{\"message\":\"temporary failure\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[" +
+            "{\"id\":1,\"body\":\"fallback previous\",\"created_at_ms\":1000}," +
+            "{\"id\":2,\"body\":\"fallback trigger\",\"created_at_ms\":2000}" +
+        "]}"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:44:comment:2", "cangjie", "compiler", "issue", "44", "dave", "", "", "fallback trigger")
+        let envelope = GitCodeWebhookEnvelope("Note Hook", "issue", itemId: "44", commentId: "2", title: "Envelope title", body: "Envelope parent body", commentBody: "fallback trigger")
+
+        let context = fetchGitCodeDiscussionContext(transport, event, envelope: Some<GitCodeWebhookEnvelope>(envelope))
+
+        @Expect(context.status, "degraded")
+        @Expect(context.parent.body, "Envelope parent body")
+        @Expect(context.parent.source, "webhook_envelope")
+        @Expect(context.previousComments.size, 1)
+        @Expect(context.previousComments[0].body, "fallback previous")
+        @Expect(context.diagnostics.contains("detail_fetch_failed:server_error"), true)
+    }
+
+    @TestCase
+    public func ctxP1N001ApiErrorsMapToDegradedDiagnosticsWithoutSecrets(): Unit {
+        // CTX-P1-N-001
+        for ((statusCode, expected) in [(403, "forbidden"), (429, "rate_limited"), (500, "server_error")]) {
+            let sender = FakeHttpSender()
+            sender.enqueue(HttpResponseSpec(statusCode, body: "{\"message\":\"PRIVATE-TOKEN fake-api-token\"}", headers: [("Retry-After", "2")]))
+            sender.enqueue(HttpResponseSpec(statusCode, body: "{\"message\":\"gitcode_token=fake-api-token\"}", headers: [("Retry-After", "2")]))
+            let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5", token: "fake-api-token"), sender: sender, pageSize: 100)
+            let event = GitCodeEvent("gitcode:cangjie/compiler:issue:45:comment:9", "cangjie", "compiler", "issue", "45", "dave", "", "", "trigger")
+
+            let context = fetchGitCodeDiscussionContext(transport, event)
+            let json = context.toJsonString()
+
+            @Expect(context.status, "degraded")
+            @Expect(json.contains(expected), true)
+            @Expect(json.contains("fake-api-token"), false)
+            @Expect(json.contains("PRIVATE-TOKEN"), false)
+            @Expect(json.contains("gitcode_token="), false)
+        }
+    }
+
+    @TestCase
+    public func ctxP1N002ContextJsonRedactsSecretsAndLocalPaths(): Unit {
+        // CTX-P1-N-002
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"iid\":46,\"title\":\"Issue title\",\"description\":\"parent body\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"comments\":[" +
+            "{\"id\":1,\"body\":\"gitcode_token=fake-secret /Users/example/private\",\"created_at_ms\":1000}," +
+            "{\"id\":2,\"body\":\"trigger with /Users/example/.metis\",\"created_at_ms\":2000}" +
+        "]}"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let event = GitCodeEvent("gitcode:cangjie/compiler:issue:46:comment:2", "cangjie", "compiler", "issue", "46", "dave", "", "", "trigger with /Users/example/.metis")
+
+        let context = fetchGitCodeDiscussionContext(transport, event)
+        let json = context.toJsonString()
+
+        @Expect(json.contains("fake-secret"), false)
+        @Expect(json.contains("/Users/example"), false)
+        @Expect(json.contains("[REDACTED"), true)
     }
 }

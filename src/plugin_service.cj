@@ -200,7 +200,7 @@ public func buildGitCodeMonitorCapabilityDeclarations(): ArrayList<ServiceCapabi
         "gitcode.event.accepted",
         "event",
         direction: "gcm-to-metis",
-        description: "Accepted GitCode issue/PR/comment event; legacy top-level fields coexist with contractVersion and reviewRequest",
+        description: "Accepted GitCode issue/PR/comment event; legacy top-level fields coexist with contractVersion and reviewRequest, and accepted comment events may include reviewRequest.context parent/previous-comment facts",
         outputSchema: "schemas/gitcode.event.accepted.contract-v1-plus-legacy.json"
     ))
     records.add(ServiceCapabilityRecord(
