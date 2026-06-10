@@ -323,6 +323,17 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func p1u003PluginStdioUsesFileBackedStdinInsteadOfConsoleReader(): Unit {
+        // T-P1-U-003
+        let runtimeSource = readFixture("src/plugin_runtime.cj")
+        @Expect(runtimeSource.contains("getStdIn"), false)
+        @Expect(runtimeSource.contains("ConsoleReader"), false)
+        @Expect(runtimeSource.contains("METIS_SERVICE_PLUGIN_STDIN_PATH"), true)
+        @Expect(runtimeSource.contains("File(gcmPluginStdinPath(), OpenMode.Read)"), true)
+        @Expect(runtimeSource.contains("StringReader<File>"), true)
+    }
+
+    @TestCase
     public func p2u001OrphanCapabilityRemainsAsHistoricalDiagnosticCompatibility(): Unit {
         // T-P2-U-001
         let records = buildGitCodeMonitorCapabilityDeclarations()

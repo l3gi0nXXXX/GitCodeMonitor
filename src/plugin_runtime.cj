@@ -1,8 +1,9 @@
 package gitcodemonitor
 
 import std.collection.ArrayList
-import std.env.{getStdIn, getStdOut}
-import std.fs.{Path, exists}
+import std.env.{getStdOut, getVariable}
+import std.fs.{File, OpenMode, Path, exists}
+import std.io.StringReader
 import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonObject, JsonValue}
@@ -434,6 +435,35 @@ public class GcmMcpClientMode {
     }
 }
 
+private func gcmPluginStdinPath(): String {
+    getVariable("METIS_SERVICE_PLUGIN_STDIN_PATH") ?? "/dev/stdin"
+}
+
+private func readGcmPluginStdioLine(reader: StringReader<File>): Option<String> {
+    try {
+        reader.readln()
+    } catch (_: Exception) {
+        None<String>
+    }
+}
+
+private func shutdownGcmPluginRuntime(
+    runtime: RuntimeContainer,
+    state: MonitorState,
+    leasePath: ?String,
+    processorLoop: WebhookProcessorLoopRuntime,
+    listener: WebhookHttpServerRuntime
+): Unit {
+    let _ = runtime.store.save(state)
+    match (leasePath) {
+        case Some(path) =>
+            let _ = markGcmPluginLeaseStopped(path, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
+        case None => ()
+    }
+    processorLoop.stop()
+    listener.stop()
+}
+
 public func gcmPluginMain(args: Array<String>): Int64 {
     let writer = GcmPluginStdioWriter(GcmStdoutLineSink())
     let configRef = pluginArgValue(args, "--config") ?? pluginArgValue(args, "configRef") ?? defaultConfigPath()
@@ -468,52 +498,38 @@ public func gcmPluginMain(args: Array<String>): Int64 {
         processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
     )
     writer.writeFrame(ServiceFrame("response", "initialize", GCM_SERVICE_PLUGIN_ID, method: "initialize", payload: gcmInitializeResponsePayload(initResult)))
-    let stdin = getStdIn()
-    while (true) {
-        let line = try {
-            stdin.readln()
-        } catch (_: Exception) {
-            None<String>
-        }
-        match (line) {
-            case Some(raw) =>
-                let handled = handleGcmPluginInputLineWithJobs(
-                    raw,
-                    loaded.config,
-                    runtime,
-                    state,
-                    jobs,
-                    listenerSnapshot: Some<WebhookHttpServerSnapshot>(listener.snapshot()),
-                    processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
-                )
-                if (!handled.frame.frameType.isEmpty()) {
-                    writer.writeFrame(handled.frame)
-                }
-                if (!handled.asyncJobId.isEmpty()) {
-                    startGcmScanJobWorker(handled.asyncJobId, loaded.config, runtime, state, jobs, writer)
-                }
-                if (handled.shouldStop) {
-                    let _ = runtime.store.save(state)
-                    match (leasePath) {
-                        case Some(path) =>
-                            let _ = markGcmPluginLeaseStopped(path, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
-                        case None => ()
+    try (stdinFile = File(gcmPluginStdinPath(), OpenMode.Read)) {
+        let stdin = StringReader<File>(stdinFile)
+        while (true) {
+            match (readGcmPluginStdioLine(stdin)) {
+                case Some(raw) =>
+                    let handled = handleGcmPluginInputLineWithJobs(
+                        raw,
+                        loaded.config,
+                        runtime,
+                        state,
+                        jobs,
+                        listenerSnapshot: Some<WebhookHttpServerSnapshot>(listener.snapshot()),
+                        processorSnapshot: Some<WebhookProcessorLoopSnapshot>(processorLoop.snapshot())
+                    )
+                    if (!handled.frame.frameType.isEmpty()) {
+                        writer.writeFrame(handled.frame)
                     }
-                    processorLoop.stop()
-                    listener.stop()
+                    if (!handled.asyncJobId.isEmpty()) {
+                        startGcmScanJobWorker(handled.asyncJobId, loaded.config, runtime, state, jobs, writer)
+                    }
+                    if (handled.shouldStop) {
+                        shutdownGcmPluginRuntime(runtime, state, leasePath, processorLoop, listener)
+                        return 0
+                    }
+                case None =>
+                    shutdownGcmPluginRuntime(runtime, state, leasePath, processorLoop, listener)
                     return 0
-                }
-            case None =>
-                let _ = runtime.store.save(state)
-                match (leasePath) {
-                    case Some(path) =>
-                        let _ = markGcmPluginLeaseStopped(path, nowMs: DateTime.now().toUnixTimeStamp().toMilliseconds())
-                    case None => ()
-                }
-                processorLoop.stop()
-                listener.stop()
-                return 0
+            }
         }
+    } catch (_: Exception) {
+        shutdownGcmPluginRuntime(runtime, state, leasePath, processorLoop, listener)
+        return 2
     }
     0
 }
