@@ -598,6 +598,16 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "/Users/name/file"), config).reason, "local_path_detected")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, ""), config).reason, "draft_empty")
         @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("e1", "Cangjie/community", "issue", "1", request.url, "safe", parseStatus: "draft_too_large"), config).reason, "draft_too_large")
+        // DRAFT-M4-U-001
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("draft-m4-u-001", "Cangjie/community", "issue", "1", request.url, "{\"tool\":\"functions._answer_\",\"reason\":\"x\"}", safety: "approved"), config).reason, "draft_invalid_tool_json")
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("draft-m4-u-002", "Cangjie/community", "issue", "1", request.url, "{\"reason\":\"_answer_\"}", safety: "approved"), config).reason, "draft_invalid_tool_json")
+        // DRAFT-M4-B-001
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("draft-m4-b-001", "Cangjie/community", "issue", "1", request.url, "[\"x\"]", safety: "approved"), config).reason, "draft_raw_json")
+        // DRAFT-M4-N-001
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("draft-m4-n-001", "Cangjie/community", "issue", "1", request.url, "{\"result\":\"x\"}", safety: "approved"), config).reason, "draft_raw_json")
+        // DRAFT-M4-N-002
+        @Expect(evaluateGcmAutoReplyGate(GcmWritebackRequest("draft-m4-n-002", "Cangjie/community", "issue", "1", request.url, "auto-reply by gitcodemonitor", safety: "approved"), config).reason, "draft_forbidden_marker")
+        // DRAFT-M4-P-001
         @Expect(evaluateGcmAutoReplyGate(request, config).reason, "allow_write")
     }
 
@@ -868,6 +878,23 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(writer.written[0].contains("auto-reply"), false)
         @Expect(writer.written[0].contains("gitcodemonitor"), false)
         @Expect(writer.written[0].contains("<!--"), false)
+
+        // DRAFT-M4-U-001
+        let toolJson = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", "{\\\"tool\\\":\\\"functions._answer_\\\",\\\"reason\\\":\\\"x\\\"}"), GcmRuntime(config))
+        @Expect(toolJson.writerCalled, false)
+        @Expect(toolJson.decision.reason, "draft_invalid_tool_json")
+        // DRAFT-M4-B-001
+        let rawArrayJson = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", "[\\\"x\\\"]"), GcmRuntime(config))
+        @Expect(rawArrayJson.writerCalled, false)
+        @Expect(rawArrayJson.decision.reason, "draft_raw_json")
+        // DRAFT-M4-N-001
+        let rawObjectJson = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", "{\\\"result\\\":\\\"x\\\"}"), GcmRuntime(config))
+        @Expect(rawObjectJson.writerCalled, false)
+        @Expect(rawObjectJson.decision.reason, "draft_raw_json")
+        // DRAFT-M4-N-002
+        let forbiddenMarker = handleGcmWritebackApplyResult(payload.replace("初步看没有发现阻塞问题。", "auto-reply by gitcodemonitor"), GcmRuntime(config))
+        @Expect(forbiddenMarker.writerCalled, false)
+        @Expect(forbiddenMarker.decision.reason, "draft_forbidden_marker")
 
         let human = handleGcmWritebackApplyResult(payload.replace("\"needsHumanReview\":false", "\"needsHumanReview\":true"), GcmRuntime(config))
         @Expect(human.writerCalled, false)

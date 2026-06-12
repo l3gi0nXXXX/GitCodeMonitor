@@ -913,7 +913,85 @@ public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: Monit
     if (request.duplicate) { return GcmWritebackDecision(false, "duplicate") }
     if (containsSecret(request.draft)) { return GcmWritebackDecision(false, "secret_detected") }
     if (containsLocalPath(request.draft)) { return GcmWritebackDecision(false, "local_path_detected") }
+    if (gcmWritebackDraftLooksLikeToolJson(request.draft)) { return GcmWritebackDecision(false, "draft_invalid_tool_json") }
+    if (gcmWritebackDraftLooksLikeRawJson(request.draft)) { return GcmWritebackDecision(false, "draft_raw_json") }
+    if (gcmWritebackDraftContainsForbiddenMarker(request.draft)) { return GcmWritebackDecision(false, "draft_forbidden_marker") }
     GcmWritebackDecision(true, "allow_write")
+}
+
+private func gcmWritebackDraftLooksLikeToolJson(draft: String): Bool {
+    let trimmed = draft.trimAscii()
+    let root = try {
+        JsonValue.fromStr(trimmed).asObject()
+    } catch (_: Exception) {
+        return false
+    }
+    if (gcmJsonObjectHasAnyKey(root, ["tool", "name", "arguments", "function_call", "tool_calls"])) {
+        return true
+    }
+    gcmJsonObjectHasAnyStringValue(root, ["tool", "name", "function_call"], ["_answer_", "functions._answer_"]) ||
+        gcmJsonTextHasAnyQuotedValue(root.toJsonString(), ["_answer_", "functions._answer_"])
+}
+
+private func gcmWritebackDraftLooksLikeRawJson(draft: String): Bool {
+    let trimmed = draft.trimAscii()
+    let parsed = try {
+        JsonValue.fromStr(trimmed)
+    } catch (_: Exception) {
+        return false
+    }
+    try {
+        let _ = parsed.asObject()
+        return !gcmWritebackDraftLooksLikeToolJson(draft)
+    } catch (_: Exception) {
+        ()
+    }
+    try {
+        let _ = parsed.asArray()
+        return true
+    } catch (_: Exception) {
+        return false
+    }
+}
+
+private func gcmWritebackDraftContainsForbiddenMarker(draft: String): Bool {
+    let lower = draft.toAsciiLower()
+    lower.contains("auto-reply") ||
+        lower.contains("gitcodemonitor") ||
+        lower.contains("<!--") ||
+        lower.contains("hidden marker") ||
+        lower.contains("bot attribution")
+}
+
+private func gcmJsonObjectHasAnyKey(root: JsonObject, keys: Array<String>): Bool {
+    for (key in keys) {
+        match (root.get(key)) {
+            case Some(_) => return true
+            case None => ()
+        }
+    }
+    false
+}
+
+private func gcmJsonObjectHasAnyStringValue(root: JsonObject, keys: Array<String>, values: Array<String>): Bool {
+    for (key in keys) {
+        match (root.get(key)) {
+            case Some(value) =>
+                let text = try { value.asString().getValue() } catch (_: Exception) { "" }
+                for (expected in values) {
+                    if (text == expected) { return true }
+                }
+            case None => ()
+        }
+    }
+    false
+}
+
+private func gcmJsonTextHasAnyQuotedValue(json: String, values: Array<String>): Bool {
+    for (value in values) {
+        if (json.contains("\"${jsonEscape(value)}\"")) { return true }
+    }
+    false
 }
 
 public func emitGcmWritebackAudit(audit: GcmWritebackAudit, host: MetisHostClient): HostEmitResult {
