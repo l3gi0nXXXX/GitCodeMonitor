@@ -946,6 +946,39 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func draftE2E003GeneratedReplyToolJsonBypassMetisDoesNotCallWriter(): Unit {
+        // DRAFT-E2E-003.
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer)
+        let badPayload = "{" +
+            "\"contractVersion\":\"gcm-metis-gitcode-review-v1\"," +
+            "\"generatedReply\":{\"eventId\":\"draft-e2e-003\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"{\\\"tool\\\":\\\"functions._answer_\\\",\\\"reason\\\":\\\"当前任务只需要输出中文回复草稿\\\"}\",\"safety\":\"approved\",\"needsHumanReview\":false}" +
+            "}"
+        let blocked = handleGcmWritebackApplyResult(badPayload, runtime)
+        @Expect(blocked.ok, true)
+        @Expect(blocked.writerCalled, false)
+        @Expect(blocked.posted, false)
+        @Expect(blocked.decision.allowed, false)
+        @Expect(blocked.decision.reason, "draft_invalid_tool_json")
+        @Expect(writer.written.size, 0)
+
+        let safePayload = badPayload.replace("{\\\"tool\\\":\\\"functions._answer_\\\",\\\"reason\\\":\\\"当前任务只需要输出中文回复草稿\\\"}", "建议补充回归测试。")
+        let posted = handleGcmWritebackApplyResult(safePayload, runtime)
+        @Expect(posted.ok, true)
+        @Expect(posted.writerCalled, true)
+        @Expect(posted.posted, true)
+        @Expect(posted.decision.reason, "posted")
+        @Expect(writer.written.size, 1)
+        @Expect(writer.written[0].contains("建议补充回归测试。"), true)
+        @Expect(writer.written[0].contains("\"tool\""), false)
+    }
+
+    @TestCase
     public func writebackResponseFrameAndWebhookDiagnosticsExposeNewCounters(): Unit {
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
