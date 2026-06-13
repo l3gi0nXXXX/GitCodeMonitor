@@ -14,15 +14,17 @@ public class MaintainerSmtpConfig {
     public let port: Int64
     public let security: String
     public let username: String
+    public let password: String
     public let passwordEnv: String
     public let connectTimeoutMs: Int64
     public let sendTimeoutMs: Int64
 
-    public init(host: String, port: Int64, security: String, username: String, passwordEnv: String, connectTimeoutMs!: Int64 = 10000, sendTimeoutMs!: Int64 = 30000) {
+    public init(host: String, port: Int64, security: String, username: String, passwordEnv: String, password!: String = "", connectTimeoutMs!: Int64 = 10000, sendTimeoutMs!: Int64 = 30000) {
         this.host = host.trimAscii()
         this.port = port
         this.security = security.trimAscii().toAsciiLower()
         this.username = username.trimAscii()
+        this.password = password.trimAscii()
         this.passwordEnv = passwordEnv.trimAscii()
         this.connectTimeoutMs = connectTimeoutMs
         this.sendTimeoutMs = sendTimeoutMs
@@ -33,6 +35,7 @@ public class MaintainerSmtpConfig {
         this.port = 0
         this.security = "ssl"
         this.username = ""
+        this.password = ""
         this.passwordEnv = ""
         this.connectTimeoutMs = 10000
         this.sendTimeoutMs = 30000
@@ -168,11 +171,12 @@ public interface MaintainerSmtpTransport {
 public class FakeSmtpTransport <: MaintainerSmtpTransport {
     public let mimeMessages = ArrayList<String>()
     public let recipients = ArrayList<String>()
+    public let passwords = ArrayList<String>()
     public var nextResult: MaintainerEmailSendResult = MaintainerEmailSendResult("sent")
     public init() {}
     public func send(config: MaintainerNotificationEmailConfig, message: MaintainerEmailMessage, mime: String, password: String): MaintainerEmailSendResult {
         let _ = config
-        let _ = password
+        passwords.add(password)
         mimeMessages.add(mime)
         for (recipient in message.recipients) { recipients.add(recipient) }
         if (nextResult.status == "sent") {
@@ -618,7 +622,7 @@ public class SmtpMaintainerEmailSender <: MaintainerEmailSender {
 
     public func send(message: MaintainerEmailMessage): MaintainerEmailSendResult {
         if (!config.enabled) { return MaintainerEmailSendResult("email_disabled") }
-        let password = getVariable(config.smtp.passwordEnv) ?? ""
+        let password = if (!config.smtp.password.isEmpty()) { config.smtp.password } else { getVariable(config.smtp.passwordEnv) ?? "" }
         if (password.trimAscii().isEmpty()) {
             return MaintainerEmailSendResult("send_failed", retryable: false, failedCount: message.recipients.size, diagnostic: "smtp_password_env_missing")
         }

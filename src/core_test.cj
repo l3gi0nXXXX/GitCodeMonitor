@@ -188,6 +188,25 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
         @Expect(validateConfig(valid), "ok")
         @Expect(configSummary(valid).contains("GCM_SMTP_PASSWORD"), false)
 
+        let directPassword = loadConfigJsonForTest("gcm-maintainer-email-direct-password", "{" +
+            "\"gitcode\":{\"maintainerNotification\":{\"email\":{" +
+            "\"enabled\":true,\"transport\":\"smtp\"," +
+            "\"smtp\":{\"host\":\"smtp.example.com\",\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"password\":\"SMTP_SECRET_VALUE\"}," +
+            "\"from\":\"bot@example.com\",\"replyTo\":\"reply@example.com\"" +
+            "}}}}"
+        )
+        @Expect(directPassword.maintainerNotificationEmail.smtp.password, "SMTP_SECRET_VALUE")
+        @Expect(directPassword.maintainerNotificationEmail.smtp.passwordEnv, "")
+        @Expect(validateConfig(directPassword), "ok")
+        @Expect(configSummary(directPassword).contains("SMTP_SECRET_VALUE"), false)
+        let directTransport = FakeSmtpTransport()
+        let directSender = SmtpMaintainerEmailSender(directPassword.maintainerNotificationEmail, transport: directTransport)
+        let directResult = directSender.send(MaintainerEmailMessage(["alice@example.com"], "subject", "body"))
+        @Expect(directResult.status, "sent")
+        @Expect(directSender.connectCount, 1)
+        @Expect(directTransport.passwords.size, 1)
+        @Expect(directTransport.passwords[0], "SMTP_SECRET_VALUE")
+
         let badHost = loadConfigJsonForTest("gcm-maintainer-email-bad-host", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"},\"from\":\"bot@example.com\"}}}}")
         @Expect(validateConfig(badHost).contains("maintainerNotification.email.smtp.host"), true)
         let badPort = loadConfigJsonForTest("gcm-maintainer-email-bad-port", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"host\":\"smtp.example.com\",\"port\":70000,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"},\"from\":\"bot@example.com\"}}}}")

@@ -388,6 +388,11 @@ public class AuditRecord {
     public var safety: String
     public var deliveryStatus: String
     public var writeDecision: String
+    public var emailNotificationStatus: String
+    public var emailSentCount: Int64
+    public var emailFailedCount: Int64
+    public var emailRetryable: Bool
+    public var emailDiagnostic: String
 
     public init(eventId: String, status!: String = "pending", reason!: String = "") {
         this.eventId = eventId
@@ -399,6 +404,11 @@ public class AuditRecord {
         this.safety = ""
         this.deliveryStatus = "pending"
         this.writeDecision = ""
+        this.emailNotificationStatus = ""
+        this.emailSentCount = 0
+        this.emailFailedCount = 0
+        this.emailRetryable = false
+        this.emailDiagnostic = ""
     }
 }
 
@@ -649,6 +659,11 @@ public class StateStore {
                         audit.safety = readJsonString(row, "safety")
                         audit.deliveryStatus = readJsonString(row, "deliveryStatus")
                         audit.writeDecision = readJsonString(row, "writeDecision")
+                        audit.emailNotificationStatus = readJsonString(row, "emailNotificationStatus")
+                        audit.emailSentCount = readJsonInt(row, "emailSentCount")
+                        audit.emailFailedCount = readJsonInt(row, "emailFailedCount")
+                        audit.emailRetryable = firstJsonBool(row, ["emailRetryable"], false)
+                        audit.emailDiagnostic = readJsonString(row, "emailDiagnostic")
                         state.addAudit(audit)
                     }
                 case None => ()
@@ -703,6 +718,11 @@ public func stateToJson(state: MonitorState): JsonObject {
         row.put("safety", JsonString(record.safety))
         row.put("deliveryStatus", JsonString(record.deliveryStatus))
         row.put("writeDecision", JsonString(record.writeDecision))
+        row.put("emailNotificationStatus", JsonString(record.emailNotificationStatus))
+        row.put("emailSentCount", JsonInt(record.emailSentCount))
+        row.put("emailFailedCount", JsonInt(record.emailFailedCount))
+        row.put("emailRetryable", JsonBool(record.emailRetryable))
+        row.put("emailDiagnostic", JsonString(record.emailDiagnostic))
         audits.add(row)
     }
     root.put("audit", audits)
@@ -2022,6 +2042,7 @@ func parseMaintainerNotificationEmailConfig(obj: JsonObject): MaintainerNotifica
         if (firstJsonString(smtpObj, ["security"]).isEmpty()) { "ssl" } else { firstJsonString(smtpObj, ["security"]) },
         firstJsonString(smtpObj, ["username"]),
         firstJsonString(smtpObj, ["passwordEnv"]),
+        password: firstJsonString(smtpObj, ["password"]),
         connectTimeoutMs: firstPositiveOrDefault(firstJsonInt(smtpObj, ["connectTimeoutMs"]), 10000),
         sendTimeoutMs: firstPositiveOrDefault(firstJsonInt(smtpObj, ["sendTimeoutMs"]), 30000)
     )
@@ -2224,7 +2245,7 @@ public func validateMaintainerNotificationEmailConfig(config: MaintainerNotifica
     if (!(config.smtp.security == "ssl" || config.smtp.security == "starttls" || config.smtp.security == "none")) { return "smtp.security" }
     if (config.smtp.security == "none" && !config.allowPlainSmtpForTest) { return "smtp.security" }
     if (config.smtp.username.trimAscii().isEmpty()) { return "smtp.username" }
-    if (!envNameIsValid(config.smtp.passwordEnv)) { return "smtp.passwordEnv" }
+    if (config.smtp.password.isEmpty() && !envNameIsValid(config.smtp.passwordEnv)) { return "smtp.passwordEnv" }
     let from = if (!config.from.isEmpty()) { config.from } else { config.smtp.username }
     if (!isValidMaintainerEmail(from)) { return "from" }
     if (!config.replyTo.isEmpty() && !isValidMaintainerEmail(config.replyTo)) { return "replyTo" }

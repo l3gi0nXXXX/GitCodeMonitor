@@ -934,7 +934,7 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
     } else {
         MaintainerEmailSendResult("email_disabled")
     }
-    recordGcmWritebackAuditState(runtime.state, request, finalDecision, replyUrl: if (writeStatus == "posted") { replyUrl } else { "" }, posted: writeStatus == "posted")
+    recordGcmWritebackAuditState(runtime.state, request, finalDecision, replyUrl: if (writeStatus == "posted") { replyUrl } else { "" }, posted: writeStatus == "posted", emailResult: emailResult)
     GcmWritebackApplyResult(
         true,
         finalDecision,
@@ -1154,13 +1154,22 @@ public func buildGcmWritebackAudit(request: GcmWritebackRequest, decision: GcmWr
     GcmWritebackAudit(request.eventId, decision.reason, hashRawPayload(request.draft), replyUrl: sanitizeWritebackReplyUrlForStorage(replyUrl))
 }
 
-private func recordGcmWritebackAuditState(state: MonitorState, request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = "", posted!: Bool = false): Unit {
+private func recordGcmWritebackAuditState(state: MonitorState, request: GcmWritebackRequest, decision: GcmWritebackDecision, replyUrl!: String = "", posted!: Bool = false, emailResult!: MaintainerEmailSendResult = MaintainerEmailSendResult("email_disabled")): Unit {
     let status = if (posted) { "writeback_posted" } else { "writeback_skipped" }
     let record = AuditRecord(if (request.eventId.isEmpty()) { "writeback" } else { request.eventId }, status: status, reason: decision.reason)
     record.replyUrl = sanitizeWritebackReplyUrlForStorage(replyUrl)
     record.writeDecision = decision.reason
     record.safety = request.safety
+    record.emailNotificationStatus = emailResult.status
+    record.emailSentCount = emailResult.sentCount
+    record.emailFailedCount = emailResult.failedCount
+    record.emailRetryable = emailResult.retryable
+    record.emailDiagnostic = sanitizeGcmEmailDiagnosticForAudit(emailResult.diagnostic)
     state.addAudit(record)
+}
+
+private func sanitizeGcmEmailDiagnosticForAudit(raw: String): String {
+    compactSummary(redactSecrets(raw), limit: 200)
 }
 
 private func isRetryableGcmWritebackStatus(status: String): Bool {
