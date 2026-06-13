@@ -6,6 +6,64 @@ import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
 
+class FakeMaintainerSmtpProcessForTest <: MaintainerSmtpProcess {
+    public let writes = ArrayList<String>()
+    private let responses = ArrayList<String>()
+    public var terminated = false
+
+    public init(responses!: Array<String> = []) {
+        for (response in responses) {
+            this.responses.add(response)
+        }
+    }
+
+    public func write(data: String): Unit {
+        writes.add(data)
+    }
+
+    public func readLine(timeoutMs: Int64): Option<String> {
+        let _ = timeoutMs
+        if (responses.isEmpty()) {
+            return None<String>
+        }
+        let line = responses[0]
+        responses.remove(at: 0)
+        Some(line)
+    }
+
+    public func isAlive(): Bool {
+        !terminated
+    }
+
+    public func wait(timeoutMs: Int64): Option<Int64> {
+        let _ = timeoutMs
+        Some(0)
+    }
+
+    public func terminate(force: Bool): Unit {
+        let _ = force
+        terminated = true
+    }
+
+    public func stderrSummary(): String {
+        ""
+    }
+}
+
+class FakeMaintainerSmtpRunnerForTest <: MaintainerSmtpProcessRunner {
+    public let starts = ArrayList<MaintainerNotificationEmailConfig>()
+    public let process: FakeMaintainerSmtpProcessForTest
+
+    public init(process: FakeMaintainerSmtpProcessForTest) {
+        this.process = process
+    }
+
+    public func start(config: MaintainerNotificationEmailConfig): MaintainerSmtpProcessStartResult {
+        starts.add(config)
+        MaintainerSmtpProcessStartResult.Started(process)
+    }
+}
+
 @Test
 public class GitCodeMonitorCoreServicePluginOnlyTest {
     private func tempDir(name: String): Path {
@@ -150,6 +208,87 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
         @Expect(mime.data.contains("Bearer secret"), false)
         @Expect(mime.data.contains("/Users/alice"), false)
         @Expect(mime.data.contains("GCM_SMTP_PASSWORD"), false)
+
+        let defaultSender = SmtpMaintainerEmailSender(valid.maintainerNotificationEmail)
+        @Expect(defaultSender.transport is NativeSmtpTransport, true)
+    }
+
+    @TestCase
+    public func t3GcmUnit005NativeSmtpTransportSpeaksSmtpWithoutLeakingPassword(): Unit {
+        let config = MaintainerNotificationEmailConfig(
+            enabled: true,
+            smtp: MaintainerSmtpConfig("smtp.example.test", 465, "ssl", "bot@example.com", "GCM_SMTP_PASSWORD"),
+            from: "bot@example.com",
+            replyTo: "bot@example.com"
+        )
+        let message = MaintainerEmailMessage(
+            ["alice@example.com", "bob@example.com"],
+            "subject",
+            "body",
+            repo: "Cangjie/community",
+            kind: "issue",
+            number: "520",
+            url: "https://gitcode.com/Cangjie/community/issues/520",
+            replyUrl: "https://gitcode.com/Cangjie/community/issues/520#note_1"
+        )
+        let mime = buildSmtpMimeMessage(message, config)
+        @Expect(mime.ok, true)
+        let process = FakeMaintainerSmtpProcessForTest(responses: [
+            "220 smtp.example.test ESMTP ready",
+            "250-smtp.example.test",
+            "250-AUTH PLAIN LOGIN",
+            "250 OK",
+            "235 Authentication successful",
+            "250 OK",
+            "250 OK",
+            "250 OK",
+            "354 End data with <CR><LF>.<CR><LF>",
+            "250 queued",
+            "221 bye"
+        ])
+        let runner = FakeMaintainerSmtpRunnerForTest(process)
+        let result = NativeSmtpTransport(runner: runner).send(config, message, mime.data, "smtp-secret")
+
+        @Expect(result.status, "sent")
+        @Expect(result.sentCount, 2)
+        @Expect(result.failedCount, 0)
+        @Expect(runner.starts.size, 1)
+        let written = joinStrings(process.writes.toArray(), "")
+        @Expect(written.contains("EHLO localhost\r\n"), true)
+        @Expect(written.contains("AUTH PLAIN "), true)
+        @Expect(written.contains("smtp-secret"), false)
+        @Expect(written.contains("MAIL FROM:<bot@example.com>\r\n"), true)
+        @Expect(written.contains("RCPT TO:<alice@example.com>\r\n"), true)
+        @Expect(written.contains("RCPT TO:<bob@example.com>\r\n"), true)
+        @Expect(written.contains("DATA\r\n"), true)
+        @Expect(written.contains("Subject: subject"), true)
+        @Expect(written.endsWith("QUIT\r\n"), true)
+    }
+
+    @TestCase
+    public func t3GcmUnit006NativeSmtpTransportReportsAuthenticationFailureSafely(): Unit {
+        let config = MaintainerNotificationEmailConfig(
+            enabled: true,
+            smtp: MaintainerSmtpConfig("smtp.example.test", 465, "ssl", "bot@example.com", "GCM_SMTP_PASSWORD"),
+            from: "bot@example.com"
+        )
+        let message = MaintainerEmailMessage(["alice@example.com"], "subject", "body")
+        let mime = buildSmtpMimeMessage(message, config)
+        @Expect(mime.ok, true)
+        let process = FakeMaintainerSmtpProcessForTest(responses: [
+            "220 smtp.example.test ESMTP ready",
+            "250-smtp.example.test",
+            "250-AUTH PLAIN LOGIN",
+            "250 OK",
+            "535 Authentication failed"
+        ])
+        let result = NativeSmtpTransport(runner: FakeMaintainerSmtpRunnerForTest(process)).send(config, message, mime.data, "smtp-secret")
+
+        @Expect(result.status, "send_failed")
+        @Expect(result.retryable, false)
+        @Expect(result.failedCount, 1)
+        @Expect(result.diagnostic.contains("smtp_auth_failed"), true)
+        @Expect(joinStrings(process.writes.toArray(), "").contains("smtp-secret"), false)
     }
 
     @TestCase

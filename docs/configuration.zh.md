@@ -78,7 +78,7 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 
 维护者 lookup、footer 和邮件通知都属于 GCM。Metis 不读取 `team/repo_list.md`，不读取 `.gitcode/CODEOWNERS`，也不发送维护者邮件。
 
-邮件通知默认关闭。启用后，GCM 只会在 GitCode 评论写回成功后发送邮件；gate 失败、dry-run、`autoReply=false`、GitCode writer 失败、draft 含 secret 或本机路径时都不会发送邮件。测试必须使用 fake sender 或 fake SMTP transport，不得连接真实 SMTP 服务。
+邮件通知默认关闭。启用后，GCM 只会在 GitCode 评论写回成功后发送邮件；gate 失败、dry-run、`autoReply=false`、GitCode writer 失败、draft 含 secret 或本机路径时都不会发送邮件。生产 SMTP transport 通过本机 `openssl s_client` 建立 `ssl`/`starttls` SMTP 连接，因此运行 GCM 的环境需要能从 `PATH` 找到 `openssl`。测试必须使用 fake sender 或 fake SMTP transport，不得连接真实 SMTP 服务。
 
 维护者邮箱默认从 GitCode 用户接口动态查询：GCM 根据维护者 mention/login 调用 `GET {gitcode.baseUrl}/users/{login}`，读取响应中的 email 字段。生产默认路径是动态查询；`addressBook` 只作为 `fallbackToAddressBook=true` 时的兜底。GCM 不会根据 login 拼接邮箱，也不会把 `github_account` 当作收件邮箱。
 
