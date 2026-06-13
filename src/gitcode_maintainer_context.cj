@@ -185,7 +185,12 @@ public class GcmMaintainerContextStore {
     }
 }
 
-public func resolveGcmMaintainerContext(transport: GitCodeHttpTransport, event: GitCodeEvent): GcmMaintainerContext {
+public func resolveGcmMaintainerContext(
+    transport: GitCodeHttpTransport,
+    event: GitCodeEvent,
+    emailConfig!: MaintainerNotificationEmailConfig = MaintainerNotificationEmailConfig(),
+    emailCache!: MaintainerEmailLookupCache = MaintainerEmailLookupCache()
+): GcmMaintainerContext {
     let repo = "${event.org}/${event.repo}"
     let diagnostics = ArrayList<String>()
     let repoList = fetchRepoListMd(transport.client, sender: transport.sender)
@@ -211,7 +216,7 @@ public func resolveGcmMaintainerContext(transport: GitCodeHttpTransport, event: 
             diagnostics.add("codeowners_${codeowners.status}:${codeowners.diagnostic}")
         }
     }
-    GcmMaintainerContext(
+    let baseContext = GcmMaintainerContext(
         event.id,
         repo,
         event.itemKind,
@@ -225,6 +230,7 @@ public func resolveGcmMaintainerContext(transport: GitCodeHttpTransport, event: 
         contextSource: if (teamResolution.teamLeaderStatus == "resolved" || codeownerResolution.codeownerStatus == "resolved") { "deterministic_fallback" } else { "unavailable" },
         diagnostics: diagnostics.toArray()
     )
+    contextWithResolvedUserEmails(baseContext, transport.client, transport.sender, emailConfig, emailCache)
 }
 
 public func fetchPullRequestChangedFiles(client: GitCodeApiClient, repo: GitCodeRepo, number: String, sender!: HttpSender = NativeHttpSender()): GitCodeChangedFilesResult {
@@ -298,6 +304,58 @@ public func contextWithAddressBookEmails(context: GcmMaintainerContext, config: 
         changedFilesTruncated: context.changedFilesTruncated,
         contextSource: context.contextSource,
         diagnostics: context.diagnostics,
+        createdAtMs: context.createdAtMs
+    )
+}
+
+public func contextWithResolvedUserEmails(
+    context: GcmMaintainerContext,
+    client: GitCodeApiClient,
+    sender: HttpSender,
+    config: MaintainerNotificationEmailConfig,
+    cache: MaintainerEmailLookupCache
+): GcmMaintainerContext {
+    let diagnostics = ArrayList<String>()
+    for (diagnostic in context.diagnostics) { diagnostics.add(diagnostic) }
+
+    let teamEmails = ArrayList<String>()
+    for (email in context.teamLeaderEmails) { teamEmails.add(email) }
+    if (teamEmails.size == 0 && config.enabled && config.userLookup.enabled) {
+        let resolved = resolveMaintainerEmailsForMentions(context.teamLeaderMentions, client, sender, config, cache)
+        for (email in resolved.emails) { teamEmails.add(email) }
+        if (resolved.status != "resolved" && resolved.status != "lookup_disabled") { diagnostics.add("team_email_${resolved.status}") }
+    }
+    if (teamEmails.size == 0 && config.enabled && config.userLookup.fallbackToAddressBook) {
+        for (email in emailDomainsForMentions(context.teamLeaderMentions, config)) { teamEmails.add(email) }
+    }
+
+    let ownerEmails = ArrayList<String>()
+    for (email in context.codeownerEmails) { ownerEmails.add(email) }
+    if (ownerEmails.size == 0 && config.enabled && config.userLookup.enabled) {
+        let resolved = resolveMaintainerEmailsForMentions(context.codeownerMentions, client, sender, config, cache)
+        for (email in resolved.emails) { ownerEmails.add(email) }
+        if (resolved.status != "resolved" && resolved.status != "lookup_disabled") { diagnostics.add("codeowner_email_${resolved.status}") }
+    }
+    if (ownerEmails.size == 0 && config.enabled && config.userLookup.fallbackToAddressBook) {
+        for (email in emailDomainsForMentions(context.codeownerMentions, config)) { ownerEmails.add(email) }
+    }
+
+    GcmMaintainerContext(
+        context.eventId,
+        context.repo,
+        context.kind,
+        context.number,
+        sourceEventId: context.sourceEventId,
+        teamLeaderMentions: context.teamLeaderMentions,
+        codeownerMentions: context.codeownerMentions,
+        teamLeaderEmails: normalizeMaintainerEmails(teamEmails.toArray(), allowedDomains: config.allowedDomains),
+        codeownerEmails: normalizeMaintainerEmails(ownerEmails.toArray(), allowedDomains: config.allowedDomains),
+        teamLeaderStatus: context.teamLeaderStatus,
+        codeownerStatus: context.codeownerStatus,
+        changedFiles: context.changedFiles,
+        changedFilesTruncated: context.changedFilesTruncated,
+        contextSource: context.contextSource,
+        diagnostics: diagnostics.toArray(),
         createdAtMs: context.createdAtMs
     )
 }

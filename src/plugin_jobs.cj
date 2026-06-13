@@ -532,7 +532,12 @@ func scanOnceRuntimeBoundedForJob(
                         if (processed.newEvents > 0) {
                             match (eventWriter) {
                                 case Some(writer) =>
-                                    let maintainerContext = resolveGcmMaintainerContext(runtime.gitCode, event)
+                                    let maintainerContext = resolveGcmMaintainerContext(
+                                        runtime.gitCode,
+                                        event,
+                                        emailConfig: config.maintainerNotificationEmail,
+                                        emailCache: runtime.maintainerEmailLookupCache
+                                    )
                                     let _ = runtime.maintainerContextStore.put(maintainerContext)
                                     emitGcmAcceptedScanEvent(job.jobId, event, writer, maintainerContext: Some<GcmMaintainerContext>(maintainerContext))
                                 case None => ()

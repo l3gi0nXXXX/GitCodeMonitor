@@ -100,6 +100,7 @@ public class GcmRuntime {
     public let state: MonitorState
     public let writer: GitCodeWritebackWriter
     public let maintainerContextStore: GcmMaintainerContextStore
+    public let maintainerEmailLookupCache: MaintainerEmailLookupCache
     public let emailSender: MaintainerEmailSender
     public let gitCode: ?GitCodeHttpTransport
     public init(
@@ -107,6 +108,7 @@ public class GcmRuntime {
         state!: MonitorState = MonitorState(),
         writer!: GitCodeWritebackWriter = FakeCommentWriter(),
         maintainerContextStore!: GcmMaintainerContextStore = GcmMaintainerContextStore(),
+        maintainerEmailLookupCache!: MaintainerEmailLookupCache = MaintainerEmailLookupCache(),
         emailSender!: MaintainerEmailSender = NoopMaintainerEmailSender(),
         gitCode!: ?GitCodeHttpTransport = None<GitCodeHttpTransport>
     ) {
@@ -114,6 +116,7 @@ public class GcmRuntime {
         this.state = state
         this.writer = writer
         this.maintainerContextStore = maintainerContextStore
+        this.maintainerEmailLookupCache = maintainerEmailLookupCache
         this.emailSender = emailSender
         this.gitCode = gitCode
     }
@@ -743,7 +746,7 @@ public func handleGcmPluginInputLineWithJobs(
         return GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", "{\"ok\":true,\"status\":\"ok\"}"))
     }
     if (frame.method == "status") {
-        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
+        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, maintainerEmailLookupCache: runtime.maintainerEmailLookupCache, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
         return GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
     }
     if (frame.method == "stop") {
@@ -754,7 +757,7 @@ public func handleGcmPluginInputLineWithJobs(
     }
     match (frame.capabilityId) {
         case "gitcode.monitor.status" =>
-            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
+            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, maintainerEmailLookupCache: runtime.maintainerEmailLookupCache, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
             GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
         case "gitcode.monitor.scan_once" =>
             let mode = scanPayloadMode(frame.payload)
@@ -857,7 +860,7 @@ public func handleGcmPluginInputLineWithJobs(
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "accepted", eventReconcilePayload(config)))
         case "gitcode.writeback.apply_result" =>
             let beforeVersion = state.version()
-            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
+            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, maintainerEmailLookupCache: runtime.maintainerEmailLookupCache, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
             let saved = runtime.store.saveIfChanged(state, beforeVersion, reason: "writeback_apply_result")
             let ok = applied.ok && saved.status != "state_save_failed"
             let status = if (ok) { applied.decision.reason } else { "state_save_failed" }
@@ -960,7 +963,12 @@ func withResolvedWritebackMaintainerContext(request: GcmWritebackRequest, runtim
                     let parts = request.repo.split("/", 2)
                     if (parts.size == 2 && !request.number.isEmpty()) {
                         let fallbackEvent = GitCodeEvent(request.eventId, parts[0], parts[1], request.kind, request.number, "metis", "", request.url, request.draft)
-                        let resolved = resolveGcmMaintainerContext(transport, fallbackEvent)
+                        let resolved = resolveGcmMaintainerContext(
+                            transport,
+                            fallbackEvent,
+                            emailConfig: runtime.config.maintainerNotificationEmail,
+                            emailCache: runtime.maintainerEmailLookupCache
+                        )
                         if (resolved.teamLeaderMentions.size > 0 || resolved.codeownerMentions.size > 0) {
                             resolved
                         } else if (request.teamLeaderMentions.size > 0 || request.codeownerMentions.size > 0) {
@@ -979,7 +987,17 @@ func withResolvedWritebackMaintainerContext(request: GcmWritebackRequest, runtim
                     }
             }
     }
-    let withEmails = contextWithAddressBookEmails(context, runtime.config.maintainerNotificationEmail)
+    let withEmails = match (runtime.gitCode) {
+        case Some(transport) =>
+            contextWithResolvedUserEmails(
+                context,
+                transport.client,
+                transport.sender,
+                runtime.config.maintainerNotificationEmail,
+                runtime.maintainerEmailLookupCache
+            )
+        case None => contextWithAddressBookEmails(context, runtime.config.maintainerNotificationEmail)
+    }
     GcmWritebackRequest(
         request.eventId,
         request.repo,

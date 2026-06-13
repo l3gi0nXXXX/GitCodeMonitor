@@ -791,11 +791,13 @@ public class HttpRequestSpec {
     public let url: String
     public let headers: Array<(String, String)>
     public let body: String
-    public init(method: String, url: String, headers!: Array<(String, String)> = [], body!: String = "") {
+    public let timeoutMs: Int64
+    public init(method: String, url: String, headers!: Array<(String, String)> = [], body!: String = "", timeoutMs!: Int64 = 0) {
         this.method = method
         this.url = url
         this.headers = headers
         this.body = body
+        this.timeoutMs = timeoutMs
     }
     public func redactedLogLine(): String {
         let parts = ArrayList<String>()
@@ -855,7 +857,13 @@ public class NativeHttpSender <: HttpSender {
 
     public func send(request: HttpRequestSpec): HttpResponseSpec {
         try {
-            rawTransport.send(request, this.timeoutSeconds)
+            let requestTimeoutSeconds = if (request.timeoutMs > 0) {
+                let seconds = (request.timeoutMs + 999) / 1000
+                if (seconds < 1) { 1 } else { seconds }
+            } else {
+                this.timeoutSeconds
+            }
+            rawTransport.send(request, requestTimeoutSeconds)
         } catch (e: Exception) {
             HttpResponseSpec(599, body: "transport_error: ${redactSecrets(redactUrl(e.message))}")
         }
@@ -937,6 +945,11 @@ public class CurlHttpSender <: HttpSender {
         for ((key, value) in request.headers) {
             args.add("-H")
             args.add("${key}: ${value}")
+        }
+        if (request.timeoutMs > 0) {
+            let timeoutSeconds = if (request.timeoutMs < 1000) { 1 } else { (request.timeoutMs + 999) / 1000 }
+            args.add("--max-time")
+            args.add("${timeoutSeconds}")
         }
         if (!request.body.isEmpty()) {
             args.add("--data")
@@ -1073,6 +1086,10 @@ public class GitCodeApiClient {
         HttpRequestSpec("GET", withAuthQuery("${baseUrl}/repos/${urlPart(repo.org)}/${urlPart(repo.name)}/pulls/${number}/files"), headers: authHeaders())
     }
 
+    public func userProfileRequest(login: String, timeoutMs!: Int64 = 0): HttpRequestSpec {
+        HttpRequestSpec("GET", withAuthQuery("${baseUrl}/users/${urlPart(login)}"), headers: authHeaders(), timeoutMs: timeoutMs)
+    }
+
     public func postCommentRequest(event: GitCodeEvent, body: String): HttpRequestSpec {
         let kind = if (event.itemKind == "pr") { "pulls" } else { "issues" }
         let json = "{\"body\":\"${jsonEscape(body)}\"}"
@@ -1188,6 +1205,7 @@ public class RuntimeContainer {
     public let gitCode: GitCodeHttpTransport
     public let writer: GitCodeCommentWriter
     public let maintainerContextStore: GcmMaintainerContextStore
+    public let maintainerEmailLookupCache: MaintainerEmailLookupCache
     public let emailSender: MaintainerEmailSender
     public let httpTransportKind: String
 
@@ -1206,6 +1224,10 @@ public class RuntimeContainer {
         this.gitCode = GitCodeHttpTransport(client, sender: this.sender, pageSize: 100)
         this.writer = GitCodeCommentWriter(client, sender: this.sender)
         this.maintainerContextStore = GcmMaintainerContextStore(path: "${config.statePath}.maintainer-context.json")
+        this.maintainerEmailLookupCache = MaintainerEmailLookupCache(
+            maxEntries: config.maintainerNotificationEmail.userLookup.maxCacheEntries,
+            ttlMs: config.maintainerNotificationEmail.userLookup.cacheTtlMs
+        )
         this.emailSender = if (config.maintainerNotificationEmail.enabled) { SmtpMaintainerEmailSender(config.maintainerNotificationEmail) } else { NoopMaintainerEmailSender() }
     }
 }
@@ -1985,6 +2007,14 @@ func applyMaintainerNotificationSection(config: MonitorConfig, obj: JsonObject):
 func parseMaintainerNotificationEmailConfig(obj: JsonObject): MaintainerNotificationEmailConfig {
     let enabled = firstJsonBool(obj, ["enabled"], false)
     let transport = firstNonEmpty([firstJsonString(obj, ["transport"]), "smtp"])
+    let userLookupObj = nestedObject(obj, ["userLookup"])
+    let userLookup = MaintainerUserEmailLookupConfig(
+        enabled: firstJsonBool(userLookupObj, ["enabled"], true),
+        timeoutMs: firstPositiveOrDefault(firstJsonInt(userLookupObj, ["timeoutMs"]), 10000),
+        cacheTtlMs: firstPositiveOrDefault(firstJsonInt(userLookupObj, ["cacheTtlMs"]), 24 * 60 * 60 * 1000),
+        maxCacheEntries: firstPositiveOrDefault(firstJsonInt(userLookupObj, ["maxCacheEntries"]), 4096),
+        fallbackToAddressBook: firstJsonBool(userLookupObj, ["fallbackToAddressBook"], true)
+    )
     let smtpObj = nestedObject(obj, ["smtp"])
     let smtp = MaintainerSmtpConfig(
         firstJsonString(smtpObj, ["host"]),
@@ -1998,6 +2028,7 @@ func parseMaintainerNotificationEmailConfig(obj: JsonObject): MaintainerNotifica
     MaintainerNotificationEmailConfig(
         enabled: enabled,
         transport: transport,
+        userLookup: userLookup,
         smtp: smtp,
         from: firstJsonString(obj, ["from"]),
         replyTo: firstJsonString(obj, ["replyTo"]),
@@ -2185,6 +2216,9 @@ public func validateAuthorPolicyConfig(policy: AuthorPolicyConfig): String {
 public func validateMaintainerNotificationEmailConfig(config: MaintainerNotificationEmailConfig): String {
     if (!config.enabled) { return "ok" }
     if (config.transport != "smtp") { return "transport" }
+    if (config.userLookup.timeoutMs <= 0) { return "userLookup.timeoutMs" }
+    if (config.userLookup.cacheTtlMs <= 0) { return "userLookup.cacheTtlMs" }
+    if (config.userLookup.maxCacheEntries <= 0) { return "userLookup.maxCacheEntries" }
     if (config.smtp.host.trimAscii().isEmpty()) { return "smtp.host" }
     if (config.smtp.port < 1 || config.smtp.port > 65535) { return "smtp.port" }
     if (!(config.smtp.security == "ssl" || config.smtp.security == "starttls" || config.smtp.security == "none")) { return "smtp.security" }

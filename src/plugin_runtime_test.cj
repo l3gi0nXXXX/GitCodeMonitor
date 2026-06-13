@@ -924,7 +924,7 @@ public class GitCodeMonitorPluginRuntimeTest {
 
     @TestCase
     public func t3GcmEmailSenderAndWritebackSemanticsUseOnlyFakeTransport(): Unit {
-        // T3-GCM-POS-001, T3-GCM-POS-002, T3-GCM-NEG-001, T3-GCM-NEG-002, T3-GCM-NEG-003, T3-GCM-NEG-004, T3-GCM-BOUND-001, T3-GCM-BOUND-004, T3-GCM-REG-001, T5-E2E-POS-003, T5-E2E-NEG-001, T5-E2E-NEG-002, T5-E2E-BOUND-002
+        // T3-GCM-POS-001, T3-GCM-POS-002, T3-GCM-NEG-001, T3-GCM-NEG-002, T3-GCM-NEG-003, T3-GCM-NEG-004, T3-GCM-BOUND-001, T3-GCM-BOUND-004, T3-GCM-REG-001, T5-E2E-POS-003, T5-E2E-NEG-001, T5-E2E-NEG-002, T5-E2E-BOUND-002, E0-UNIT-001, E0-POS-001, E0-NEG-001, E3-POS-003, E3-NEG-001, E3-BOUND-001, E3-BOUND-002, E4-POS-001, E4-NEG-001
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
         config.autoReply = true
@@ -975,6 +975,74 @@ public class GitCodeMonitorPluginRuntimeTest {
         @Expect(missing.status, "send_failed")
         @Expect(missing.retryable, false)
         @Expect(missingEnvSender.connectCount, 0)
+
+        let disabledLookup = defaultConfig()
+        disabledLookup.fullScanIntervalMinutes = 10
+        disabledLookup.autoReply = true
+        disabledLookup.dryRun = false
+        disabledLookup.writebackScope.allowedRepos = ["Cangjie/community"]
+        disabledLookup.maintainerNotificationEmail = MaintainerNotificationEmailConfig(
+            enabled: true,
+            userLookup: MaintainerUserEmailLookupConfig(enabled: false),
+            smtp: MaintainerSmtpConfig("smtp.example.test", 465, "ssl", "bot@example.com", "GCM_FAKE_SMTP_PASSWORD"),
+            from: "bot@example.com"
+        )
+        let disabledStore = GcmMaintainerContextStore()
+        @Expect(disabledStore.put(GcmMaintainerContext("event-disabled-lookup", "Cangjie/community", "pr", "8", teamLeaderMentions: ["@alice"], contextSource: "store")).ok, true)
+        let disabledSender = FakeMaintainerEmailSender()
+        let disabled = handleGcmWritebackApplyResult("{\"eventId\":\"event-disabled-lookup\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft\",\"safety\":\"approved\"}", GcmRuntime(disabledLookup, writer: FakeCommentWriter(), maintainerContextStore: disabledStore, emailSender: disabledSender))
+        @Expect(disabled.posted, true)
+        @Expect(disabled.emailNotificationStatus, "email_unavailable")
+        @Expect(disabledSender.messages.size, 0)
+
+        let dynamic = defaultConfig()
+        dynamic.fullScanIntervalMinutes = 10
+        dynamic.autoReply = true
+        dynamic.dryRun = false
+        dynamic.writebackScope.allowedRepos = ["Cangjie/community"]
+        dynamic.maintainerNotificationEmail = MaintainerNotificationEmailConfig(
+            enabled: true,
+            smtp: MaintainerSmtpConfig("smtp.example.test", 465, "ssl", "bot@example.com", "GCM_FAKE_SMTP_PASSWORD"),
+            from: "bot@example.com",
+            allowedDomains: ["example.com"]
+        )
+        let dynamicStore = GcmMaintainerContextStore()
+        @Expect(dynamicStore.put(GcmMaintainerContext("event-dynamic-mail", "Cangjie/community", "pr", "8", teamLeaderMentions: ["@alice"], contextSource: "store")).ok, true)
+        let dynamicHttp = FakeHttpSender()
+        dynamicHttp.enqueue(HttpResponseSpec(200, body: "{\"email\":\"Alice@Example.com\"}"))
+        let dynamicEmailSender = FakeMaintainerEmailSender()
+        let dynamicRuntime = GcmRuntime(
+            dynamic,
+            writer: FakeCommentWriter(),
+            maintainerContextStore: dynamicStore,
+            maintainerEmailLookupCache: MaintainerEmailLookupCache(),
+            emailSender: dynamicEmailSender,
+            gitCode: Some<GitCodeHttpTransport>(GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: dynamicHttp))
+        )
+        let dynamicSent = handleGcmWritebackApplyResult("{\"eventId\":\"event-dynamic-mail\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft\",\"safety\":\"approved\"}", dynamicRuntime)
+        @Expect(dynamicSent.posted, true)
+        @Expect(dynamicSent.emailNotificationStatus, "sent")
+        @Expect(dynamicSent.emailSentCount, 1)
+        @Expect(dynamicEmailSender.messages[0].recipients[0], "alice@example.com")
+        @Expect(dynamicHttp.requests[0].url, "https://mock.gitcode.test/api/v5/users/alice")
+
+        let storedEmailHttp = FakeHttpSender()
+        let storedEmailStore = GcmMaintainerContextStore()
+        @Expect(storedEmailStore.put(GcmMaintainerContext("event-stored-email", "Cangjie/community", "pr", "8", teamLeaderMentions: ["@alice"], teamLeaderEmails: ["alice@example.com"], contextSource: "store")).ok, true)
+        let storedEmailSender = FakeMaintainerEmailSender()
+        let storedEmail = handleGcmWritebackApplyResult("{\"eventId\":\"event-stored-email\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft\",\"safety\":\"approved\"}", GcmRuntime(dynamic, writer: FakeCommentWriter(), maintainerContextStore: storedEmailStore, emailSender: storedEmailSender, gitCode: Some<GitCodeHttpTransport>(GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: storedEmailHttp))))
+        @Expect(storedEmail.emailNotificationStatus, "sent")
+        @Expect(storedEmailHttp.requests.size, 0)
+
+        let unavailableHttp = FakeHttpSender()
+        unavailableHttp.enqueue(HttpResponseSpec(404, body: "{\"message\":\"not found\"}"))
+        let unavailableStore = GcmMaintainerContextStore()
+        @Expect(unavailableStore.put(GcmMaintainerContext("event-api-missing", "Cangjie/community", "pr", "8", teamLeaderMentions: ["@missing"], contextSource: "store")).ok, true)
+        let unavailableSender = FakeMaintainerEmailSender()
+        let unavailable = handleGcmWritebackApplyResult("{\"eventId\":\"event-api-missing\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft\",\"safety\":\"approved\"}", GcmRuntime(dynamic, writer: FakeCommentWriter(), maintainerContextStore: unavailableStore, emailSender: unavailableSender, gitCode: Some<GitCodeHttpTransport>(GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: unavailableHttp))))
+        @Expect(unavailable.posted, true)
+        @Expect(unavailable.emailNotificationStatus, "email_unavailable")
+        @Expect(unavailableSender.messages.size, 0)
     }
 
     @TestCase

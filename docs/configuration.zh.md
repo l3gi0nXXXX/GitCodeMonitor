@@ -69,6 +69,7 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 - 维护者 team leader：`GET /repos/Cangjie/community/contents/team%2Frepo_list.md?ref=main`
 - CODEOWNERS：`GET /repos/{owner}/{repo}/contents/.gitcode%2FCODEOWNERS?ref=...`
 - PR changed files：`GET /repos/{owner}/{repo}/pulls/{number}/files`
+- 维护者邮箱查询：`GET /users/{login}`
 - Issue 评论：`GET /repos/{owner}/{repo}/issues/comments?...`
 - PR 评论：`GET /repos/{owner}/{repo}/pulls/{number}/comments?...`
 - 自动回复写回：`POST /repos/{owner}/{repo}/issues/{number}/comments` 或 `POST /repos/{owner}/{repo}/pulls/{number}/comments`
@@ -79,6 +80,8 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 
 邮件通知默认关闭。启用后，GCM 只会在 GitCode 评论写回成功后发送邮件；gate 失败、dry-run、`autoReply=false`、GitCode writer 失败、draft 含 secret 或本机路径时都不会发送邮件。测试必须使用 fake sender 或 fake SMTP transport，不得连接真实 SMTP 服务。
 
+维护者邮箱默认从 GitCode 用户接口动态查询：GCM 根据维护者 mention/login 调用 `GET {gitcode.baseUrl}/users/{login}`，读取响应中的 email 字段。生产默认路径是动态查询；`addressBook` 只作为 `fallbackToAddressBook=true` 时的兜底。GCM 不会根据 login 拼接邮箱，也不会把 `github_account` 当作收件邮箱。
+
 示例：
 
 ```json
@@ -88,6 +91,13 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
       "email": {
         "enabled": false,
         "transport": "smtp",
+        "userLookup": {
+          "enabled": true,
+          "timeoutMs": 10000,
+          "cacheTtlMs": 86400000,
+          "maxCacheEntries": 4096,
+          "fallbackToAddressBook": true
+        },
         "smtp": {
           "host": "smtp.example.com",
           "port": 465,
@@ -112,19 +122,24 @@ cjpm run --name gitcodemonitor --run-args "--config .gitcodemonitor/gcm-live.jso
 | --- | --- | --- |
 | `gitcode.maintainerNotification.email.enabled` | `false` | 是否启用维护者邮件。默认关闭。 |
 | `transport` | `smtp` | 当前只支持 `smtp`。 |
+| `userLookup.enabled` | `true` | 邮件启用后，是否根据维护者 login 查询 GitCode 用户接口。关闭后不会查询用户接口，也不会根据 login 猜邮箱。 |
+| `userLookup.timeoutMs` | `10000` | 单次 GitCode 用户接口查询超时时间。native transport 使用该值覆盖默认 HTTP 超时，curl transport 会转换为 `--max-time`。 |
+| `userLookup.cacheTtlMs` | `86400000` | 用户邮箱查询缓存 TTL。默认 24 小时。 |
+| `userLookup.maxCacheEntries` | `4096` | 用户邮箱查询缓存最大条目数，超出后淘汰最早条目。 |
+| `userLookup.fallbackToAddressBook` | `true` | 用户接口无邮箱、失败、限流或被 `allowedDomains` 过滤时，是否允许读取 `addressBook` 兜底。 |
 | `smtp.host` / `smtp.port` | 空 / `0` | SMTP 服务器地址和端口。启用时必须填写。 |
 | `smtp.security` | `ssl` | 支持 `ssl`、`starttls`、`none`。`none` 只允许 fake/local test transport，不允许生产配置。 |
 | `smtp.username` | 空 | SMTP 登录用户名，通常是完整邮箱地址。 |
 | `smtp.passwordEnv` | 空 | 保存 SMTP 密码或客户端授权码的环境变量名。配置文件中只写变量名，不写真实值。 |
 | `from` / `replyTo` | 空 | 邮件头里的发件人与回复地址。启用时 `from` 必须是合法 email；不填时可用 `smtp.username`。 |
-| `allowedDomains` | `[]` | 可选收件人域名白名单。非空时，addressBook 中不在白名单内的地址会被配置校验拒绝。 |
-| `addressBook` | `{}` | mention/login 到 email 的映射。GCM 不根据 login 猜邮箱。 |
+| `allowedDomains` | `[]` | 可选收件人域名白名单。非空时，用户接口和 `addressBook` 返回的不在白名单内的地址都不会被发送。 |
+| `addressBook` | `{}` | mention/login 到 email 的兜底映射。它只在动态查询不可用或无合法邮箱且 `fallbackToAddressBook=true` 时使用。 |
 
 安全要求：
 
 - 不要把真实 SMTP 密码、授权码、token、cookie 或 webhook secret 写入配置文件、测试、日志或文档。
 - `passwordEnv` 对应的真实值只应存在于运行环境变量中，GCM response 和 config summary 不会输出该真实值。
-- GCM response 只返回 `emailNotificationStatus`、计数和 retryable，不返回收件人明文或邮件正文。
+- GCM response 只返回 `emailNotificationStatus`、计数和 retryable，不返回收件人明文、用户接口原始响应或邮件正文。
 - 没有合法 email 时，GitCode 评论仍可写回并追加维护者 mention，邮件状态为 `email_unavailable`。
 
 ## GitCode Author Policy 配置

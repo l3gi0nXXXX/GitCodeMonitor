@@ -119,6 +119,11 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
             "}}}}"
         )
         @Expect(valid.maintainerNotificationEmail.enabled, true)
+        @Expect(valid.maintainerNotificationEmail.userLookup.enabled, true)
+        @Expect(valid.maintainerNotificationEmail.userLookup.timeoutMs, 10000)
+        @Expect(valid.maintainerNotificationEmail.userLookup.cacheTtlMs, 24 * 60 * 60 * 1000)
+        @Expect(valid.maintainerNotificationEmail.userLookup.maxCacheEntries, 4096)
+        @Expect(valid.maintainerNotificationEmail.userLookup.fallbackToAddressBook, true)
         @Expect(valid.maintainerNotificationEmail.smtp.passwordEnv, "GCM_SMTP_PASSWORD")
         @Expect(valid.maintainerNotificationEmail.addressBook.get("@alice").getOrThrow()[0], "alice@example.com")
         @Expect(valid.maintainerNotificationEmail.addressBook.get("@bob").getOrThrow()[0], "bob@example.com")
@@ -145,6 +150,80 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
         @Expect(mime.data.contains("Bearer secret"), false)
         @Expect(mime.data.contains("/Users/alice"), false)
         @Expect(mime.data.contains("GCM_SMTP_PASSWORD"), false)
+    }
+
+    @TestCase
+    public func e1e2MaintainerEmailUserLookupRequestParserCacheAndResolverAreSafe(): Unit {
+        // E1-UNIT-001, E1-UNIT-002, E1-POS-001, E1-NEG-001, E1-NEG-002, E1-BOUND-001, E1-BOUND-002, E2-UNIT-001, E2-UNIT-002, E2-POS-001, E2-POS-002, E2-NEG-001, E2-NEG-002, E2-BOUND-001, E2-BOUND-002
+        let config = loadConfigJsonForTest("gcm-maintainer-email-user-lookup", "{" +
+            "\"gitcode\":{\"maintainerNotification\":{\"email\":{" +
+            "\"enabled\":true,\"transport\":\"smtp\"," +
+            "\"userLookup\":{\"enabled\":true,\"timeoutMs\":15000,\"cacheTtlMs\":2000,\"maxCacheEntries\":2,\"fallbackToAddressBook\":true}," +
+            "\"smtp\":{\"host\":\"smtp.example.com\",\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"}," +
+            "\"from\":\"bot@example.com\",\"allowedDomains\":[\"example.com\"]," +
+            "\"addressBook\":{\"@fallback\":[\"fallback@example.com\"]}" +
+            "}}}}"
+        ).maintainerNotificationEmail
+        @Expect(config.userLookup.enabled, true)
+        @Expect(config.userLookup.timeoutMs, 15000)
+        @Expect(config.userLookup.cacheTtlMs, 2000)
+        @Expect(config.userLookup.maxCacheEntries, 2)
+        @Expect(config.userLookup.fallbackToAddressBook, true)
+
+        let client = GitCodeApiClient(baseUrl: "https://api.gitcode.com/api/v5", token: "secret-token")
+        let request = client.userProfileRequest("Alice")
+        @Expect(request.method, "GET")
+        @Expect(request.url, "https://api.gitcode.com/api/v5/users/Alice")
+        @Expect(request.redactedLogLine().contains("secret-token"), false)
+
+        let parsed = parseGitCodeUserEmailResponse("Alice", 200, "{\"login\":\"Alice\",\"email\":\"Alice@Example.com\",\"github_account\":\"wrong@example.com\"}", allowedDomains: ["example.com"])
+        @Expect(parsed.status, "resolved")
+        @Expect(parsed.emails[0], "alice@example.com")
+        let githubOnly = parseGitCodeUserEmailResponse("alice", 200, "{\"login\":\"alice\",\"github_account\":\"alice@example.com\"}", allowedDomains: ["example.com"])
+        @Expect(githubOnly.status, "email_unavailable")
+        @Expect(githubOnly.emails.size, 0)
+        let filtered = parseGitCodeUserEmailResponse("alice", 200, "{\"email\":\"alice@other.test\"}", allowedDomains: ["example.com"])
+        @Expect(filtered.status, "email_filtered")
+        @Expect(filtered.emails.size, 0)
+        @Expect(parseGitCodeUserEmailResponse("alice", 403, "{}").status, "auth_failed")
+        @Expect(parseGitCodeUserEmailResponse("alice", 404, "{}").status, "user_not_found")
+        @Expect(parseGitCodeUserEmailResponse("alice", 429, "{}").retryable, true)
+        @Expect(parseGitCodeUserEmailResponse("alice", 500, "{}").status, "network_error")
+        @Expect(parseGitCodeUserEmailResponse("alice", 200, "{").status, "invalid_content")
+
+        @Expect(normalizeMaintainerLogin("@Alice"), "alice")
+        @Expect(normalizeMaintainerLogin("Alice"), "alice")
+        @Expect(normalizeMaintainerLogin("a/b"), "")
+        let invalidSender = FakeHttpSender()
+        let invalid = resolveGitCodeUserEmail("a/b", client, invalidSender, config, MaintainerEmailLookupCache())
+        @Expect(invalid.status, "invalid_login")
+        @Expect(invalidSender.requests.size, 0)
+
+        let cache = MaintainerEmailLookupCache(maxEntries: 1, ttlMs: 1000)
+        cache.put(GitCodeUserEmailLookupResult("alice", emails: ["alice@example.com"], status: "resolved"), nowMs: 1000)
+        @Expect(cache.get("alice", nowMs: 1500).isSome(), true)
+        @Expect(cache.get("alice", nowMs: 2501).isNone(), true)
+        cache.put(GitCodeUserEmailLookupResult("alice", emails: ["alice@example.com"], status: "resolved"), nowMs: 3000)
+        cache.put(GitCodeUserEmailLookupResult("bob", emails: ["bob@example.com"], status: "resolved"), nowMs: 3001)
+        @Expect(cache.get("alice", nowMs: 3002).isNone(), true)
+        @Expect(cache.get("bob", nowMs: 3002).isSome(), true)
+
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"email\":\"Alice@Example.com\"}"))
+        let lookupCache = MaintainerEmailLookupCache()
+        let resolved = resolveMaintainerEmailsForMentions(["@Alice", "@alice"], client, sender, config, lookupCache)
+        @Expect(resolved.status, "resolved")
+        @Expect(resolved.emails.size, 1)
+        @Expect(resolved.emails[0], "alice@example.com")
+        @Expect(sender.requests.size, 1)
+        @Expect(sender.requests[0].timeoutMs, 15000)
+
+        let failedSender = FakeHttpSender()
+        failedSender.enqueue(HttpResponseSpec(500, body: "{\"message\":\"token=secret /Users/alice/private\"}"))
+        let failed = resolveMaintainerEmailsForMentions(["@missing"], client, failedSender, config, MaintainerEmailLookupCache())
+        @Expect(failed.status, "network_error")
+        @Expect(failed.retryable, true)
+        @Expect(failed.emails.size, 0)
     }
 
     @TestCase

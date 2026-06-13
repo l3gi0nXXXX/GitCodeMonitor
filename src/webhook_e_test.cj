@@ -1739,5 +1739,15 @@ public class GitCodeWebhookETest {
         @Expect(degraded.teamLeaderStatus, "fetch_failed")
         let degradedPayload = gcmAcceptedScanEventPayload("job-t1-neg", issueEvent, maintainerContext: Some<GcmMaintainerContext>(degraded))
         @Expect(degradedPayload.contains("temporary"), false)
+
+        let emailSender = FakeHttpSender()
+        emailSender.enqueue(HttpResponseSpec(200, body: repoListBody))
+        emailSender.enqueue(HttpResponseSpec(200, body: "{\"email\":\"Alice@Example.com\"}"))
+        let emailTransport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: emailSender, pageSize: 100)
+        let emailConfig = MaintainerNotificationEmailConfig(enabled: true, allowedDomains: ["example.com"])
+        let emailContext = resolveGcmMaintainerContext(emailTransport, issueEvent, emailConfig: emailConfig, emailCache: MaintainerEmailLookupCache())
+        @Expect(emailContext.teamLeaderMentions[0], "@alice")
+        @Expect(emailContext.teamLeaderEmails[0], "alice@example.com")
+        @Expect(emailSender.requests[1].url, "https://mock.gitcode.test/api/v5/users/alice")
     }
 }

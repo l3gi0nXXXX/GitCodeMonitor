@@ -33,9 +33,26 @@ public class MaintainerSmtpConfig {
     }
 }
 
+public class MaintainerUserEmailLookupConfig {
+    public let enabled: Bool
+    public let timeoutMs: Int64
+    public let cacheTtlMs: Int64
+    public let maxCacheEntries: Int64
+    public let fallbackToAddressBook: Bool
+
+    public init(enabled!: Bool = true, timeoutMs!: Int64 = 10000, cacheTtlMs!: Int64 = 24 * 60 * 60 * 1000, maxCacheEntries!: Int64 = 4096, fallbackToAddressBook!: Bool = true) {
+        this.enabled = enabled
+        this.timeoutMs = if (timeoutMs <= 0) { 10000 } else { timeoutMs }
+        this.cacheTtlMs = if (cacheTtlMs <= 0) { 24 * 60 * 60 * 1000 } else { cacheTtlMs }
+        this.maxCacheEntries = if (maxCacheEntries <= 0) { 4096 } else { maxCacheEntries }
+        this.fallbackToAddressBook = fallbackToAddressBook
+    }
+}
+
 public class MaintainerNotificationEmailConfig {
     public let enabled: Bool
     public let transport: String
+    public let userLookup: MaintainerUserEmailLookupConfig
     public let smtp: MaintainerSmtpConfig
     public let from: String
     public let replyTo: String
@@ -46,6 +63,7 @@ public class MaintainerNotificationEmailConfig {
     public init(
         enabled!: Bool = false,
         transport!: String = "smtp",
+        userLookup!: MaintainerUserEmailLookupConfig = MaintainerUserEmailLookupConfig(),
         smtp!: MaintainerSmtpConfig = MaintainerSmtpConfig(),
         from!: String = "",
         replyTo!: String = "",
@@ -55,6 +73,7 @@ public class MaintainerNotificationEmailConfig {
     ) {
         this.enabled = enabled
         this.transport = transport.trimAscii().toAsciiLower()
+        this.userLookup = userLookup
         this.smtp = smtp
         this.from = normalizeMaintainerEmail(from)
         this.replyTo = normalizeMaintainerEmail(replyTo)
