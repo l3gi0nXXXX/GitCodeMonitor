@@ -1433,7 +1433,7 @@ public class GitCodeWebhookETest {
 
         @Expect(result.processed, 1)
         @Expect(sink.lines.size, 1)
-        @Expect(sender.requests.size, 2)
+        @Expect(sender.requests.size, 3)
         let decoded = decodeServiceFrame(sink.lines[0])
         @Expect(decoded.frame.payload.contains("\"context\""), true)
         @Expect(decoded.frame.payload.contains("API parent issue body"), true)
@@ -1669,10 +1669,75 @@ public class GitCodeWebhookETest {
         @Expect(contents.method, "GET")
         @Expect(contents.url, "https://mock.gitcode.test/api/v5/repos/Cangjie/community/contents/team%2Frepo_list.md?ref=main")
         @Expect(contents.redactedLogLine().contains("secret"), false)
-        @Expect(fetchRepoListMd(client).status, "fetch_failed")
-        @Expect(fetchCodeowners(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main").status, "missing")
         @Expect(fetchIssueTemplateCatalog(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main").status, "missing")
         @Expect(fetchPrTemplateCatalog(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main").status, "missing")
         @Expect(client.pullRequestFilesRequest(GitCodeRepo("Cangjie", "cangjie_tools"), 9).url, "https://mock.gitcode.test/api/v5/repos/Cangjie/cangjie_tools/pulls/9/files")
+    }
+
+    @TestCase
+    public func t1GcmUnit001002FetchMaintainersAndCodeownersThroughFakeGitCodeApi(): Unit {
+        // T1-GCM-UNIT-001, T1-GCM-UNIT-002, T1-GCM-NEG-002, T1-GCM-BOUND-001
+        let sender = FakeHttpSender()
+        sender.enqueue(HttpResponseSpec(200, body: "{\"content\":\"PHRhYmxlPjx0cj48dGQ+VG9vbHM8L3RkPjx0ZD5AYWxpY2UgQGJvYjwvdGQ+PHRkPkNhbmdqaWU8L3RkPjx0ZD5jYW5namllX3Rvb2xzPC90ZD48L3RyPjwvdGFibGU+\",\"encoding\":\"base64\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"content\":\"/src/ @codeowner bad-owner\\n/src/special.cj @specific\\n\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"files\":[{\"filename\":\"src/file0.cj\"},{\"filename\":\"src/special.cj\"}]}"))
+        let client = GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5", token: "secret-token")
+        let repoList = fetchRepoListMd(client, sender: sender)
+        let team = resolveTeamLeaders("Cangjie/cangjie_tools", rows: parseRepoListMd(repoList.text).rows)
+        let codeowners = fetchCodeowners(client, GitCodeRepo("Cangjie", "cangjie_tools"), "main", sender: sender)
+        let parsed = parseCodeowners(codeowners.text)
+        let files = fetchPullRequestChangedFiles(client, GitCodeRepo("Cangjie", "cangjie_tools"), "9", sender: sender)
+        let resolved = resolveCodeownersForPaths(parsed.rules, files.paths)
+
+        @Expect(repoList.ok, true)
+        @Expect(team.teamLeaderStatus, "resolved")
+        @Expect(team.teamLeaders[0].mention, "@alice")
+        @Expect(codeowners.ok, true)
+        @Expect(parsed.diagnostics[0].code, "invalid_owner")
+        @Expect(resolved.codeownerStatus, "resolved")
+        var hasSpecific = false
+        for (owner in resolved.owners) {
+            if (owner.mention == "@specific") { hasSpecific = true }
+        }
+        @Expect(hasSpecific, true)
+        @Expect(files.paths.size, 2)
+        @Expect(sender.requests[0].url.contains("contents/team%2Frepo_list.md"), true)
+        @Expect(sender.requests[1].url.contains("contents/.gitcode%2FCODEOWNERS"), true)
+        @Expect(sender.requests[2].url.contains("/pulls/9/files"), true)
+
+        let many = ArrayList<String>()
+        for (i in 0..130) { many.add("src/file${i}.cj") }
+        @Expect(resolveCodeownersForPaths(parsed.rules, many.toArray()).changedFilesTruncated, true)
+    }
+
+    @TestCase
+    public func t1GcmPos001002003Neg001Reg001AcceptedFramesUseResolvedMaintainerContext(): Unit {
+        // T1-GCM-POS-001, T1-GCM-POS-002, T1-GCM-POS-003, T1-GCM-NEG-001, T1-GCM-REG-001, T5-E2E-POS-001
+        let sender = FakeHttpSender()
+        let repoListBody = "{\"content\":\"<table><tr><td>Tools</td><td>@alice</td><td>Cangjie</td><td>cangjie_tools</td></tr></table>\"}"
+        sender.enqueue(HttpResponseSpec(200, body: repoListBody))
+        sender.enqueue(HttpResponseSpec(200, body: "{\"content\":\"/src/ @codeowner\\n\"}"))
+        sender.enqueue(HttpResponseSpec(200, body: "[{\"filename\":\"src/main.cj\"}]"))
+        let transport = GitCodeHttpTransport(GitCodeApiClient(baseUrl: "https://mock.gitcode.test/api/v5"), sender: sender, pageSize: 100)
+        let prEvent = GitCodeEvent("gitcode:Cangjie/cangjie_tools:pr:9", "Cangjie", "cangjie_tools", "pr", "9", "alice", "", "https://gitcode.com/Cangjie/cangjie_tools/pulls/9", "pr body")
+        let prContext = resolveGcmMaintainerContext(transport, prEvent)
+        let prPayload = gcmAcceptedScanEventPayload("job-t1-pr", prEvent, maintainerContext: Some<GcmMaintainerContext>(prContext))
+        let prMaintainers = nestedObject(nestedObject(JsonValue.fromStr(prPayload).asObject(), ["reviewRequest"]), ["maintainers"])
+
+        @Expect(firstJsonString(prMaintainers, ["teamLeaderStatus"]), "resolved")
+        @Expect(firstJsonString(prMaintainers, ["codeownerStatus"]), "resolved")
+        @Expect(prPayload.contains("@alice"), true)
+        @Expect(prPayload.contains("@codeowner"), true)
+
+        sender.enqueue(HttpResponseSpec(200, body: repoListBody))
+        let issueEvent = GitCodeEvent("gitcode:Cangjie/cangjie_tools:issue:10", "Cangjie", "cangjie_tools", "issue", "10", "alice", "", "https://gitcode.com/Cangjie/cangjie_tools/issues/10", "issue body")
+        let issueContext = resolveGcmMaintainerContext(transport, issueEvent)
+        @Expect(issueContext.codeownerStatus, "not_applicable")
+
+        sender.enqueue(HttpResponseSpec(500, body: "{\"message\":\"temporary\"}"))
+        let degraded = resolveGcmMaintainerContext(transport, issueEvent)
+        @Expect(degraded.teamLeaderStatus, "fetch_failed")
+        let degradedPayload = gcmAcceptedScanEventPayload("job-t1-neg", issueEvent, maintainerContext: Some<GcmMaintainerContext>(degraded))
+        @Expect(degradedPayload.contains("temporary"), false)
     }
 }

@@ -854,6 +854,159 @@ public class GitCodeMonitorPluginRuntimeTest {
     }
 
     @TestCase
+    public func t2GcmUnit001002ContextStorePutGetPruneAndSafety(): Unit {
+        // T2-GCM-UNIT-001, T2-GCM-UNIT-002
+        let store = GcmMaintainerContextStore(maxEntries: 2, ttlMs: 1000)
+        let first = GcmMaintainerContext(
+            "event-1",
+            "Cangjie/community",
+            "pr",
+            "1",
+            teamLeaderMentions: ["@alice"],
+            codeownerMentions: ["@bob"],
+            teamLeaderEmails: ["Alice@Example.com"],
+            codeownerEmails: ["bob@example.com"],
+            teamLeaderStatus: "resolved",
+            codeownerStatus: "resolved",
+            contextSource: "store",
+            createdAtMs: 1000
+        )
+        let second = GcmMaintainerContext("event-2", "Cangjie/community", "issue", "2", teamLeaderMentions: ["@carol"], teamLeaderStatus: "resolved", codeownerStatus: "not_applicable", createdAtMs: 1500)
+        let third = GcmMaintainerContext("event-3", "Cangjie/community", "issue", "3", teamLeaderMentions: ["@dave"], teamLeaderStatus: "resolved", codeownerStatus: "not_applicable", createdAtMs: 2500)
+
+        @Expect(store.put(first).ok, true)
+        @Expect(store.put(second).ok, true)
+        @Expect(store.get("event-1").getOrThrow().teamLeaderMentions[0], "@alice")
+        @Expect(store.get("event-1").getOrThrow().teamLeaderEmails[0], "alice@example.com")
+        @Expect(store.put(third).ok, true)
+        @Expect(store.get("event-1").isNone(), true)
+        @Expect(store.get("event-3").isSome(), true)
+        @Expect(store.prune(4000), 2)
+        @Expect(store.get("event-2").isNone(), true)
+        @Expect(store.get("event-3").isNone(), true)
+        @Expect(store.toSafeJson().contains("password"), false)
+        @Expect(store.toSafeJson().contains("rawPayload"), false)
+    }
+
+    @TestCase
+    public func t2GcmPosNegBoundWritebackUsesStoreFallbackPayloadCompatPriority(): Unit {
+        // T2-GCM-POS-001, T2-GCM-POS-002, T2-GCM-NEG-001, T2-GCM-NEG-002, T2-GCM-BOUND-001, T5-E2E-BOUND-001, T5-E2E-REG-001
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        let store = GcmMaintainerContextStore()
+        @Expect(store.put(GcmMaintainerContext("event-store", "Cangjie/community", "pr", "8", teamLeaderMentions: ["@store"], codeownerMentions: ["@owner"], contextSource: "store")).ok, true)
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer, maintainerContextStore: store)
+        let payload = "{\"eventId\":\"event-store\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft\",\"safety\":\"approved\",\"maintainers\":{\"teamLeaders\":[\"@payload\"]}}"
+
+        let applied = handleGcmWritebackApplyResult(payload, runtime)
+        @Expect(applied.posted, true)
+        @Expect(applied.contextSource, "store")
+        @Expect(applied.teamLeaderCount, 1)
+        @Expect(applied.codeownerCount, 1)
+        @Expect(writer.written[0].contains("@store，@owner"), true)
+        @Expect(writer.written[0].contains("@payload"), false)
+
+        let compat = handleGcmWritebackApplyResult(payload.replace("event-store", "event-compat"), GcmRuntime(config, writer: FakeCommentWriter()))
+        @Expect(compat.contextSource, "payload_compat")
+        @Expect(compat.teamLeaderCount, 1)
+
+        let unavailableWriter = FakeCommentWriter()
+        let unavailable = handleGcmWritebackApplyResult("{\"eventId\":\"event-none\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"1\",\"url\":\"https://gitcode.com/Cangjie/community/issues/1\",\"draft\":\"safe draft\",\"safety\":\"approved\"}", GcmRuntime(config, writer: unavailableWriter))
+        @Expect(unavailable.posted, true)
+        @Expect(unavailable.contextSource, "unavailable")
+        @Expect(unavailable.maintainerMentionAppended, false)
+        @Expect(unavailableWriter.written[0].contains("@"), false)
+    }
+
+    @TestCase
+    public func t3GcmEmailSenderAndWritebackSemanticsUseOnlyFakeTransport(): Unit {
+        // T3-GCM-POS-001, T3-GCM-POS-002, T3-GCM-NEG-001, T3-GCM-NEG-002, T3-GCM-NEG-003, T3-GCM-NEG-004, T3-GCM-BOUND-001, T3-GCM-BOUND-004, T3-GCM-REG-001, T5-E2E-POS-003, T5-E2E-NEG-001, T5-E2E-NEG-002, T5-E2E-BOUND-002
+        let config = defaultConfig()
+        config.fullScanIntervalMinutes = 10
+        config.autoReply = true
+        config.dryRun = false
+        config.writebackScope.allowedRepos = ["Cangjie/community"]
+        config.maintainerNotificationEmail = MaintainerNotificationEmailConfig(
+            enabled: true,
+            smtp: MaintainerSmtpConfig("smtp.example.test", 465, "ssl", "bot@example.com", "GCM_FAKE_SMTP_PASSWORD"),
+            from: "bot@example.com",
+            replyTo: "bot@example.com",
+            allowedDomains: ["example.com"],
+            addressBook: [("@alice", ["Alice@Example.com"]), ("@bob", ["bob@example.com", "ALICE@example.com"])]
+        )
+        let store = GcmMaintainerContextStore()
+        @Expect(store.put(GcmMaintainerContext("event-mail", "Cangjie/community", "pr", "8", teamLeaderMentions: ["@alice"], codeownerMentions: ["@bob"], contextSource: "store")).ok, true)
+        let emailSender = FakeMaintainerEmailSender()
+        let writer = FakeCommentWriter()
+        let runtime = GcmRuntime(config, writer: writer, maintainerContextStore: store, emailSender: emailSender)
+
+        let sent = handleGcmWritebackApplyResult("{\"eventId\":\"event-mail\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft\",\"safety\":\"approved\"}", runtime)
+        @Expect(sent.posted, true)
+        @Expect(sent.emailNotificationStatus, "sent")
+        @Expect(sent.emailSentCount, 2)
+        @Expect(emailSender.messages.size, 1)
+        @Expect(emailSender.messages[0].recipients.size, 2)
+        @Expect(emailSender.messages[0].body.contains("safe draft"), false)
+        @Expect(emailSender.messages[0].body.contains("token="), false)
+
+        let dry = defaultConfig()
+        dry.fullScanIntervalMinutes = 10
+        dry.autoReply = true
+        dry.dryRun = true
+        dry.writebackScope.allowedRepos = ["Cangjie/community"]
+        let blockedSender = FakeMaintainerEmailSender()
+        let blocked = handleGcmWritebackApplyResult("{\"eventId\":\"event-mail\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"token=secret\",\"safety\":\"approved\"}", GcmRuntime(dry, writer: FakeCommentWriter(), maintainerContextStore: store, emailSender: blockedSender))
+        @Expect(blocked.writerCalled, false)
+        @Expect(blockedSender.messages.size, 0)
+
+        let failedSender = FakeMaintainerEmailSender()
+        failedSender.nextResult = MaintainerEmailSendResult("send_failed", retryable: true, sentCount: 0, failedCount: 2)
+        let failed = handleGcmWritebackApplyResult("{\"eventId\":\"event-mail\",\"repo\":\"Cangjie/community\",\"kind\":\"pr\",\"number\":\"8\",\"url\":\"https://gitcode.com/Cangjie/community/pulls/8\",\"draft\":\"safe draft 2\",\"safety\":\"approved\"}", GcmRuntime(config, writer: FakeCommentWriter(), maintainerContextStore: store, emailSender: failedSender))
+        @Expect(failed.posted, true)
+        @Expect(failed.emailNotificationStatus, "send_failed")
+        @Expect(failed.emailRetryable, true)
+
+        let missingEnvSender = SmtpMaintainerEmailSender(config.maintainerNotificationEmail, transport: FakeSmtpTransport())
+        let missing = missingEnvSender.send(MaintainerEmailMessage(["alice@example.com"], "subject", "body", repo: "Cangjie/community", kind: "pr", number: "8", url: "https://gitcode.com/Cangjie/community/pulls/8", replyUrl: "https://gitcode.com/Cangjie/community/pulls/8#note_1"))
+        @Expect(missing.status, "send_failed")
+        @Expect(missing.retryable, false)
+        @Expect(missingEnvSender.connectCount, 0)
+    }
+
+    @TestCase
+    public func t4GcmUnit001WritebackResponseIncludesSafeContextAndEmailStatus(): Unit {
+        // T4-GCM-UNIT-001, T5-E2E-ARCH-001
+        let result = GcmWritebackApplyResult(
+            true,
+            GcmWritebackDecision(true, "posted"),
+            writerCalled: true,
+            replyUrl: "https://gitcode.com/Cangjie/community/issues/1#note_1",
+            maintainerMentionAppended: true,
+            teamLeaderCount: 1,
+            codeownerCount: 2,
+            posted: true,
+            contextSource: "store",
+            emailNotificationStatus: "sent",
+            emailSentCount: 2,
+            emailFailedCount: 0,
+            emailRetryable: false
+        )
+        let payload = gcmWritebackApplyResultPayload(result)
+        @Expect(payload.contains("\"contextSource\":\"store\""), true)
+        @Expect(payload.contains("\"emailNotificationStatus\":\"sent\""), true)
+        @Expect(payload.contains("\"emailSentCount\":2"), true)
+        @Expect(payload.contains("alice@example.com"), false)
+        @Expect(payload.contains("body"), false)
+        @Expect(payload.contains("password"), false)
+        @Expect(payload.contains("GCM_FAKE_SMTP_PASSWORD"), false)
+        @Expect(payload.contains("token="), false)
+    }
+
+    @TestCase
     public func writebackApplyResultCoversGeneratedReplyV1GatesAndStructuredResponse(): Unit {
         let config = defaultConfig()
         config.fullScanIntervalMinutes = 10
@@ -1040,7 +1193,8 @@ public class GitCodeMonitorPluginRuntimeTest {
         config.gitCodeBaseUrl = "https://gitcode.example/api/v5"
         config.writebackScope.allowedRepos = ["Cangjie/community"]
         let sender = FakeHttpSender()
-        sender.nextResponse = HttpResponseSpec(201, body: "{\"html_url\":\"https://gitcode.com/Cangjie/community/issues/3#note_9\"}")
+        sender.enqueue(HttpResponseSpec(404, body: "{\"message\":\"repo list absent in this writer test\"}"))
+        sender.enqueue(HttpResponseSpec(201, body: "{\"html_url\":\"https://gitcode.com/Cangjie/community/issues/3#note_9\"}"))
         let runtime = RuntimeContainer(config, sender: Some<HttpSender>(sender))
         let state = runtime.store.load()
         let frame = ServiceFrame(
@@ -1057,10 +1211,11 @@ public class GitCodeMonitorPluginRuntimeTest {
 
         @Expect(handled.ok, true)
         @Expect(handled.frame.payload.contains("\"posted\":true"), true)
-        @Expect(sender.requests.size, 1)
-        @Expect(sender.requests[0].method, "POST")
-        @Expect(sender.requests[0].url, "https://gitcode.example/api/v5/repos/Cangjie/community/issues/3/comments")
-        @Expect(sender.requests[0].body.contains("safe draft"), true)
+        @Expect(sender.requests.size, 2)
+        @Expect(sender.requests[0].method, "GET")
+        @Expect(sender.requests[1].method, "POST")
+        @Expect(sender.requests[1].url, "https://gitcode.example/api/v5/repos/Cangjie/community/issues/3/comments")
+        @Expect(sender.requests[1].body.contains("safe draft"), true)
         @Expect(state.hasReply("real-writer-e1"), true)
         @Expect(exists(Path(config.statePath)), true)
         @Expect(String.fromUtf8(File.readFrom(Path(config.statePath))).contains("writeback_posted"), true)

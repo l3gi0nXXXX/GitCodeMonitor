@@ -14,9 +14,21 @@ Corporate policy is driven by `gitcode.authorPolicy.recordOnlyEmailDomains`. The
 
 Fields: `team`, `teamLeaderStatus`, `teamLeaders[]`. A leader has `mention`, `login`, and `url`. Source is `Cangjie/community/team/repo_list.md`.
 
+GCM fetches the file through the configured GitCode API transport before emitting `gitcode.event.accepted`. The contents API may return raw text or `content` with base64 encoding; both forms are normalized by GCM. Email addresses are not guessed from `login`.
+
 ## CodeownerV1
 
 Fields: `codeownerStatus`, `codeowners[]`, `changedFiles`, `changedFilesTruncated`. A codeowner has `mention`, `login`, and `url`. Source is `.gitcode/CODEOWNERS`; invalid owner tokens are diagnostics and are not emitted as owners.
+
+For PR events and PR comments, GCM fetches PR changed files with the GitCode pull request files API and matches them against `.gitcode/CODEOWNERS`. For issue events and issue comments, codeowner status is `not_applicable` unless an already persisted parent PR context is used.
+
+## MaintainerNotificationEmailV1
+
+Maintainer email recipients come only from GCM maintainer context explicit email fields or `gitcode.maintainerNotification.email.addressBook`. GCM does not derive email addresses from GitCode login names.
+
+The address book maps a maintainer mention or login to one or more email addresses. Addresses are normalized to lowercase, deduplicated, and optionally restricted by `allowedDomains`. Email notification is disabled by default and is sent only after GitCode comment writeback succeeds.
+
+GCM stores maintainer context by `eventId/sourceEventId` in its context store. Stored data is limited to repo target, mention/email/status metadata, changed-file paths, and timestamps; it must not contain raw webhook payloads, generated email bodies, tokens, SMTP passwords, or authorization codes.
 
 ## Issue Fields
 

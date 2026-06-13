@@ -99,6 +99,7 @@ public class MonitorConfig {
     public var statePath: String
     public var authorPolicy: AuthorPolicyConfig
     public var webhook: WebhookReceiverConfig
+    public var maintainerNotificationEmail: MaintainerNotificationEmailConfig
 
     public init() {
         this.orgs = ["cangjie", "cangjie-sig", "cangjie-tpc"]
@@ -125,6 +126,7 @@ public class MonitorConfig {
         this.statePath = ".gitcodemonitor/state.json"
         this.authorPolicy = AuthorPolicyConfig()
         this.webhook = defaultWebhookReceiverConfigForStatePath(this.statePath)
+        this.maintainerNotificationEmail = MaintainerNotificationEmailConfig()
     }
 }
 
@@ -167,6 +169,10 @@ public func validateConfig(config: MonitorConfig): String {
     }
     if (!config.dryRun && config.autoReply && !writebackScopeHasAllow(config)) {
         return "writeback enabled but writebackScope has no allowed orgs or repos"
+    }
+    let maintainerEmailValidation = validateMaintainerNotificationEmailConfig(config.maintainerNotificationEmail)
+    if (maintainerEmailValidation != "ok") {
+        return "maintainerNotification.email.${maintainerEmailValidation}"
     }
     let authorPolicyValidation = validateAuthorPolicyConfig(config.authorPolicy)
     if (authorPolicyValidation != "ok") {
@@ -222,6 +228,7 @@ public func configSummary(config: MonitorConfig): String {
         "recordOnlyEnabled=${config.authorPolicy.recordOnlyEnabled}\n" +
         "recordOnlyDomainCount=${config.authorPolicy.recordOnlyEmailDomains.size}\n" +
         "recordOnlyEffective=${authorPolicyRecordOnlyEffective(config.authorPolicy)}\n" +
+        "maintainerEmail=${if (config.maintainerNotificationEmail.enabled) { "enabled" } else { "disabled" }} transport=${config.maintainerNotificationEmail.transport}\n" +
         "statePath=${config.statePath}\n" +
         webhookConfigSummary(config.webhook)
 }
@@ -1180,6 +1187,8 @@ public class RuntimeContainer {
     public let sender: HttpSender
     public let gitCode: GitCodeHttpTransport
     public let writer: GitCodeCommentWriter
+    public let maintainerContextStore: GcmMaintainerContextStore
+    public let emailSender: MaintainerEmailSender
     public let httpTransportKind: String
 
     public init(config: MonitorConfig, sender!: ?HttpSender = None<HttpSender>, pluginStdioMode!: Bool = false) {
@@ -1196,6 +1205,8 @@ public class RuntimeContainer {
         let client = GitCodeApiClient(baseUrl: config.gitCodeBaseUrl, authMode: config.gitCodeAuthMode, token: config.gitCodeToken, cookie: config.gitCodeCookie)
         this.gitCode = GitCodeHttpTransport(client, sender: this.sender, pageSize: 100)
         this.writer = GitCodeCommentWriter(client, sender: this.sender)
+        this.maintainerContextStore = GcmMaintainerContextStore(path: "${config.statePath}.maintainer-context.json")
+        this.emailSender = if (config.maintainerNotificationEmail.enabled) { SmtpMaintainerEmailSender(config.maintainerNotificationEmail) } else { NoopMaintainerEmailSender() }
     }
 }
 
@@ -1958,6 +1969,98 @@ func applyGitCodeSection(config: MonitorConfig, obj: JsonObject): Unit {
         case Some(v) => try { applyWebhookSection(config, v.asObject()) } catch (_: Exception) { () }
         case None => ()
     }
+    match (obj.get("maintainerNotification")) {
+        case Some(v) => try { applyMaintainerNotificationSection(config, v.asObject()) } catch (_: Exception) { () }
+        case None => ()
+    }
+}
+
+func applyMaintainerNotificationSection(config: MonitorConfig, obj: JsonObject): Unit {
+    match (obj.get("email")) {
+        case Some(v) => try { config.maintainerNotificationEmail = parseMaintainerNotificationEmailConfig(v.asObject()) } catch (_: Exception) { () }
+        case None => ()
+    }
+}
+
+func parseMaintainerNotificationEmailConfig(obj: JsonObject): MaintainerNotificationEmailConfig {
+    let enabled = firstJsonBool(obj, ["enabled"], false)
+    let transport = firstNonEmpty([firstJsonString(obj, ["transport"]), "smtp"])
+    let smtpObj = nestedObject(obj, ["smtp"])
+    let smtp = MaintainerSmtpConfig(
+        firstJsonString(smtpObj, ["host"]),
+        firstJsonInt(smtpObj, ["port"]),
+        if (firstJsonString(smtpObj, ["security"]).isEmpty()) { "ssl" } else { firstJsonString(smtpObj, ["security"]) },
+        firstJsonString(smtpObj, ["username"]),
+        firstJsonString(smtpObj, ["passwordEnv"]),
+        connectTimeoutMs: firstPositiveOrDefault(firstJsonInt(smtpObj, ["connectTimeoutMs"]), 10000),
+        sendTimeoutMs: firstPositiveOrDefault(firstJsonInt(smtpObj, ["sendTimeoutMs"]), 30000)
+    )
+    MaintainerNotificationEmailConfig(
+        enabled: enabled,
+        transport: transport,
+        smtp: smtp,
+        from: firstJsonString(obj, ["from"]),
+        replyTo: firstJsonString(obj, ["replyTo"]),
+        allowedDomains: firstJsonStringArray(obj, ["allowedDomains"]),
+        addressBook: parseMaintainerEmailAddressBook(nestedObject(obj, ["addressBook"])),
+        allowPlainSmtpForTest: firstJsonBool(obj, ["allowPlainSmtpForTest"], false)
+    )
+}
+
+func parseMaintainerEmailAddressBook(obj: JsonObject): Array<(String, Array<String>)> {
+    let out = ArrayList<(String, Array<String>)>()
+    let raw = obj.toJsonString()
+    let runes = raw.toRuneArray()
+    var index: Int64 = 0
+    while (index < runes.size) {
+        while (index < runes.size && runes[index] != r'"') { index++ }
+        if (index >= runes.size) { break }
+        let keyStart = index + 1
+        index++
+        while (index < runes.size && runes[index] != r'"') { index++ }
+        if (index >= runes.size) { break }
+        let key = String(runes[keyStart..index])
+        index++
+        while (index < runes.size && runes[index] != r':') { index++ }
+        if (index >= runes.size) { break }
+        index++
+        while (index < runes.size && runes[index] != r'[' && runes[index] != r'"') { index++ }
+        let emails = ArrayList<String>()
+        if (index < runes.size && runes[index] == r'[') {
+            index++
+            while (index < runes.size && runes[index] != r']') {
+                if (runes[index] == r'"') {
+                    let valueStart = index + 1
+                    index++
+                    while (index < runes.size && runes[index] != r'"') { index++ }
+                    if (index < runes.size) {
+                        let email = String(runes[valueStart..index])
+                        if (!email.isEmpty()) { emails.add(email) }
+                    }
+                }
+                index++
+            }
+        } else if (index < runes.size && runes[index] == r'"') {
+            let valueStart = index + 1
+            index++
+            while (index < runes.size && runes[index] != r'"') { index++ }
+            if (index < runes.size) {
+                let email = String(runes[valueStart..index])
+                if (!email.isEmpty()) { emails.add(email) }
+            }
+        }
+        if (!key.isEmpty() && emails.size > 0) { out.add((key, emails.toArray())) }
+        index++
+    }
+    out.toArray()
+}
+
+func unquoteJsonString(raw: String): String {
+    var value = raw.trimAscii()
+    if (value.startsWith(",")) { value = value[1..value.size].trimAscii() }
+    if (value.startsWith("\"")) { value = value[1..value.size] }
+    if (value.endsWith("\"")) { value = value[0..value.size - 1] }
+    value.replace("\\\"", "\"").replace("\\n", "\n")
 }
 
 func applyAuthorPolicySection(config: MonitorConfig, obj: JsonObject): Unit {
@@ -2076,6 +2179,35 @@ public func validateAuthorPolicyConfig(policy: AuthorPolicyConfig): String {
     for (diagnostic in validateAuthorPolicyIdentityRule(policy.targetAuthorRule)) { return diagnostic }
     for (diagnostic in validateAuthorPolicyIdentityRule(policy.commentAuthorRule)) { return diagnostic }
     for (diagnostic in validateAuthorPolicyIdentityRule(policy.eventActorRule)) { return diagnostic }
+    "ok"
+}
+
+public func validateMaintainerNotificationEmailConfig(config: MaintainerNotificationEmailConfig): String {
+    if (!config.enabled) { return "ok" }
+    if (config.transport != "smtp") { return "transport" }
+    if (config.smtp.host.trimAscii().isEmpty()) { return "smtp.host" }
+    if (config.smtp.port < 1 || config.smtp.port > 65535) { return "smtp.port" }
+    if (!(config.smtp.security == "ssl" || config.smtp.security == "starttls" || config.smtp.security == "none")) { return "smtp.security" }
+    if (config.smtp.security == "none" && !config.allowPlainSmtpForTest) { return "smtp.security" }
+    if (config.smtp.username.trimAscii().isEmpty()) { return "smtp.username" }
+    if (!envNameIsValid(config.smtp.passwordEnv)) { return "smtp.passwordEnv" }
+    let from = if (!config.from.isEmpty()) { config.from } else { config.smtp.username }
+    if (!isValidMaintainerEmail(from)) { return "from" }
+    if (!config.replyTo.isEmpty() && !isValidMaintainerEmail(config.replyTo)) { return "replyTo" }
+    for (domain in config.allowedDomains) {
+        if (domain.isEmpty() || !domain.contains(".") || domain.contains(" ") || domain.contains("/")) { return "allowedDomains" }
+    }
+    for (key in config.addressBook.keys()) {
+        if (normalizeMaintainerMention(key).isEmpty()) { return "addressBook" }
+        match (config.addressBook.get(key)) {
+            case Some(emails) =>
+                for (email in emails) {
+                    if (!isValidMaintainerEmail(email)) { return "addressBook" }
+                    if (config.allowedDomains.size > 0 && !emailDomainAllowed(email, config.allowedDomains)) { return "addressBook" }
+                }
+            case None => ()
+        }
+    }
     "ok"
 }
 

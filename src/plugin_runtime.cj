@@ -99,10 +99,23 @@ public class GcmRuntime {
     public let config: MonitorConfig
     public let state: MonitorState
     public let writer: GitCodeWritebackWriter
-    public init(config: MonitorConfig, state!: MonitorState = MonitorState(), writer!: GitCodeWritebackWriter = FakeCommentWriter()) {
+    public let maintainerContextStore: GcmMaintainerContextStore
+    public let emailSender: MaintainerEmailSender
+    public let gitCode: ?GitCodeHttpTransport
+    public init(
+        config: MonitorConfig,
+        state!: MonitorState = MonitorState(),
+        writer!: GitCodeWritebackWriter = FakeCommentWriter(),
+        maintainerContextStore!: GcmMaintainerContextStore = GcmMaintainerContextStore(),
+        emailSender!: MaintainerEmailSender = NoopMaintainerEmailSender(),
+        gitCode!: ?GitCodeHttpTransport = None<GitCodeHttpTransport>
+    ) {
         this.config = config
         this.state = state
         this.writer = writer
+        this.maintainerContextStore = maintainerContextStore
+        this.emailSender = emailSender
+        this.gitCode = gitCode
     }
 }
 
@@ -301,6 +314,9 @@ public class GcmWritebackRequest {
     public let parseStatus: String
     public let teamLeaderMentions: Array<String>
     public let codeownerMentions: Array<String>
+    public let teamLeaderEmails: Array<String>
+    public let codeownerEmails: Array<String>
+    public let contextSource: String
 
     public init(
         eventId: String,
@@ -314,7 +330,10 @@ public class GcmWritebackRequest {
         duplicate!: Bool = false,
         parseStatus!: String = "ok",
         teamLeaderMentions!: Array<String> = [],
-        codeownerMentions!: Array<String> = []
+        codeownerMentions!: Array<String> = [],
+        teamLeaderEmails!: Array<String> = [],
+        codeownerEmails!: Array<String> = [],
+        contextSource!: String = "unavailable"
     ) {
         this.eventId = eventId.trimAscii()
         this.repo = repo.trimAscii()
@@ -328,6 +347,9 @@ public class GcmWritebackRequest {
         this.parseStatus = parseStatus.trimAscii()
         this.teamLeaderMentions = sanitizeMentionList(teamLeaderMentions)
         this.codeownerMentions = sanitizeMentionList(codeownerMentions)
+        this.teamLeaderEmails = normalizeMaintainerEmails(teamLeaderEmails)
+        this.codeownerEmails = normalizeMaintainerEmails(codeownerEmails)
+        this.contextSource = contextSource.trimAscii()
     }
 }
 
@@ -350,6 +372,11 @@ public class GcmWritebackApplyResult {
     public let codeownerCount: Int64
     public let posted: Bool
     public let retryable: Bool
+    public let contextSource: String
+    public let emailNotificationStatus: String
+    public let emailSentCount: Int64
+    public let emailFailedCount: Int64
+    public let emailRetryable: Bool
     public init(
         ok: Bool,
         decision: GcmWritebackDecision,
@@ -359,7 +386,12 @@ public class GcmWritebackApplyResult {
         teamLeaderCount!: Int64 = 0,
         codeownerCount!: Int64 = 0,
         posted!: Bool = false,
-        retryable!: Bool = false
+        retryable!: Bool = false,
+        contextSource!: String = "unavailable",
+        emailNotificationStatus!: String = "email_disabled",
+        emailSentCount!: Int64 = 0,
+        emailFailedCount!: Int64 = 0,
+        emailRetryable!: Bool = false
     ) {
         this.ok = ok
         this.decision = decision
@@ -370,6 +402,11 @@ public class GcmWritebackApplyResult {
         this.codeownerCount = codeownerCount
         this.posted = posted
         this.retryable = retryable
+        this.contextSource = contextSource
+        this.emailNotificationStatus = emailNotificationStatus
+        this.emailSentCount = emailSentCount
+        this.emailFailedCount = emailFailedCount
+        this.emailRetryable = emailRetryable
     }
 }
 
@@ -706,7 +743,7 @@ public func handleGcmPluginInputLineWithJobs(
         return GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "ok", "{\"ok\":true,\"status\":\"ok\"}"))
     }
     if (frame.method == "status") {
-        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer))
+        let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
         return GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
     }
     if (frame.method == "stop") {
@@ -717,7 +754,7 @@ public func handleGcmPluginInputLineWithJobs(
     }
     match (frame.capabilityId) {
         case "gitcode.monitor.status" =>
-            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer))
+            let status = handleGcmStatusCapability(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
             GcmPluginFrameHandleResult(status.ok, frame: gcmPluginResponseFrame(frame, status.ok, status.status, "{\"ok\":${status.ok},\"status\":\"${status.status}\",\"summary\":\"${jsonEscape(status.summary)}\"}"))
         case "gitcode.monitor.scan_once" =>
             let mode = scanPayloadMode(frame.payload)
@@ -820,7 +857,7 @@ public func handleGcmPluginInputLineWithJobs(
             GcmPluginFrameHandleResult(true, frame: gcmPluginResponseFrame(frame, true, "accepted", eventReconcilePayload(config)))
         case "gitcode.writeback.apply_result" =>
             let beforeVersion = state.version()
-            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer))
+            let applied = handleGcmWritebackApplyResult(frame.payload, GcmRuntime(config, state: state, writer: runtime.writer, maintainerContextStore: runtime.maintainerContextStore, emailSender: runtime.emailSender, gitCode: Some<GitCodeHttpTransport>(runtime.gitCode)))
             let saved = runtime.store.saveIfChanged(state, beforeVersion, reason: "writeback_apply_result")
             let ok = applied.ok && saved.status != "state_save_failed"
             let status = if (ok) { applied.decision.reason } else { "state_save_failed" }
@@ -857,7 +894,8 @@ public func appendGcmPluginAudit(audit: GcmAuditRecord, host: MetisHostClient): 
 }
 
 public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime): GcmWritebackApplyResult {
-    let request = parseWritebackRequest(payload)
+    let parsedRequest = parseWritebackRequest(payload)
+    let request = withResolvedWritebackMaintainerContext(parsedRequest, runtime)
     let decision = evaluateGcmAutoReplyGate(request, runtime.config)
     if (!decision.allowed) {
         let _ = emitGcmWritebackAudit(buildGcmWritebackAudit(request, decision, replyUrl: ""), MetisHostClient())
@@ -866,7 +904,9 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
             request.parseStatus != "invalid_payload",
             decision,
             teamLeaderCount: request.teamLeaderMentions.size,
-            codeownerCount: request.codeownerMentions.size
+            codeownerCount: request.codeownerMentions.size,
+            contextSource: request.contextSource,
+            emailNotificationStatus: "email_disabled"
         )
     }
     let event = GitCodeEvent(request.eventId, request.repo.split("/", 2)[0], if (request.repo.contains("/")) { request.repo.split("/", 2)[1] } else { request.repo }, request.kind, request.number, "metis", "", request.url, request.draft)
@@ -886,6 +926,11 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
     if (writeStatus == "posted") {
         let _ = recordWriteback(writebackLedgerPathForConfig(runtime.config), request.repo, request.kind, request.number, replyUrl, appended.body, request.eventId)
     }
+    let emailResult = if (writeStatus == "posted") {
+        sendMaintainerEmailAfterWriteback(request, replyUrl, runtime)
+    } else {
+        MaintainerEmailSendResult("email_disabled")
+    }
     recordGcmWritebackAuditState(runtime.state, request, finalDecision, replyUrl: if (writeStatus == "posted") { replyUrl } else { "" }, posted: writeStatus == "posted")
     GcmWritebackApplyResult(
         true,
@@ -896,8 +941,86 @@ public func handleGcmWritebackApplyResult(payload: String, runtime: GcmRuntime):
         teamLeaderCount: request.teamLeaderMentions.size,
         codeownerCount: request.codeownerMentions.size,
         posted: writeStatus == "posted",
-        retryable: isRetryableGcmWritebackStatus(writeStatus)
+        retryable: isRetryableGcmWritebackStatus(writeStatus),
+        contextSource: request.contextSource,
+        emailNotificationStatus: emailResult.status,
+        emailSentCount: emailResult.sentCount,
+        emailFailedCount: emailResult.failedCount,
+        emailRetryable: emailResult.retryable
     )
+}
+
+func withResolvedWritebackMaintainerContext(request: GcmWritebackRequest, runtime: GcmRuntime): GcmWritebackRequest {
+    if (request.parseStatus != "ok") { return request }
+    let context = match (runtime.maintainerContextStore.get(request.eventId)) {
+        case Some(stored) => stored
+        case None =>
+            match (runtime.gitCode) {
+                case Some(transport) =>
+                    let parts = request.repo.split("/", 2)
+                    if (parts.size == 2 && !request.number.isEmpty()) {
+                        let fallbackEvent = GitCodeEvent(request.eventId, parts[0], parts[1], request.kind, request.number, "metis", "", request.url, request.draft)
+                        let resolved = resolveGcmMaintainerContext(transport, fallbackEvent)
+                        if (resolved.teamLeaderMentions.size > 0 || resolved.codeownerMentions.size > 0) {
+                            resolved
+                        } else if (request.teamLeaderMentions.size > 0 || request.codeownerMentions.size > 0) {
+                            GcmMaintainerContext(request.eventId, request.repo, request.kind, request.number, teamLeaderMentions: request.teamLeaderMentions, codeownerMentions: request.codeownerMentions, contextSource: "payload_compat")
+                        } else {
+                            GcmMaintainerContext(request.eventId, request.repo, request.kind, request.number, contextSource: "unavailable")
+                        }
+                    } else {
+                        GcmMaintainerContext(request.eventId, request.repo, request.kind, request.number, contextSource: "unavailable")
+                    }
+                case None =>
+                    if (request.teamLeaderMentions.size > 0 || request.codeownerMentions.size > 0) {
+                        GcmMaintainerContext(request.eventId, request.repo, request.kind, request.number, teamLeaderMentions: request.teamLeaderMentions, codeownerMentions: request.codeownerMentions, contextSource: "payload_compat")
+                    } else {
+                        GcmMaintainerContext(request.eventId, request.repo, request.kind, request.number, contextSource: "unavailable")
+                    }
+            }
+    }
+    let withEmails = contextWithAddressBookEmails(context, runtime.config.maintainerNotificationEmail)
+    GcmWritebackRequest(
+        request.eventId,
+        request.repo,
+        request.kind,
+        request.number,
+        request.url,
+        request.draft,
+        safety: request.safety,
+        needsHumanReview: request.needsHumanReview,
+        duplicate: request.duplicate,
+        parseStatus: request.parseStatus,
+        teamLeaderMentions: withEmails.teamLeaderMentions,
+        codeownerMentions: withEmails.codeownerMentions,
+        teamLeaderEmails: withEmails.teamLeaderEmails,
+        codeownerEmails: withEmails.codeownerEmails,
+        contextSource: if (withEmails.contextSource.isEmpty()) { "unavailable" } else { withEmails.contextSource }
+    )
+}
+
+func sendMaintainerEmailAfterWriteback(request: GcmWritebackRequest, replyUrl: String, runtime: GcmRuntime): MaintainerEmailSendResult {
+    let emails = ArrayList<String>()
+    for (email in request.teamLeaderEmails) { emails.add(email) }
+    for (email in request.codeownerEmails) { emails.add(email) }
+    let mentions = ArrayList<String>()
+    for (mention in request.teamLeaderMentions) { mentions.add(mention) }
+    for (mention in request.codeownerMentions) { mentions.add(mention) }
+    let plan = buildMaintainerNotificationPlan(mentions.toArray(), emails: emails.toArray(), emailNotificationEnabled: runtime.config.maintainerNotificationEmail.enabled)
+    if (plan.emailNotificationStatus != "ready") {
+        return MaintainerEmailSendResult(plan.emailNotificationStatus)
+    }
+    let message = MaintainerEmailMessage(
+        plan.emailPlan,
+        "GitCode ${request.repo} ${request.kind} #${request.number} 需要维护者关注",
+        "GitCode 讨论有新回复，请在页面中查看。\nrepo=${request.repo}\nkind=${request.kind}\nnumber=${request.number}\nurl=${request.url}\nreplyUrl=${replyUrl}",
+        repo: request.repo,
+        kind: request.kind,
+        number: request.number,
+        url: request.url,
+        replyUrl: replyUrl
+    )
+    runtime.emailSender.send(message)
 }
 
 public func evaluateGcmAutoReplyGate(request: GcmWritebackRequest, config: MonitorConfig): GcmWritebackDecision {
@@ -1026,7 +1149,7 @@ private func isRetryableGcmWritebackStatus(status: String): Bool {
     status == "gitcode_api_unavailable" || status == "gitcode_api_timeout" || status == "rate_limited" || status == "server_error"
 }
 
-private func gcmWritebackApplyResultPayload(result: GcmWritebackApplyResult): String {
+public func gcmWritebackApplyResultPayload(result: GcmWritebackApplyResult): String {
     "{\"ok\":${result.ok}," +
         "\"status\":\"${jsonEscape(result.decision.reason)}\"," +
         "\"writerCalled\":${result.writerCalled}," +
@@ -1035,7 +1158,12 @@ private func gcmWritebackApplyResultPayload(result: GcmWritebackApplyResult): St
         "\"replyUrl\":\"${jsonEscape(result.replyUrl)}\"," +
         "\"maintainerMentionAppended\":${result.maintainerMentionAppended}," +
         "\"teamLeaderCount\":${result.teamLeaderCount}," +
-        "\"codeownerCount\":${result.codeownerCount}" +
+        "\"codeownerCount\":${result.codeownerCount}," +
+        "\"contextSource\":\"${jsonEscape(result.contextSource)}\"," +
+        "\"emailNotificationStatus\":\"${jsonEscape(result.emailNotificationStatus)}\"," +
+        "\"emailSentCount\":${result.emailSentCount}," +
+        "\"emailFailedCount\":${result.emailFailedCount}," +
+        "\"emailRetryable\":${result.emailRetryable}" +
     "}"
 }
 
@@ -1177,7 +1305,7 @@ private func parseWritebackRequest(payload: String): GcmWritebackRequest {
     )
 }
 
-class WritebackMaintainerContext {
+public class WritebackMaintainerContext {
     public let teamLeaderMentions: Array<String>
     public let codeownerMentions: Array<String>
     public init(teamLeaderMentions!: Array<String> = [], codeownerMentions!: Array<String> = []) {
@@ -1195,7 +1323,7 @@ private func generatedReplyObjectForWriteback(root: JsonObject): JsonObject {
     root
 }
 
-private func writebackMaintainerContext(payloadRoot: JsonObject, replyRoot: JsonObject): WritebackMaintainerContext {
+public func writebackMaintainerContext(payloadRoot: JsonObject, replyRoot: JsonObject): WritebackMaintainerContext {
     let team = ArrayList<String>()
     let owners = ArrayList<String>()
     addJsonStringArray(team, replyRoot, "teamLeaders")

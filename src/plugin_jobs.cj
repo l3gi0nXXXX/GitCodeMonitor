@@ -531,7 +531,10 @@ func scanOnceRuntimeBoundedForJob(
                         let processed = processRuntimeEvent(config, state, event, baselineMode: baselineMode)
                         if (processed.newEvents > 0) {
                             match (eventWriter) {
-                                case Some(writer) => emitGcmAcceptedScanEvent(job.jobId, event, writer)
+                                case Some(writer) =>
+                                    let maintainerContext = resolveGcmMaintainerContext(runtime.gitCode, event)
+                                    let _ = runtime.maintainerContextStore.put(maintainerContext)
+                                    emitGcmAcceptedScanEvent(job.jobId, event, writer, maintainerContext: Some<GcmMaintainerContext>(maintainerContext))
                                 case None => ()
                             }
                         }
@@ -561,11 +564,11 @@ func emitGcmScanJobEvent(job: GcmScanJob, writer: GcmPluginStdioWriter): Unit {
     writer.writeFrame(gcmScanJobEventFrame(job))
 }
 
-func emitGcmAcceptedScanEvent(jobId: String, event: GitCodeEvent, writer: GcmPluginStdioWriter, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>): Unit {
-    writer.writeFrame(gcmAcceptedScanEventFrame(jobId, event, discussionContext: discussionContext))
+func emitGcmAcceptedScanEvent(jobId: String, event: GitCodeEvent, writer: GcmPluginStdioWriter, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>, maintainerContext!: ?GcmMaintainerContext = None<GcmMaintainerContext>): Unit {
+    writer.writeFrame(gcmAcceptedScanEventFrame(jobId, event, discussionContext: discussionContext, maintainerContext: maintainerContext))
 }
 
-func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>): ServiceFrame {
+func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>, maintainerContext!: ?GcmMaintainerContext = None<GcmMaintainerContext>): ServiceFrame {
     ServiceFrame(
         "event",
         "accepted-${jobId}-${hashRawPayload(event.id)}",
@@ -573,12 +576,28 @@ func gcmAcceptedScanEventFrame(jobId: String, event: GitCodeEvent, discussionCon
         method: "emitCapabilityEvent",
         capabilityId: "gitcode.event.accepted",
         correlationId: "corr-${jobId}",
-        payload: gcmAcceptedScanEventPayload(jobId, event, discussionContext: discussionContext)
+        payload: gcmAcceptedScanEventPayload(jobId, event, discussionContext: discussionContext, maintainerContext: maintainerContext)
     )
 }
 
-func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>): String {
-    renderReviewRequestJson(jobId, event, discussionContext: discussionContext)
+func gcmAcceptedScanEventPayload(jobId: String, event: GitCodeEvent, discussionContext!: ?GitCodeDiscussionContext = None<GitCodeDiscussionContext>, maintainerContext!: ?GcmMaintainerContext = None<GcmMaintainerContext>): String {
+    match (maintainerContext) {
+        case Some(context) =>
+            renderReviewRequestJson(
+                jobId,
+                event,
+                maintainer: Some<GitCodeTeamLeaderResolution>(GitCodeTeamLeaderResolution(context.repo, teamLeaders: contextPersons(context.teamLeaderMentions), teamLeaderStatus: context.teamLeaderStatus)),
+                codeowners: Some<GitCodeCodeownerResolution>(GitCodeCodeownerResolution(owners: contextPersons(context.codeownerMentions), codeownerStatus: context.codeownerStatus, changedFiles: context.changedFiles, changedFilesTruncated: context.changedFilesTruncated)),
+                discussionContext: discussionContext
+            )
+        case None => renderReviewRequestJson(jobId, event, discussionContext: discussionContext)
+    }
+}
+
+func contextPersons(mentions: Array<String>): Array<GitCodeMaintainerPerson> {
+    let out = ArrayList<GitCodeMaintainerPerson>()
+    for (mention in mentions) { out.add(GitCodeMaintainerPerson(mention)) }
+    out.toArray()
 }
 
 func gcmScanJobEventFrame(job: GcmScanJob): ServiceFrame {

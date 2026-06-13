@@ -40,9 +40,16 @@ public class GitCodeCodeownerResolution {
     }
 }
 
-public func fetchCodeowners(client: GitCodeApiClient, repo: GitCodeRepo, ref: String): GitCodeTextFetchResult {
+public func fetchCodeowners(client: GitCodeApiClient, repo: GitCodeRepo, ref: String, sender!: HttpSender = NativeHttpSender()): GitCodeTextFetchResult {
     let req = client.contentsRequest(repo, ".gitcode/CODEOWNERS", ref)
-    GitCodeTextFetchResult(false, "missing", diagnostic: hashRawPayload(req.url))
+    let res = sender.send(req)
+    if (res.statusCode == 404) { return GitCodeTextFetchResult(false, "missing", diagnostic: hashRawPayload(req.url)) }
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+        return GitCodeTextFetchResult(false, "fetch_failed", diagnostic: hashRawPayload(req.url))
+    }
+    let decoded = decodeGitCodeContentsText(res.body)
+    if (!decoded.ok) { return GitCodeTextFetchResult(false, "invalid_content", diagnostic: decoded.diagnostic) }
+    decoded
 }
 
 public func parseCodeowners(text: String): GitCodeCodeownersParseResult {
