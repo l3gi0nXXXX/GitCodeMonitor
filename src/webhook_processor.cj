@@ -175,7 +175,9 @@ public func processWebhookBatch(
                         } else {
                             None<GitCodeDiscussionContext>
                         }
-                        emitGcmAcceptedScanEvent("webhook-${sanitizeDeliveryIdForPath(delivery.deliveryId)}", parsed.event, writer, discussionContext: discussionContext)
+                        let maintainerContext = resolveGcmMaintainerContext(runtime.gitCode, parsed.event)
+                        let _ = runtime.maintainerContextStore.put(maintainerContext)
+                        emitGcmAcceptedScanEvent("webhook-${sanitizeDeliveryIdForPath(delivery.deliveryId)}", parsed.event, writer, discussionContext: discussionContext, maintainerContext: Some<GcmMaintainerContext>(maintainerContext))
                     case None => ()
                 }
             }

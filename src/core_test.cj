@@ -103,6 +103,51 @@ public class GitCodeMonitorCoreServicePluginOnlyTest {
     }
 
     @TestCase
+    public func t3GcmUnit001002003004MaintainerEmailConfigAddressBookAndMimeAreSafe(): Unit {
+        // T3-GCM-UNIT-001, T3-GCM-UNIT-002, T3-GCM-UNIT-003, T3-GCM-UNIT-004, T3-GCM-BOUND-002, T3-GCM-BOUND-003
+        let defaults = defaultConfig()
+        @Expect(defaults.maintainerNotificationEmail.enabled, false)
+        @Expect(configSummary(defaults).contains("password"), false)
+        @Expect(configSummary(defaults).contains("SMTP_SECRET_VALUE"), false)
+
+        let valid = loadConfigJsonForTest("gcm-maintainer-email-valid", "{" +
+            "\"gitcode\":{\"maintainerNotification\":{\"email\":{" +
+            "\"enabled\":true,\"transport\":\"smtp\"," +
+            "\"smtp\":{\"host\":\"smtp.example.com\",\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"}," +
+            "\"from\":\"bot@example.com\",\"replyTo\":\"reply@example.com\",\"allowedDomains\":[\"example.com\"]," +
+            "\"addressBook\":{\"@Alice\":[\"Alice@Example.com\",\"alice@example.com\"],\"bob\":[\"BOB@example.com\"]}" +
+            "}}}}"
+        )
+        @Expect(valid.maintainerNotificationEmail.enabled, true)
+        @Expect(valid.maintainerNotificationEmail.smtp.passwordEnv, "GCM_SMTP_PASSWORD")
+        @Expect(valid.maintainerNotificationEmail.addressBook.get("@alice").getOrThrow()[0], "alice@example.com")
+        @Expect(valid.maintainerNotificationEmail.addressBook.get("@bob").getOrThrow()[0], "bob@example.com")
+        @Expect(validateConfig(valid), "ok")
+        @Expect(configSummary(valid).contains("GCM_SMTP_PASSWORD"), false)
+
+        let badHost = loadConfigJsonForTest("gcm-maintainer-email-bad-host", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"},\"from\":\"bot@example.com\"}}}}")
+        @Expect(validateConfig(badHost).contains("maintainerNotification.email.smtp.host"), true)
+        let badPort = loadConfigJsonForTest("gcm-maintainer-email-bad-port", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"host\":\"smtp.example.com\",\"port\":70000,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"},\"from\":\"bot@example.com\"}}}}")
+        @Expect(validateConfig(badPort).contains("maintainerNotification.email.smtp.port"), true)
+        let badSecurity = loadConfigJsonForTest("gcm-maintainer-email-bad-security", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"host\":\"smtp.example.com\",\"port\":25,\"security\":\"none\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"},\"from\":\"bot@example.com\"}}}}")
+        @Expect(validateConfig(badSecurity).contains("maintainerNotification.email.smtp.security"), true)
+        let badEnv = loadConfigJsonForTest("gcm-maintainer-email-bad-env", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"host\":\"smtp.example.com\",\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"bad env\"},\"from\":\"bot@example.com\"}}}}")
+        @Expect(validateConfig(badEnv).contains("maintainerNotification.email.smtp.passwordEnv"), true)
+        let badDomain = loadConfigJsonForTest("gcm-maintainer-email-bad-domain", "{\"gitcode\":{\"maintainerNotification\":{\"email\":{\"enabled\":true,\"transport\":\"smtp\",\"smtp\":{\"host\":\"smtp.example.com\",\"port\":465,\"security\":\"ssl\",\"username\":\"bot@example.com\",\"passwordEnv\":\"GCM_SMTP_PASSWORD\"},\"from\":\"bot@example.com\",\"allowedDomains\":[\"example.com\"],\"addressBook\":{\"@alice\":[\"alice@other.test\"]}}}}}")
+        @Expect(validateConfig(badDomain).contains("maintainerNotification.email.addressBook"), true)
+
+        let message = MaintainerEmailMessage(["alice@example.com"], "中文 subject", "第一行\n.第二行\nAuthorization: Bearer secret\n/Users/alice/private", repo: "Cangjie/community", kind: "pr", number: "8", url: "https://gitcode.com/Cangjie/community/pulls/8", replyUrl: "https://gitcode.com/Cangjie/community/pulls/8#note_1")
+        let mime = buildSmtpMimeMessage(message, valid.maintainerNotificationEmail)
+        @Expect(mime.ok, true)
+        @Expect(mime.data.contains("\r\n"), true)
+        @Expect(mime.data.contains("Content-Type: text/plain; charset=utf-8"), true)
+        @Expect(mime.data.contains("\r\n..第二行"), true)
+        @Expect(mime.data.contains("Bearer secret"), false)
+        @Expect(mime.data.contains("/Users/alice"), false)
+        @Expect(mime.data.contains("GCM_SMTP_PASSWORD"), false)
+    }
+
+    @TestCase
     public func gitCodeCommentWriterPostsIssueAndPrWithJsonBody(): Unit {
         // T-ROOT-004, T-WRITER-001, T-WRITER-002, T-WRITER-005
         let sender = FakeHttpSender()

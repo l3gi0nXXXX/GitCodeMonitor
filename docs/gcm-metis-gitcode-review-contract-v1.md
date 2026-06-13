@@ -10,7 +10,8 @@ This document fixes the contract boundary between GitCodeMonitor and Metis for G
 |---|---|---|
 | GitCode webhook receive, authentication, queue, dedupe, event state | GitCodeMonitor | Metis must not parse raw GitCode webhook payload as the source of truth. |
 | Author email classification and corporate record-only policy | GitCodeMonitor | Record-only author domains are configured by `gitcode.authorPolicy.recordOnlyEmailDomains`; default is empty, so no author is filtered unless configured. Matching events are recorded only and must not call Metis. |
-| Team leader, CODEOWNERS, issue template, PR template lookup | GitCodeMonitor | Lookup failures are diagnostics, not hard failures. |
+| Team leader, CODEOWNERS, issue template, PR template lookup | GitCodeMonitor | Lookup failures are diagnostics, not hard failures. GCM reads `Cangjie/community/team/repo_list.md`, target `.gitcode/CODEOWNERS`, and PR changed files before accepted event emission. |
+| Maintainer context store and maintainer email notification | GitCodeMonitor | GCM persists maintainer context by `eventId/sourceEventId`, appends natural maintainer footer, and sends optional SMTP email after successful GitCode writeback. Metis must not parse repo list/CODEOWNERS or send maintainer email. |
 | LLM, CKB, source workspace, external PR review engine adapter, draft generation | Metis | GCM must not call LLM, CKB, or PR review engine for user-facing reply generation. Metis owns only the adapter boundary for the external PR review engine. |
 | GitCode official API writeback | GitCodeMonitor | Metis returns a generated reply; GCM owns gate, natural maintainer mention sentence, internal writeback audit state, and API call. |
 | GitCode writeback scope | GitCodeMonitor | GCM owns writeback scope evaluation. Metis does not directly decide whether a GitCode repo or org is allowed to receive writeback. |
@@ -106,6 +107,14 @@ Compatible maintainer context fields may be provided at top level, under `mainta
 
 Only parsed valid GitCode mentions are used for the final comment.
 
+New Metis integrations should not send maintainer facts back. GCM resolves writeback maintainer context in this priority order:
+
+```text
+GCM context store > GCM deterministic fallback > payload_compat > unavailable
+```
+
+`payload_compat` exists only for older payloads and tests. The normal Metis payload remains minimal: event identity, repo target, draft, safety, and human-review flags.
+
 ## Writeback Gate
 
 GCM must not call the GitCode writer when any of these conditions holds:
@@ -156,8 +165,15 @@ deniedRepos > allowedRepos > allowedOrgs > default deny
 - `maintainerMentionAppended`
 - `teamLeaderCount`
 - `codeownerCount`
+- `contextSource`: `store`, `deterministic_fallback`, `payload_compat`, or `unavailable`
+- `emailNotificationStatus`: `email_disabled`, `email_unavailable`, `sent`, or `send_failed`
+- `emailSentCount`
+- `emailFailedCount`
+- `emailRetryable`
 
 The service plugin protocol may carry this as JSON inside a response frame. User-facing Metis renderers are responsible for turning it into human-readable text.
+
+The response must not include recipient email addresses, SMTP passwords or authorization codes, `passwordEnv` values, raw payloads, or email bodies.
 
 ## Comment Body Invariants
 
